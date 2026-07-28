@@ -1280,16 +1280,16 @@ private extension DirectRealtimeController {
         const activeSources = [
           ...session.assistantPlaybackTextByResponseId.values()
         ];
-        if (activeSources.some(sourceText =>
+        const sources = [
+          ...activeSources,
+          ...session.recentAssistantPlaybackTexts.map(item => item.text)
+        ];
+        if (sources.some(sourceText =>
           normalizedEchoText(sourceText) === candidate
         )) {
           return true;
         }
         if (candidate.length < 4) return false;
-        const sources = [
-          ...activeSources,
-          ...session.recentAssistantPlaybackTexts.map(item => item.text)
-        ];
         return sources.some(sourceText => {
           const source = normalizedEchoText(sourceText);
           if (source.length < 4) return false;
@@ -1537,9 +1537,18 @@ private extension DirectRealtimeController {
                   "clarify",
                   "ignore"
                 ]
+              },
+              social_origin: {
+                type: "string",
+                enum: [
+                  "user_reply",
+                  "assistant_like_playback",
+                  "independent",
+                  "not_applicable"
+                ]
               }
             },
-            required: ["kind"],
+            required: ["kind", "social_origin"],
             additionalProperties: false
           }
         };
@@ -1561,6 +1570,17 @@ private extension DirectRealtimeController {
         return allowed.has(kind) ? kind : "codex";
       }
 
+      function normalizeSocialOrigin(value) {
+        const origin = String(value || "");
+        const allowed = new Set([
+          "user_reply",
+          "assistant_like_playback",
+          "independent",
+          "not_applicable"
+        ]);
+        return allowed.has(origin) ? origin : "not_applicable";
+      }
+
       function requestRouteDecision() {
         return dataSend({
           type: "response.create",
@@ -1571,7 +1591,7 @@ private extension DirectRealtimeController {
             parallel_tool_calls: false,
             metadata: { voice_relay_kind: "route_classifier" },
             instructions:
-              "Call route_voice_turn immediately. Decide semantically from the complete utterance. Direct chat is only pure social speech with no factual or contextual content. Every current, factual, personal-context, device-state, external-information, calculation, verification, lookup, analysis, tool, file, app, memory, or source-dependent request must use codex. When in doubt, use codex. Do not answer or produce audio before the tool call."
+              "Call route_voice_turn immediately. Decide semantically from the complete utterance. Direct chat is only pure social speech with no factual or contextual content. Every current, factual, personal-context, device-state, external-information, calculation, verification, lookup, analysis, tool, file, app, memory, or source-dependent request must use codex. Set social_origin to user_reply only when the utterance is a social response to the immediately preceding assistant turn, such as a conversational receipt, approval, thanks, repeat request, or farewell, and it adds no work. Set assistant_like_playback when the utterance speaks from the assistant's role or appears to continue or reproduce assistant output. Use independent for other social speech and not_applicable for every non-social route. Mixed social and factual speech must use codex with not_applicable. When in doubt, use codex. Do not answer or produce audio before the tool call."
           }
         });
       }
@@ -2040,6 +2060,9 @@ private extension DirectRealtimeController {
             }
             session.pendingCalls.add(callId);
             const kind = normalizeRouteKind(args.kind);
+            const socialOrigin = kind === "direct_chat"
+              ? normalizeSocialOrigin(args.social_origin)
+              : "not_applicable";
             const activeTurn = session.activeUserTurn;
             diagnostic("route_decision", generation, {
               callID: callId,
@@ -2047,17 +2070,28 @@ private extension DirectRealtimeController {
               reason: activeTurn?.playbackContended
                 ? "playback_contended"
                 : "normal",
+              socialOrigin,
               text,
               turnID: String(activeTurn?.id || "")
             });
-            const suppressiblePlaybackKinds = new Set([
-              "direct_chat",
+            const alwaysSuppressiblePlaybackKinds = new Set([
               "ignore",
               "local_presence",
               "local_wake"
             ]);
-            if (activeTurn?.playbackContended
-                && suppressiblePlaybackKinds.has(kind)) {
+            const suppressPlaybackContendedTurn =
+              activeTurn?.playbackContended
+              && (
+                (
+                  kind === "direct_chat"
+                  && socialOrigin !== "user_reply"
+                )
+                || (
+                  kind !== "direct_chat"
+                  && alwaysSuppressiblePlaybackKinds.has(kind)
+                )
+              );
+            if (suppressPlaybackContendedTurn) {
               session.pendingCalls.delete(callId);
               dataSend({
                 type: "conversation.item.create",
@@ -2076,12 +2110,27 @@ private extension DirectRealtimeController {
                 {
                   callID: callId,
                   kind,
+                  socialOrigin,
                   text,
                   turnID: String(activeTurn?.id || "")
                 }
               );
               completeAcceptedTurn();
               break;
+            }
+            if (activeTurn?.playbackContended
+                && kind === "direct_chat"
+                && socialOrigin === "user_reply") {
+              diagnostic(
+                "playback_contended_user_reply_admitted",
+                generation,
+                {
+                  callID: callId,
+                  socialOrigin,
+                  text,
+                  turnID: String(activeTurn?.id || "")
+                }
+              );
             }
             reportActiveUserTurnIfNeeded();
             if (kind === "stop_session") {
@@ -2288,11 +2337,13 @@ private extension DirectRealtimeController {
                 session.expectedCancelEventIds.clear();
               }
               const responseStatus = String(event.response?.status || "");
-              if (!session.audioResponseIds.has(responseId)
-                  || (responseStatus && responseStatus !== "completed")) {
+              const playbackStillDraining =
+                session.audioResponseIds.has(responseId)
+                && (!responseStatus || responseStatus === "completed");
+              if (!playbackStillDraining) {
                 finishActiveCodexSpeech(responseId);
+                state("thinking", generation);
               }
-              state("thinking", generation);
               break;
             }
             const text = responseText(event.response)
@@ -2651,6 +2702,12 @@ private extension DirectRealtimeController {
         });
         if (responseKind.startsWith("codex_")) {
           finishActiveCodexSpeech(responseId);
+          if (isTransientCodexSpeechKind(responseKind)) {
+            state(
+              session.codexInFlight ? "thinking" : "listening",
+              generation
+            );
+          }
         }
         processNextAcceptedTurn();
         if (wasFinal) {

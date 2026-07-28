@@ -113,6 +113,38 @@ require_text \
   "route diagnostics and dispatch must use a bounded route enum"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
+  'required: ["kind", "social_origin"]' \
+  "route decisions must classify social speech origin without an allow-by-default fallback"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'socialOrigin !== "user_reply"' \
+  "playback-tail social suppression must admit only a confirmed user reply"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"playback_contended_user_reply_admitted"' \
+  "admitted post-playback user replies must leave a distinct diagnostic"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'const playbackStillDraining =' \
+  "transient Realtime speech must remain speaking until native playback drains"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'self.scheduleConversationCollapse(delay: 0.5)' \
+  "a blocked conversation collapse must re-arm instead of stranding the expanded surface"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  '"wake_audio_capture_released"' \
+  "SpeechAnalyzer handoff must expose the actual audio-release boundary"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'finishAudioRelease()' \
+  "Realtime handoff must continue after wake audio is released"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  '"wake_cleanup_completed"' \
+  "SpeechAnalyzer model and asset cleanup must remain observable after handoff"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
   'const callId = String(event.call_id || "").trim();' \
   "route completions must require a non-empty call identifier"
 require_text \
@@ -585,8 +617,8 @@ require_text \
   "the listening dot cluster must move at a calm readable pace"
 require_text \
   "$ROOT/Sources/VoiceSurfacePolicy.swift" \
-  'let headerExpanded = phase == .thinking || answerVisible || hovering' \
-  "post-speech work, hover history, and visible answers must enlarge the black notch header"
+  'let headerExpanded = answerVisible || hovering' \
+  "silent post-speech work must stay compact until content or hover expands the Notch"
 require_text \
   "$ROOT/Sources/VoiceSurfacePolicy.swift" \
   'showsHoverVoiceAction: hovering && !answerVisible' \
@@ -2319,7 +2351,7 @@ require_text \
   "surface retention must wait for the matching native response to drain"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  '!self.assistantOutputLifecycle.isActive' \
+  'self.assistantOutputLifecycle.isActive' \
   "conversation collapse must stay blocked while native or local speech is active"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \

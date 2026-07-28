@@ -1427,8 +1427,13 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         guard !text.isEmpty else { return }
         realtimeDraft = text
         isReplyPreviewVisible = true
+        replyRetainUntil =
+            NotchAnswerLifecyclePolicy.retentionDeadline()
         showConversationHistory(
             animated: !answerTargetVisible && config.animateSurface
+        )
+        scheduleConversationCollapse(
+            delay: max(config.collapseDelay, 1.1)
         )
         realtimeController.speakCodexCommentary(
             text,
@@ -2497,8 +2502,13 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             guard !trimmed.isEmpty else { return }
             realtimeDraft = trimmed
             isReplyPreviewVisible = true
+            replyRetainUntil =
+                NotchAnswerLifecyclePolicy.retentionDeadline()
             showConversationHistory(
                 animated: !answerTargetVisible && config.animateSurface
+            )
+            scheduleConversationCollapse(
+                delay: max(config.collapseDelay, 1.1)
             )
         case "assistantPartial":
             guard let text = event["text"] as? String else { return }
@@ -2516,8 +2526,13 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             realtimeDraft = trimmed
             if resolvedAnchor == .notch {
                 isReplyPreviewVisible = true
+                replyRetainUntil =
+                    NotchAnswerLifecyclePolicy.retentionDeadline()
                 showConversationHistory(
                     animated: !answerTargetVisible && config.animateSurface
+                )
+                scheduleConversationCollapse(
+                    delay: max(config.collapseDelay, 1.1)
                 )
             }
         case "assistantFinal":
@@ -3094,13 +3109,20 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             : delay
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            guard !self.isHoveringNotch,
-                  !self.isHoveringOrbReply,
-                  self.isHoverPreviewVisible || self.isReplyPreviewVisible,
-                  !self.isWaitingForReply,
-                  !self.isShowingTransientError,
-                  !self.assistantOutputLifecycle.isActive,
-                  !self.voiceState.phase.blocksConversationCollapse else {
+            self.hoverCollapseWorkItem = nil
+            guard self.isHoverPreviewVisible
+                    || self.isReplyPreviewVisible else {
+                return
+            }
+            let collapseBlocked =
+                self.isHoveringNotch
+                || self.isHoveringOrbReply
+                || self.isWaitingForReply
+                || self.isShowingTransientError
+                || self.assistantOutputLifecycle.isActive
+                || self.voiceState.phase.blocksConversationCollapse
+            if collapseBlocked {
+                self.scheduleConversationCollapse(delay: 0.5)
                 return
             }
             self.isHoverPreviewVisible = false

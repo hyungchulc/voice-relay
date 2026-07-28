@@ -49,7 +49,7 @@ struct NotchPresentation: Equatable {
         answerVisible: Bool,
         hovering: Bool = false
     ) -> NotchPresentation {
-        let headerExpanded = phase == .thinking || answerVisible || hovering
+        let headerExpanded = answerVisible || hovering
         return NotchPresentation(
             headerExpanded: headerExpanded,
             answerExpanded: answerVisible,

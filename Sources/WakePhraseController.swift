@@ -771,8 +771,9 @@ private final class SpeechAnalyzerWakeSession {
     private var resultTasks: [Task<Void, Never>] = []
     private var reservedLocales: [Locale] = []
     private var stopped = false
-    private var stopCompleted = false
-    private var stopCompletions: [() -> Void] = []
+    private var audioReleaseCompleted = false
+    private var audioReleaseCompletions: [() -> Void] = []
+    private var cleanupCompleted = false
     private var failureReported = false
 
     init(
@@ -1033,12 +1034,12 @@ private final class SpeechAnalyzerWakeSession {
 
     func stop(completion: @escaping () -> Void = {}) {
         stateLock.lock()
-        if stopCompleted {
+        if audioReleaseCompleted {
             stateLock.unlock()
             DispatchQueue.main.async(execute: completion)
             return
         }
-        stopCompletions.append(completion)
+        audioReleaseCompletions.append(completion)
         if stopped {
             stateLock.unlock()
             return
@@ -1050,6 +1051,12 @@ private final class SpeechAnalyzerWakeSession {
         reservedLocales.removeAll()
         stateLock.unlock()
 
+        let stopStartedAt = ProcessInfo.processInfo.systemUptime
+        VoiceRelayDiagnostics.flow(
+            "wake_audio_capture_release_started",
+            generation: diagnosticGeneration,
+            fields: ["backend": "speech_analyzer"]
+        )
         lifecycleLock.withLock {
             inputContinuation?.finish()
             inputContinuation = nil
@@ -1062,32 +1069,95 @@ private final class SpeechAnalyzerWakeSession {
             }
             audioEngine.inputNode.removeTap(onBus: 0)
         }
+        VoiceRelayDiagnostics.flow(
+            "wake_audio_capture_released",
+            generation: diagnosticGeneration,
+            fields: [
+                "backend": "speech_analyzer",
+                "elapsed_ms": Self.elapsedMilliseconds(
+                    since: stopStartedAt
+                ),
+            ]
+        )
+        finishAudioRelease()
         Task { [self] in
             if let analyzerToCancel {
                 await analyzerToCancel.cancelAndFinishNow()
             }
+            VoiceRelayDiagnostics.flow(
+                "wake_analyzer_cancel_completed",
+                generation: diagnosticGeneration,
+                fields: [
+                    "elapsed_ms": Self.elapsedMilliseconds(
+                        since: stopStartedAt
+                    )
+                ]
+            )
             for locale in localesToRelease {
                 _ = await AssetInventory.release(
                     reservedLocale: locale
                 )
             }
-            finishStop()
+            VoiceRelayDiagnostics.flow(
+                "wake_asset_release_completed",
+                generation: diagnosticGeneration,
+                fields: [
+                    "elapsed_ms": Self.elapsedMilliseconds(
+                        since: stopStartedAt
+                    ),
+                    "locale_count": String(localesToRelease.count),
+                ]
+            )
+            finishCleanup(startedAt: stopStartedAt)
         }
     }
 
-    private func finishStop() {
+    private func finishAudioRelease() {
         stateLock.lock()
-        guard !stopCompleted else {
+        guard !audioReleaseCompleted else {
             stateLock.unlock()
             return
         }
-        stopCompleted = true
-        let completions = stopCompletions
-        stopCompletions.removeAll()
+        audioReleaseCompleted = true
+        let completions = audioReleaseCompletions
+        audioReleaseCompletions.removeAll()
         stateLock.unlock()
         DispatchQueue.main.async {
             completions.forEach { $0() }
         }
+    }
+
+    private func finishCleanup(startedAt: TimeInterval) {
+        stateLock.lock()
+        guard !cleanupCompleted else {
+            stateLock.unlock()
+            return
+        }
+        cleanupCompleted = true
+        stateLock.unlock()
+        VoiceRelayDiagnostics.flow(
+            "wake_cleanup_completed",
+            generation: diagnosticGeneration,
+            fields: [
+                "elapsed_ms": Self.elapsedMilliseconds(
+                    since: startedAt
+                )
+            ]
+        )
+    }
+
+    private static func elapsedMilliseconds(
+        since startedAt: TimeInterval
+    ) -> String {
+        String(
+            Int(
+                max(
+                    0,
+                    (ProcessInfo.processInfo.systemUptime - startedAt)
+                        * 1_000
+                )
+            )
+        )
     }
 
     private var isStopped: Bool {

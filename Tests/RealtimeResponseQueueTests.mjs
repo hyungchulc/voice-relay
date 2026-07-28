@@ -119,6 +119,24 @@ assert.equal(
   "route_voice_turn",
   "the required route tool must be route_voice_turn",
 );
+assert.deepEqual(
+  Array.from(responseCreates().at(-1).response.tools[0].parameters.required),
+  ["kind", "social_origin"],
+  "the route tool must require a fail-closed social-origin classification",
+);
+assert.deepEqual(
+  Array.from(
+    responseCreates().at(-1).response.tools[0]
+      .parameters.properties.social_origin.enum,
+  ),
+  [
+    "user_reply",
+    "assistant_like_playback",
+    "independent",
+    "not_applicable",
+  ],
+  "social-origin classification must distinguish real replies from playback",
+);
 assert.equal(
   responseCreates().at(-1).response.metadata.voice_relay_kind,
   "route_classifier",
@@ -1050,6 +1068,7 @@ runtime.receiveRealtimeEvent({
     transcript: "I’ll check that.",
   },
 });
+const weatherProgressDoneStart = nativeMessages.length;
 runtime.receiveRealtimeEvent({
   generation: 9,
   event: {
@@ -1062,10 +1081,26 @@ runtime.receiveRealtimeEvent({
     },
   },
 });
+assert.equal(
+  nativeMessages.slice(weatherProgressDoneStart).filter(message =>
+    message.type === "state"
+    && message.phase === "thinking"
+  ).length,
+  0,
+  "completed transient generation must remain speaking until native playback drains",
+);
 runtime.playbackDrained({
   generation: 9,
   responseId: "weather-progress-speech-1",
 });
+assert.equal(
+  nativeMessages.slice(weatherProgressDoneStart).filter(message =>
+    message.type === "state"
+    && message.phase === "thinking"
+  ).length,
+  1,
+  "transient playback drain must return the live Codex turn to thinking once",
+);
 runtime.resolveCodex({
   generation: 9,
   callId: "weather-route-call-1",
@@ -1280,6 +1315,40 @@ runtime.playbackDrained({
   generation: 10,
   responseId: "post-final-speech-1",
 });
+const exactRecentEchoStart = nativeMessages.length;
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "post-final-exact-echo-item",
+    transcript: "The current weather is clear.",
+  },
+});
+const exactRecentEchoMessages =
+  nativeMessages.slice(exactRecentEchoStart);
+assert.equal(
+  exactRecentEchoMessages.filter(message =>
+    message.type === "diagnostic"
+    && message.stage === "playback_echo_transcript_suppressed"
+  ).length,
+  1,
+  "an exact post-drain playback echo must be rejected before semantic routing",
+);
+assert.equal(
+  exactRecentEchoMessages
+    .filter(message => message.type === "realtimeSend")
+    .map(message => JSON.parse(message.eventJSON))
+    .filter(event => event.type === "response.create").length,
+  0,
+  "an exact post-drain playback echo must not create a route classifier",
+);
+assert.equal(
+  exactRecentEchoMessages.filter(message =>
+    message.type === "userTranscript"
+  ).length,
+  0,
+  "an exact post-drain playback echo must not become a visible user turn",
+);
 const novelPlaybackEchoStart = nativeMessages.length;
 runtime.receiveRealtimeEvent({
   generation: 10,
@@ -1305,7 +1374,10 @@ runtime.receiveRealtimeEvent({
     type: "response.function_call_arguments.done",
     name: "route_voice_turn",
     call_id: "post-final-echo-call",
-    arguments: JSON.stringify({ kind: "direct_chat" }),
+    arguments: JSON.stringify({
+      kind: "direct_chat",
+      social_origin: "assistant_like_playback",
+    }),
   },
 });
 runtime.receiveRealtimeEvent({
@@ -1353,6 +1425,81 @@ assert.equal(
     .filter(message => message.type === "codexRequest").length,
   1,
   "a post-final playback echo must never create a second Codex request",
+);
+
+const postFinalReplyStart = nativeMessages.length;
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "post-final-thanks-item",
+    transcript: "Thanks.",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.created",
+    response: {
+      id: "post-final-thanks-route",
+      metadata: { voice_relay_kind: "route_classifier" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.function_call_arguments.done",
+    name: "route_voice_turn",
+    call_id: "post-final-thanks-call",
+    arguments: JSON.stringify({
+      kind: "direct_chat",
+      social_origin: "user_reply",
+    }),
+  },
+});
+const postFinalReplyMessages = nativeMessages.slice(postFinalReplyStart);
+assert.equal(
+  postFinalReplyMessages.filter(message =>
+    message.type === "diagnostic"
+    && message.stage === "playback_contended_user_reply_admitted"
+  ).length,
+  1,
+  "a real post-final social reply must pass the playback-tail backstop",
+);
+assert.equal(
+  postFinalReplyMessages.filter(message =>
+    message.type === "diagnostic"
+    && message.stage === "playback_contended_social_turn_suppressed"
+  ).length,
+  0,
+  "a real post-final social reply must not be suppressed as playback",
+);
+assert.equal(
+  postFinalReplyMessages.filter(message =>
+    message.type === "userTranscript"
+    && message.text === "Thanks."
+  ).length,
+  1,
+  "an admitted post-final social reply must remain visible as a user turn",
+);
+assert.equal(
+  postFinalReplyMessages
+    .filter(message => message.type === "realtimeSend")
+    .map(message => JSON.parse(message.eventJSON))
+    .filter(event =>
+      event.type === "response.create"
+      && event.response?.metadata?.voice_relay_kind !== "route_classifier"
+    ).length,
+  1,
+  "an admitted post-final social reply must create exactly one spoken reply",
+);
+assert.equal(
+  postFinalReplyMessages.filter(message =>
+    message.type === "codexRequest"
+  ).length,
+  0,
+  "a post-final conversational receipt must stay on the direct Realtime path",
 );
 
 console.log("Realtime response queue tests passed");

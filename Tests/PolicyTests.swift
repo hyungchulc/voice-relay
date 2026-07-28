@@ -528,6 +528,10 @@ struct PolicyTests {
             phase: .thinking,
             answerVisible: false
         )
+        let thinkingWithAnswer = NotchPresentation.resolve(
+            phase: .thinking,
+            answerVisible: true
+        )
         let answerNotch = NotchPresentation.resolve(
             phase: .speaking,
             answerVisible: true
@@ -570,12 +574,19 @@ struct PolicyTests {
             "the notch Voice control must appear only on a header-only hover"
         )
         expect(
-            thinkingNotch.headerExpanded
+            !thinkingNotch.headerExpanded
                 && !thinkingNotch.answerExpanded
                 && thinkingNotch.indicatorUsesRing
-                && thinkingNotch.showsActivityLabel
+                && !thinkingNotch.showsActivityLabel
                 && !thinkingNotch.showsHoverVoiceAction,
-            "post-speech work must modestly expand the Notch"
+            "silent post-speech work must stay in the compact hover-sized Notch"
+        )
+        expect(
+            thinkingWithAnswer.headerExpanded
+                && thinkingWithAnswer.answerExpanded
+                && thinkingWithAnswer.indicatorUsesRing
+                && thinkingWithAnswer.showsActivityLabel,
+            "visible Codex progress must expand while retaining the thinking ring"
         )
         expect(
             answerNotch.headerExpanded
