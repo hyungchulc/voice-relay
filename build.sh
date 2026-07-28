@@ -6,6 +6,7 @@ OUT_DIR="${VOICE_RELAY_OUT:-${ROOT}/build}"
 APP_DIR="${OUT_DIR}/Voice Relay.app"
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/voice-relay.XXXXXX")"
 ARCHS="${VOICE_RELAY_ARCHS:-arm64 x86_64}"
+SIGNING_IDENTITY="${VOICE_RELAY_SIGNING_IDENTITY:--}"
 if [[ "$#" -ne 0 ]]; then
   echo "usage: $0" >&2
   exit 2
@@ -44,6 +45,8 @@ SOURCES=(
   "$ROOT/Sources/VoiceSurfacePolicy.swift"
   "$ROOT/Sources/VoiceOrbView.swift"
   "$ROOT/Sources/WakePhraseController.swift"
+  "$ROOT/Sources/RealtimeAudioAdmissionPolicy.swift"
+  "$ROOT/Sources/RealtimeEchoAdmissionPolicy.swift"
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift"
   "$ROOT/Sources/DirectRealtimeController.swift"
 )
@@ -86,6 +89,8 @@ xcrun swiftc \
   "$ROOT/Sources/PresenceMonitor.swift" \
   "$ROOT/Sources/SettingsStore.swift" \
   "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  "$ROOT/Sources/RealtimeAudioAdmissionPolicy.swift" \
+  "$ROOT/Sources/RealtimeEchoAdmissionPolicy.swift" \
   "$ROOT/Tests/PolicyTests.swift" \
   -o "$BUILD_DIR/VoiceRelayPolicyTests" \
   -framework Cocoa \
@@ -120,12 +125,23 @@ plutil -lint "$APP_DIR/Contents/Resources/PrivacyInfo.xcprivacy" >/dev/null
 node -e \
   'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' \
   "$APP_DIR/Contents/Resources/authority-pack.json"
-/usr/bin/codesign \
-  --force \
-  --deep \
-  --sign - \
-  --entitlements "$ROOT/Resources/VoiceRelay.entitlements" \
-  --requirements '=designated => identifier "com.hyungchulc.voice-relay"' \
-  "$APP_DIR" >/dev/null
+if [[ -z "$SIGNING_IDENTITY" || "$SIGNING_IDENTITY" == "-" ]]; then
+  /usr/bin/codesign \
+    --force \
+    --deep \
+    --sign - \
+    --entitlements "$ROOT/Resources/VoiceRelay.entitlements" \
+    --requirements '=designated => identifier "com.hyungchulc.voice-relay"' \
+    "$APP_DIR" >/dev/null
+else
+  /usr/bin/codesign \
+    --force \
+    --deep \
+    --options runtime \
+    --timestamp=none \
+    --sign "$SIGNING_IDENTITY" \
+    --entitlements "$ROOT/Resources/VoiceRelay.entitlements" \
+    "$APP_DIR" >/dev/null
+fi
 
 echo "$APP_DIR"

@@ -45,6 +45,62 @@ require_text \
   "Realtime must mechanically route every completed user turn"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
+  'metadata: { voice_relay_kind: "route_classifier" }' \
+  "route-classifier responses must be distinguishable from spoken replies"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'output_modalities: ["text"]' \
+  "route-classifier responses must not emit audio before the tool call"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'parallel_tool_calls: false' \
+  "route classification must produce one bounded decision"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'code: "route_classifier_failed"' \
+  "a missing route tool call must fail closed without killing Realtime"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'diagnostic("server_error", generation' \
+  "Realtime event errors must retain a privacy-safe causal diagnostic"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'type: "turnError"' \
+  "recoverable Realtime event errors must stay scoped to one turn"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'diagnostic("route_decision", generation, { kind })' \
+  "route decisions must be diagnosable without logging the transcript"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Voice Relay Codex bridge accepted request generation=%d' \
+  "native Codex handoff must leave a privacy-safe acceptance diagnostic"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'Voice Relay Codex Remote ask completed generation=%d result=success' \
+  "Codex Remote completion must be distinguishable from connection health"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'const kind = normalizeRouteKind(args.kind);' \
+  "route diagnostics and dispatch must use a bounded route enum"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'const callId = String(event.call_id || "").trim();' \
+  "route completions must require a non-empty call identifier"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'if (!isAwaitingRouteDecision()) break;' \
+  "duplicate route completions must not start duplicate Codex work"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'audioAdmissionPolicy.shouldAdmit(responseID: responseID)' \
+  "route-classifier audio must be rejected before native playback"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'emitDiagnostic("classifier_audio_suppressed")' \
+  "suppressed classifier audio must leave a privacy-safe diagnostic"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
   'type: "function_call_output"' \
   "Realtime must bind every routed reply to a function result"
 require_text \
@@ -61,8 +117,8 @@ require_text \
   "Realtime must use the bounded local-or-Codex routing tool"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  "For English, natural variants include 'Let me check'" \
-  "Realtime handoff prompts must use natural English examples"
+  'Do not reuse or closely paraphrase these recent acknowledgements' \
+  "Realtime handoff prompts must reject recently spoken stock phrasing"
 if /usr/bin/sed -n \
   '/static let defaultRealtimeInstructions = """/,/^    """/p' \
   "$ROOT/Sources/SettingsStore.swift" \
@@ -83,7 +139,7 @@ reject_text \
   "Realtime semantic routing must not be overridden by a local time phrase list"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
-  'self.fail("The Realtime WebSocket connection timed out")' \
+  '"The Realtime WebSocket connection timed out"' \
   "native Realtime transport must own its bounded connection timeout"
 require_text \
   "$ROOT/Sources/CodexAppRemoteClient.swift" \
@@ -97,6 +153,62 @@ require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'activeStartGeneration = 0' \
   "stopping Voice must invalidate the in-flight startup generation"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'init(maximumTransportAttempts: Int = 3)' \
+  "Realtime startup must survive two bounded pre-listening audio-device failures"
+reject_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'RealtimeAudioHandoffPolicy.activationDelay' \
+  "wake recognition must hand off to Realtime without an artificial delay"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '.AVAudioEngineConfigurationChange' \
+  "Realtime audio must observe live hardware configuration changes"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'try input.setVoiceProcessingEnabled(true)' \
+  "Realtime audio must keep Voice Processing enabled on the system default route"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'engine.outputNode.isVoiceProcessingEnabled' \
+  "Voice Processing must bind both microphone and playback reference"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'installPlaybackReferenceTap(' \
+  "full-duplex echo admission must inspect the actual rendered assistant audio"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'echoAdmissionPolicy.filterCapture(' \
+  "assistant echo must be removed before microphone audio reaches Realtime"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'if shouldForwardInputEvent {' \
+  "server VAD must not interrupt playback without local speech admission"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'if (responseKind.startsWith("codex_")) {' \
+  "Codex commentary and final speech must advance only after playback drains"
+reject_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'setVoiceProcessingEnabled(false)' \
+  "audio recovery must never disable Voice Processing"
+reject_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'requestsVoiceProcessing' \
+  "Realtime audio must have one Voice Processing startup path"
+reject_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'kAudioOutputUnitProperty_CurrentDevice' \
+  "Voice Relay must leave input and output device selection to macOS"
+reject_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'AudioDeviceID' \
+  "Voice Relay must not pin a hardware input or output device"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'audio_recovered' \
+  "Realtime audio must resume after a live device change"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'capturedChunks: capturedChunks' \
@@ -353,8 +465,12 @@ require_text \
   "the Codex task must warm after Realtime becomes responsive"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'startWakePhraseAfterLaunchIfAuthorized()' \
+  "completed onboarding must start the wake analyzer rather than a Realtime session"
+reject_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'startRealtimeAfterLaunchIfAuthorized()' \
-  "completed onboarding with microphone permission must preconnect Realtime"
+  "app launch must not bypass the wake analyzer"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'errorCollapseWorkItem' \
@@ -571,6 +687,26 @@ require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'handoffProgressInstructions' \
   "Codex handoff progress must be contextual rather than a fixed spoken line"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'recentHandoffAcknowledgements' \
+  "Codex handoff progress must vary across successive voice sessions"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'type: "playbackInterrupt"' \
+  "confirmed human barge-in must stop native playback"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'playback_echo_transcript_suppressed' \
+  "assistant playback transcripts must be rejected as new user turns"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'playback_backpressure_drop' \
+  "playback backpressure must degrade without killing the Realtime session"
+reject_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'stage: "playback_queue"' \
+  "a full playback queue must never terminate the Realtime session"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'Do not answer any part of the request.' \
@@ -1486,8 +1622,8 @@ require_text \
   "closing Settings must restore the Voice surface after an interrupted recovery"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  'overlayController?.startRealtimeAfterLaunchIfAuthorized()' \
-  "restored Voice surfaces must restart authorized Realtime"
+  'overlayController?.startWakePhraseAfterLaunchIfAuthorized()' \
+  "restored Voice surfaces must restart wake monitoring"
 require_text \
   "$ROOT/Sources/VoiceOrbView.swift" \
   'OrbAudioLevelPolicy.scale(' \
@@ -1576,6 +1712,10 @@ require_text \
   "$ROOT/build.sh" \
   '"$ROOT/Sources/NativeRealtimeAudioTransport.swift"' \
   "the maintained build must compile the native Realtime media transport"
+require_text \
+  "$ROOT/build.sh" \
+  '"$ROOT/Sources/RealtimeEchoAdmissionPolicy.swift"' \
+  "the maintained build and policy tests must compile echo admission"
 require_text \
   "$ROOT/build.sh" \
   '"$ROOT/Helpers/voice-relay-thread-policy.mjs"' \
@@ -1884,8 +2024,14 @@ NODE
       }
     }
   });
-  if (!posted.some(event => event.type === "error")) {
-    throw new Error("an uncorrelated Realtime failure was hidden");
+  if (!posted.some(event =>
+      event.type === "diagnostic"
+      && event.stage === "server_error"
+      && event.code === "server_error")) {
+    throw new Error("an uncorrelated Realtime failure lost its causal diagnostic");
+  }
+  if (posted.some(event => event.type === "error")) {
+    throw new Error("a recoverable Realtime event error became a fatal session error");
   }
   voice.stop({ generation: 33 });
 NODE
@@ -2041,6 +2187,18 @@ require_text \
   "custom wake phrases must bias the modern transcriber"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
+  'phrase_count=' \
+  "wake recognition must expose a privacy-safe configured phrase count"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'modernSession == nil' \
+  "wake recognition must reject duplicate starts while a modern session opens"
+reject_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'if phrase == "릴레이야"' \
+  "wake normalization must not hard-code one triggering phrase"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
   'AssetInventory.reserve(locale: locale)' \
   "modern wake recognition must reserve the selected on-device speech assets"
 require_text \
@@ -2189,8 +2347,24 @@ require_text \
   "the public alpha DMG must contain a universal app"
 require_text \
   "$ROOT/package-alpha-dmg.sh" \
+  'Set VOICE_RELAY_SIGNING_IDENTITY to an Apple Development or Developer ID Application identity.' \
+  "the public alpha packager must refuse an identity-less artifact"
+require_text \
+  "$ROOT/package-alpha-dmg.sh" \
   'Privacy & Security, then choose Open Anyway' \
-  "the unsigned alpha DMG must include a Gatekeeper recovery instruction"
+  "the non-notarized signed alpha DMG must include a Gatekeeper recovery instruction"
+require_text \
+  "$ROOT/package-alpha-dmg.sh" \
+  'development-signed' \
+  "Apple Development alpha artifacts must disclose their signing class"
+require_text \
+  "$ROOT/package-alpha-dmg.sh" \
+  'diskutil image create from' \
+  "current macOS packaging must use the supported folder-image path"
+require_text \
+  "$ROOT/package-alpha-dmg.sh" \
+  'test -d "$MOUNT_DIR/Voice Relay.app"' \
+  "the DMG verifier must reject an empty or malformed image"
 require_text \
   "$ROOT/package-alpha-dmg.sh" \
   'Corresponding source for Voice Relay' \

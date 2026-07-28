@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import WebKit
 
 private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
@@ -17,6 +18,11 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
 }
 
 final class DirectRealtimeController: NSObject {
+    private static let logger = Logger(
+        subsystem: "com.hyungchulc.voice-relay",
+        category: "RealtimeReducer"
+    )
+
     private let model: String
     private let voice: String
     private let reasoningEffort: String
@@ -109,16 +115,8 @@ final class DirectRealtimeController: NSObject {
             )
         }
         transport.onDiagnostic = { snapshot in
-            NSLog(
-                "Voice Relay native Realtime stage=%@ generation=%d captured=%d sent=%d received=%d rendered=%d dropped=%d voiceProcessing=%@",
-                snapshot.stage,
-                snapshot.generation,
-                snapshot.capturedChunks,
-                snapshot.sentChunks,
-                snapshot.receivedChunks,
-                snapshot.renderedChunks,
-                snapshot.droppedCaptureChunks,
-                snapshot.voiceProcessingEnabled ? "on" : "off"
+            Self.logger.notice(
+                "Native Realtime stage=\(snapshot.stage, privacy: .public) generation=\(snapshot.generation) captured=\(snapshot.capturedChunks) sent=\(snapshot.sentChunks) received=\(snapshot.receivedChunks) rendered=\(snapshot.renderedChunks) dropped=\(snapshot.droppedCaptureChunks) echo_suppressed=\(snapshot.suppressedEchoChunks) voice_processing=\(snapshot.voiceProcessingEnabled ? "on" : "off", privacy: .public)"
             )
         }
         transport.onError = { [weak self] generation, message in
@@ -306,6 +304,18 @@ extension DirectRealtimeController: WKScriptMessageHandler {
             handleRealtimeSend(body)
             return
         }
+        if type == "playbackInterrupt",
+           let generation = (body["generation"] as? NSNumber)?.intValue,
+           generation == activeGeneration {
+            transport.interruptPlayback(generation: generation)
+            return
+        }
+        if type == "playbackResume",
+           let generation = (body["generation"] as? NSNumber)?.intValue,
+           generation == activeGeneration {
+            transport.resumePlayback(generation: generation)
+            return
+        }
         if type == "codexRequest" {
             handleCodexRequest(body)
             return
@@ -320,13 +330,12 @@ extension DirectRealtimeController: WKScriptMessageHandler {
             let ice = body["ice"] as? String ?? "-"
             let channel = body["channel"] as? String ?? "-"
             let shape = body["shape"] as? String ?? "-"
-            NSLog(
-                "Voice Relay Realtime diagnostic stage=%@ peer=%@ ice=%@ channel=%@ shape=%@",
-                stage,
-                peer,
-                ice,
-                channel,
-                shape
+            let kind = body["kind"] as? String ?? "-"
+            let code = body["code"] as? String ?? "-"
+            let errorType = body["errorType"] as? String ?? "-"
+            let eventID = body["eventID"] as? String ?? "-"
+            Self.logger.notice(
+                "Realtime diagnostic stage=\(stage, privacy: .public) peer=\(peer, privacy: .public) ice=\(ice, privacy: .public) channel=\(channel, privacy: .public) shape=\(shape, privacy: .public) kind=\(kind, privacy: .public) code=\(code, privacy: .public) error_type=\(errorType, privacy: .public) event_id=\(eventID, privacy: .public)"
             )
             return
         }
@@ -496,7 +505,15 @@ extension DirectRealtimeController: WKScriptMessageHandler {
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return
         }
+        NSLog(
+            "Voice Relay Codex bridge accepted request generation=%d",
+            generation
+        )
         guard let onCodexRequest else {
+            NSLog(
+                "Voice Relay Codex bridge unavailable generation=%d",
+                generation
+            )
             evaluate(
                 method: "resolveCodex",
                 payload: [
@@ -512,6 +529,10 @@ extension DirectRealtimeController: WKScriptMessageHandler {
                 guard let self, self.activeGeneration == generation else { return }
                 switch result {
                 case let .success(output):
+                    NSLog(
+                        "Voice Relay Codex bridge completed generation=%d result=success",
+                        generation
+                    )
                     self.evaluate(
                         method: "resolveCodex",
                         payload: [
@@ -521,6 +542,11 @@ extension DirectRealtimeController: WKScriptMessageHandler {
                         ]
                     )
                 case let .failure(error):
+                    NSLog(
+                        "Voice Relay Codex bridge completed generation=%d result=failure error=%@",
+                        generation,
+                        error.localizedDescription
+                    )
                     self.evaluate(
                         method: "resolveCodex",
                         payload: [
@@ -592,7 +618,10 @@ extension DirectRealtimeController: WKScriptMessageHandler {
         "stopAcknowledgementDrained",
         "credentialRequest",
         "realtimeSend",
+        "playbackInterrupt",
+        "playbackResume",
         "terminal",
+        "turnError",
         "error",
         "diagnostic",
     ]
@@ -639,6 +668,7 @@ private extension DirectRealtimeController {
       const send = payload => native?.postMessage(payload);
       let session = null;
       let activeStartGeneration = 0;
+      const recentHandoffAcknowledgements = [];
 
       function state(phase, generation) {
         if (
@@ -709,6 +739,74 @@ private extension DirectRealtimeController {
         }
         resetAssistantDraft();
         return true;
+      }
+
+      function finishInterruptedPlaybackForBargeIn() {
+        if (!session) return;
+        const responseIds = Array.from(session.audioResponseIds);
+        if (responseIds.length === 0) {
+          processNextAcceptedTurn();
+          return;
+        }
+        const responseId = String(responseIds.at(-1) || "");
+        for (const interruptedId of responseIds) {
+          const playedText = String(
+            session.assistantPlaybackTextByResponseId.get(interruptedId) || ""
+          ).trim();
+          if (playedText) {
+            session.recentAssistantPlaybackTexts.push({
+              text: playedText,
+              expiresAt: Date.now() + 8_000
+            });
+          }
+          session.audioResponseIds.delete(interruptedId);
+          session.finalAudioResponseIds.delete(interruptedId);
+          session.assistantPlaybackTextByResponseId.delete(interruptedId);
+        }
+        pruneRecentAssistantPlaybackTexts();
+        if (!session.activeResponseId && session.codexSpeechInFlight) {
+          finishActiveCodexSpeech(responseId);
+        } else {
+          processNextAcceptedTurn();
+        }
+      }
+
+      function recoverFromRealtimeServerError(event, generation) {
+        const error = event?.error || {};
+        const causalEventId = String(error.event_id || "");
+        const responseId = String(session?.activeResponseId || "");
+        diagnostic("server_error", generation, {
+          code: String(error.code || ""),
+          errorType: String(error.type || ""),
+          eventID: causalEventId
+        });
+
+        if (responseId) {
+          session.codexSpeechResponseKinds.delete(responseId);
+          session.progressResponseIds.delete(responseId);
+          session.transientAssistantTranscripts.delete(responseId);
+        }
+        session.activeResponseId = "";
+        session.responseCancelPending = false;
+        session.expectedCancelEventIds.clear();
+
+        if (session.codexSpeechInFlight) {
+          finishActiveCodexSpeech(responseId);
+        }
+        if (session.codexInFlight) {
+          state("thinking", generation);
+          return;
+        }
+
+        session.pendingCalls.clear();
+        session.awaitingFinal = false;
+        resetAssistantDraft();
+        send({
+          type: "turnError",
+          generation,
+          code: String(error.code || "")
+        });
+        completeAcceptedTurn();
       }
 
       function responseText(response) {
@@ -782,6 +880,84 @@ private extension DirectRealtimeController {
         });
       }
 
+      function rememberAssistantPlaybackText(
+        responseId,
+        text,
+        replace = false
+      ) {
+        if (!session) return;
+        const normalizedResponseId = String(responseId || "");
+        const value = String(text || "");
+        if (!normalizedResponseId || !value) return;
+        const previous = String(
+          session.assistantPlaybackTextByResponseId.get(
+            normalizedResponseId
+          ) || ""
+        );
+        session.assistantPlaybackTextByResponseId.set(
+          normalizedResponseId,
+          replace ? value : `${previous}${value}`
+        );
+      }
+
+      function normalizedEchoText(text) {
+        return String(text || "")
+          .normalize("NFKC")
+          .toLocaleLowerCase()
+          .replace(/[^\p{L}\p{N}]+/gu, "");
+      }
+
+      function echoBigramSimilarity(lhs, rhs) {
+        if (lhs === rhs) return 1;
+        if (lhs.length < 2 || rhs.length < 2) return 0;
+        const counts = new Map();
+        for (let index = 0; index < lhs.length - 1; index += 1) {
+          const gram = lhs.slice(index, index + 2);
+          counts.set(gram, (counts.get(gram) || 0) + 1);
+        }
+        let overlap = 0;
+        for (let index = 0; index < rhs.length - 1; index += 1) {
+          const gram = rhs.slice(index, index + 2);
+          const count = counts.get(gram) || 0;
+          if (count <= 0) continue;
+          overlap += 1;
+          counts.set(gram, count - 1);
+        }
+        return (2 * overlap) / (lhs.length + rhs.length - 2);
+      }
+
+      function pruneRecentAssistantPlaybackTexts() {
+        if (!session) return;
+        const now = Date.now();
+        session.recentAssistantPlaybackTexts =
+          session.recentAssistantPlaybackTexts.filter(
+            item => Number(item.expiresAt || 0) > now
+          );
+      }
+
+      function isLikelyAssistantPlaybackEcho(text) {
+        if (!session) return false;
+        const candidate = normalizedEchoText(text);
+        if (candidate.length < 4) return false;
+        pruneRecentAssistantPlaybackTexts();
+        const sources = [
+          ...session.assistantPlaybackTextByResponseId.values(),
+          ...session.recentAssistantPlaybackTexts.map(item => item.text)
+        ];
+        return sources.some(sourceText => {
+          const source = normalizedEchoText(sourceText);
+          if (source.length < 4) return false;
+          const shorter = Math.min(candidate.length, source.length);
+          const longer = Math.max(candidate.length, source.length);
+          const containment =
+            (candidate.includes(source) || source.includes(candidate))
+            && shorter >= 5
+            && shorter / longer >= 0.42;
+          return containment
+            || echoBigramSimilarity(candidate, source) >= 0.72;
+        });
+      }
+
       function emitAssistantFinalOnce(text, responseId = "") {
         const value = String(text || "").trim();
         if (!session || !session.awaitingFinal || !value) return false;
@@ -806,11 +982,14 @@ private extension DirectRealtimeController {
 
       function handoffProgressInstructions(text) {
         const request = String(text || "").trim();
+        const recent = recentHandoffAcknowledgements.slice(-3);
         return [
           "Give one brief, natural, non-question handoff acknowledgement in the user's language.",
           "State only that the request is being passed on or checked.",
-          "Vary the wording naturally instead of using one stock phrase.",
-          "For English, natural variants include 'Let me check' and 'I will look into that.'",
+          "Use fresh wording and a different sentence shape each time instead of a stock phrase.",
+          recent.length > 0
+            ? `Do not reuse or closely paraphrase these recent acknowledgements: ${JSON.stringify(recent)}`
+            : "Choose the wording freely.",
           "Use at most eight words.",
           "Never ask a question or request information from the user.",
           "Do not reference the request's subject or repeat words from it.",
@@ -898,6 +1077,7 @@ private extension DirectRealtimeController {
         if (!session) return;
         const normalizedResponseId = String(responseId || "");
         if (normalizedResponseId) {
+          session.audioResponseIds.delete(normalizedResponseId);
           session.codexSpeechResponseKinds.delete(normalizedResponseId);
           session.progressResponseIds.delete(normalizedResponseId);
           session.transientAssistantTranscripts.delete(normalizedResponseId);
@@ -906,6 +1086,7 @@ private extension DirectRealtimeController {
         session.activeCodexSpeech = null;
         startNextActiveCodexControlTurn();
         startNextCodexSpeech();
+        processNextAcceptedTurn();
       }
 
       function isMeaningfulSpeechTranscript(text) {
@@ -937,15 +1118,91 @@ private extension DirectRealtimeController {
         session.draftFlushTimer = null;
       }
 
+      function routeVoiceTurnTool() {
+        return {
+          type: "function",
+          name: "route_voice_turn",
+          description:
+            "Classify one completed voice turn immediately. Direct chat is only pure social speech that needs no facts or context. Any factual, current-state, personal-context, device-state, external-information, calculation, verification, lookup, analysis, tool, file, app, memory, or source-dependent request must use codex. If a complete reliable answer could take more than about five seconds, use codex. When in doubt, use codex. Do not speak before this tool call.",
+          parameters: {
+            type: "object",
+            properties: {
+              kind: {
+                type: "string",
+                enum: [
+                  "stop_session",
+                  "local_datetime",
+                  "direct_chat",
+                  "local_identity",
+                  "local_wake",
+                  "local_presence",
+                  "codex",
+                  "clarify",
+                  "ignore"
+                ]
+              }
+            },
+            required: ["kind"],
+            additionalProperties: false
+          }
+        };
+      }
+
+      function normalizeRouteKind(value) {
+        const kind = String(value || "");
+        const allowed = new Set([
+          "stop_session",
+          "local_datetime",
+          "direct_chat",
+          "local_identity",
+          "local_wake",
+          "local_presence",
+          "codex",
+          "clarify",
+          "ignore"
+        ]);
+        return allowed.has(kind) ? kind : "codex";
+      }
+
+      function requestRouteDecision() {
+        return dataSend({
+          type: "response.create",
+          response: {
+            output_modalities: ["text"],
+            tools: [routeVoiceTurnTool()],
+            tool_choice: "required",
+            parallel_tool_calls: false,
+            metadata: { voice_relay_kind: "route_classifier" },
+            instructions:
+              "Call route_voice_turn immediately. Decide semantically from the complete utterance. Direct chat is only pure social speech with no factual or contextual content. Every current, factual, personal-context, device-state, external-information, calculation, verification, lookup, analysis, tool, file, app, memory, or source-dependent request must use codex. When in doubt, use codex. Do not answer or produce audio before the tool call."
+          }
+        });
+      }
+
+      function isAwaitingRouteDecision() {
+        return Boolean(
+          session
+          && session.routeInFlight
+          && session.pendingCalls.size === 0
+          && !session.awaitingFinal
+          && !session.codexInFlight
+        );
+      }
+
       function processNextAcceptedTurn() {
         if (!session || session.lifecycle !== "active"
             || session.routeInFlight
+            || session.activeResponseId
+            || session.responseCancelPending
+            || session.codexSpeechInFlight
+            || session.audioResponseIds.size > 0
             || session.acceptedTurnQueue.length === 0) {
           return;
         }
         const turn = session.acceptedTurnQueue.shift();
         session.activeUserTurn = turn;
         session.routeInFlight = true;
+        session.routeClassifierRetryCount = 0;
         resetAssistantDraft();
         if (turn.inputText) {
           dataSend({
@@ -965,7 +1222,7 @@ private extension DirectRealtimeController {
             text: turn.text
           });
         }
-        dataSend({ type: "response.create" });
+        requestRouteDecision();
         state("thinking", session.generation);
       }
 
@@ -1179,7 +1436,6 @@ private extension DirectRealtimeController {
         switch (event.type) {
           case "input_audio_buffer.speech_started":
             session.currentUserTranscript = "";
-            cancelActiveResponseForBargeIn();
             send({
               type: "userTranscriptPartial",
               generation: session.generation,
@@ -1203,6 +1459,32 @@ private extension DirectRealtimeController {
             const text = String(event.transcript || "").trim();
             session.currentUserTranscript = "";
             if (!isMeaningfulSpeechTranscript(text)) break;
+            if (isLikelyAssistantPlaybackEcho(text)) {
+              diagnostic(
+                "playback_echo_transcript_suppressed",
+                generation
+              );
+              send({
+                type: "playbackResume",
+                generation: session.generation
+              });
+              send({
+                type: "userTranscriptPartial",
+                generation: session.generation,
+                text: ""
+              });
+              break;
+            }
+            const hadBufferedPlayback = session.audioResponseIds.size > 0;
+            if (session.activeResponseId || hadBufferedPlayback) {
+              send({
+                type: "playbackInterrupt",
+                generation: session.generation
+              });
+            }
+            if (session.activeResponseId) {
+              cancelActiveResponseForBargeIn();
+            }
             if (session.codexInFlight) {
               send({
                 type: "userTranscript",
@@ -1210,9 +1492,15 @@ private extension DirectRealtimeController {
                 text
               });
               queueActiveCodexControlTurn(text);
+              if (hadBufferedPlayback) {
+                finishInterruptedPlaybackForBargeIn();
+              }
               break;
             }
             acceptUserTurn(text, false);
+            if (hadBufferedPlayback) {
+              finishInterruptedPlaybackForBargeIn();
+            }
             break;
           }
           case "response.function_call_arguments.done": {
@@ -1221,6 +1509,12 @@ private extension DirectRealtimeController {
               break;
             }
             if (event.name !== "route_voice_turn") break;
+            if (!isAwaitingRouteDecision()) break;
+            const callId = String(event.call_id || "").trim();
+            if (!callId) {
+              diagnostic("route_invalid_call", generation);
+              break;
+            }
             session.lastAudioTranscript = "";
             let args = {};
             try { args = JSON.parse(event.arguments || "{}"); } catch (_) {}
@@ -1233,16 +1527,17 @@ private extension DirectRealtimeController {
               );
               break;
             }
-            session.pendingCalls.add(event.call_id);
-            const kind = String(args.kind || "codex");
+            session.pendingCalls.add(callId);
+            const kind = normalizeRouteKind(args.kind);
+            diagnostic("route_decision", generation, { kind });
             if (kind === "stop_session") {
-              session.pendingCalls.delete(event.call_id);
+              session.pendingCalls.delete(callId);
               beginSemanticStop(text);
               break;
             }
             if (kind === "local_datetime") {
               finishRoute(
-                event.call_id,
+                callId,
                 { status: "ok", request: text, ...localDateTimeResult() },
                 "Answer only the user's exact local time, date, or weekday question from the tool result. Use one short sentence in the user's language."
               );
@@ -1250,7 +1545,7 @@ private extension DirectRealtimeController {
             }
             if (kind === "direct_chat") {
               finishRoute(
-                event.call_id,
+                callId,
                 { status: "ok", request: text },
                 "Give one brief natural conversational reply to the exact request. This route is only for a greeting, thanks, goodbye, repeat request, conversational receipt, approval, or acknowledgement that adds no work. Do not add facts, advice, or a new topic."
               );
@@ -1258,7 +1553,7 @@ private extension DirectRealtimeController {
             }
             if (kind === "local_identity") {
               finishRoute(
-                event.call_id,
+                callId,
                 {
                   status: "ok",
                   request: text,
@@ -1271,7 +1566,7 @@ private extension DirectRealtimeController {
             }
             if (kind === "local_wake") {
               finishRoute(
-                event.call_id,
+                callId,
                 {
                   status: "ok",
                   request: text
@@ -1282,7 +1577,7 @@ private extension DirectRealtimeController {
             }
             if (kind === "local_presence") {
               finishRoute(
-                event.call_id,
+                callId,
                 {
                   status: "ok",
                   request: text
@@ -1292,12 +1587,12 @@ private extension DirectRealtimeController {
               break;
             }
             if (kind === "ignore") {
-              session.pendingCalls.delete(event.call_id);
+              session.pendingCalls.delete(callId);
               dataSend({
                 type: "conversation.item.create",
                 item: {
                   type: "function_call_output",
-                  call_id: event.call_id,
+                  call_id: callId,
                   output: JSON.stringify({ status: "ignored" })
                 }
               });
@@ -1307,7 +1602,7 @@ private extension DirectRealtimeController {
             }
             if (kind === "clarify") {
               finishRoute(
-                event.call_id,
+                callId,
                 { status: "clarify", request: text },
                 "Ask one short clarification question in the user's language. Do not guess."
               );
@@ -1322,13 +1617,17 @@ private extension DirectRealtimeController {
             send({
               type: "codexRequest",
               generation,
-              callId: event.call_id,
+              callId,
               text
             });
             break;
           }
           case "response.output_audio.delta":
           case "response.audio.delta":
+            if (isAwaitingRouteDecision()) break;
+            if (event.response_id) {
+              session.audioResponseIds.add(String(event.response_id));
+            }
             state("speaking", generation);
             break;
           case "response.created":
@@ -1361,15 +1660,27 @@ private extension DirectRealtimeController {
             break;
           case "response.output_audio_transcript.delta":
           case "response.audio_transcript.delta":
+            if (isAwaitingRouteDecision()) break;
+            rememberAssistantPlaybackText(
+              event.response_id,
+              event.delta
+            );
             publishTransientAssistantDraft(event.delta, event.response_id);
             queueAssistantDraft(event.delta, event.response_id);
             break;
           case "response.output_audio_transcript.done":
           case "response.audio_transcript.done": {
+            if (isAwaitingRouteDecision()) break;
             const responseId = String(event.response_id || "");
+            rememberAssistantPlaybackText(
+              responseId,
+              event.transcript,
+              true
+            );
             if (isTransientCodexSpeechKind(activeCodexSpeechKind(responseId))
                 || session.progressResponseIds.has(responseId)
                 || session.stopAcknowledgementResponseIds.has(responseId)) {
+              const speechKind = activeCodexSpeechKind(responseId);
               const text = String(
                 event.transcript
                   || session.transientAssistantTranscripts.get(responseId)
@@ -1377,11 +1688,20 @@ private extension DirectRealtimeController {
               ).trim();
               if (text && !session.stopAcknowledgementResponseIds.has(responseId)) {
                 session.transientAssistantTranscripts.set(responseId, text);
+                if (speechKind === "codex_progress") {
+                  recentHandoffAcknowledgements.push(text);
+                  if (recentHandoffAcknowledgements.length > 3) {
+                    recentHandoffAcknowledgements.splice(
+                      0,
+                      recentHandoffAcknowledgements.length - 3
+                    );
+                  }
+                }
                 send({
                   type: "assistantProgress",
                   generation: session.generation,
                   responseId,
-                  kind: activeCodexSpeechKind(responseId),
+                  kind: speechKind,
                   text
                 });
               }
@@ -1410,7 +1730,11 @@ private extension DirectRealtimeController {
                 session.responseCancelPending = false;
                 session.expectedCancelEventIds.clear();
               }
-              finishActiveCodexSpeech(responseId);
+              const responseStatus = String(event.response?.status || "");
+              if (!session.audioResponseIds.has(responseId)
+                  || (responseStatus && responseStatus !== "completed")) {
+                finishActiveCodexSpeech(responseId);
+              }
               state("thinking", generation);
               break;
             }
@@ -1420,6 +1744,40 @@ private extension DirectRealtimeController {
               ? event.response.output
               : [];
             const hasFunctionCall = output.some(item => item?.type === "function_call");
+            const phases = Array.from(new Set(
+              output.map(item => String(item?.phase || "unphased"))
+            ));
+            diagnostic("response_done", generation, {
+              kind: responseKind || "unclassified",
+              shape: phases.join(",") || "empty"
+            });
+            if (isAwaitingRouteDecision()) {
+              if (session.routeClassifierRetryCount < 1) {
+                session.routeClassifierRetryCount += 1;
+                if (!responseId || session.activeResponseId === responseId) {
+                  session.activeResponseId = "";
+                  session.responseCancelPending = false;
+                  session.expectedCancelEventIds.clear();
+                }
+                requestRouteDecision();
+                state("thinking", generation);
+                break;
+              }
+              session.routeClassifierRetryCount = 0;
+              send({
+                type: "turnError",
+                generation,
+                code: "route_classifier_failed"
+              });
+              completeAcceptedTurn();
+              if (!responseId || session.activeResponseId === responseId) {
+                session.activeResponseId = "";
+                session.responseCancelPending = false;
+                session.expectedCancelEventIds.clear();
+              }
+              processNextAcceptedTurn();
+              break;
+            }
             if (!hasFunctionCall && session.awaitingFinal && text) {
               emitAssistantFinalOnce(text, event.response?.id || "");
             }
@@ -1437,8 +1795,13 @@ private extension DirectRealtimeController {
               session.responseCancelPending = false;
               session.expectedCancelEventIds.clear();
             }
+            processNextAcceptedTurn();
             if (responseKind === "codex_final") {
-              finishActiveCodexSpeech(responseId);
+              const responseStatus = String(event.response?.status || "");
+              if (!session.audioResponseIds.has(responseId)
+                  || (responseStatus && responseStatus !== "completed")) {
+                finishActiveCodexSpeech(responseId);
+              }
             } else {
               startNextActiveCodexControlTurn();
               startNextCodexSpeech();
@@ -1452,6 +1815,12 @@ private extension DirectRealtimeController {
               const cancelledResponseId = session.activeResponseId;
               session.responseCancelPending = false;
               session.activeResponseId = "";
+              if (session.routeInFlight && !session.codexInFlight) {
+                session.routeInFlight = false;
+                session.activeUserTurn = null;
+                session.pendingCalls.clear();
+                session.awaitingFinal = false;
+              }
               diagnostic(
                 "response_cancel_rejected",
                 generation,
@@ -1462,14 +1831,11 @@ private extension DirectRealtimeController {
               } else {
                 startNextActiveCodexControlTurn();
                 startNextCodexSpeech();
+                processNextAcceptedTurn();
               }
               break;
             }
-            send({
-              type: "error",
-              generation,
-              message: event.error?.message || "Realtime error"
-            });
+            recoverFromRealtimeServerError(event, generation);
             break;
           }
         }
@@ -1489,6 +1855,9 @@ private extension DirectRealtimeController {
           pendingCalls: new Set(),
           reportedAssistantResponses: new Set(),
           finalAudioResponseIds: new Set(),
+          audioResponseIds: new Set(),
+          assistantPlaybackTextByResponseId: new Map(),
+          recentAssistantPlaybackTexts: [],
           progressResponseIds: new Set(),
           stopAcknowledgementResponseIds: new Set(),
           expectedCancelEventIds: new Set(),
@@ -1507,6 +1876,7 @@ private extension DirectRealtimeController {
           acceptedTurnQueue: [],
           activeUserTurn: null,
           routeInFlight: false,
+          routeClassifierRetryCount: 0,
           codexInFlight: false,
           activeCodexControlQueue: [],
           activeCodexControlText: "",
@@ -1608,33 +1978,7 @@ private extension DirectRealtimeController {
                 voice: startPayload.voice
               }
             },
-            tools: [{
-              type: "function",
-              name: "route_voice_turn",
-              description:
-                "Classify one completed voice turn immediately. Direct chat is only pure social speech that needs no facts or context. Any factual, current-state, personal-context, device-state, external-information, calculation, verification, lookup, analysis, tool, file, app, memory, or source-dependent request must use codex. If a complete reliable answer could take more than about five seconds, use codex. When in doubt, use codex. Do not speak before this tool call.",
-              parameters: {
-                type: "object",
-                properties: {
-                  kind: {
-                    type: "string",
-                    enum: [
-                      "stop_session",
-                      "local_datetime",
-                      "direct_chat",
-                      "local_identity",
-                      "local_wake",
-                      "local_presence",
-                      "codex",
-                      "clarify",
-                      "ignore"
-                    ]
-                  }
-                },
-                required: ["kind"],
-                additionalProperties: false
-              }
-            }],
+            tools: [routeVoiceTurnTool()],
             tool_choice: "required"
           }
         });
@@ -1697,12 +2041,31 @@ private extension DirectRealtimeController {
           });
           return;
         }
-        if (!session.finalAudioResponseIds.delete(responseId)) return;
-        send({
-          type: "assistantPlaybackDrained",
-          generation,
-          responseId
-        });
+        const responseKind = activeCodexSpeechKind(responseId);
+        const wasFinal = session.finalAudioResponseIds.delete(responseId);
+        const playedText = String(
+          session.assistantPlaybackTextByResponseId.get(responseId) || ""
+        ).trim();
+        session.assistantPlaybackTextByResponseId.delete(responseId);
+        if (playedText) {
+          session.recentAssistantPlaybackTexts.push({
+            text: playedText,
+            expiresAt: Date.now() + 8_000
+          });
+          pruneRecentAssistantPlaybackTexts();
+        }
+        session.audioResponseIds.delete(responseId);
+        if (responseKind.startsWith("codex_")) {
+          finishActiveCodexSpeech(responseId);
+        }
+        processNextAcceptedTurn();
+        if (wasFinal) {
+          send({
+            type: "assistantPlaybackDrained",
+            generation,
+            responseId
+          });
+        }
         if (session.finalAudioResponseIds.size === 0
             && !session.routeInFlight
             && session.pendingCalls.size === 0

@@ -12,7 +12,11 @@ enum LaunchAtLoginStatus: Equatable {
     }
 
     var canChangeRegistration: Bool {
-        self != .notFound
+        true
+    }
+
+    var shouldRegisterWhenEnabled: Bool {
+        self == .notRegistered || self == .notFound
     }
 }
 
@@ -69,7 +73,7 @@ final class LaunchAtLoginManager {
         guard current.canChangeRegistration else { return current }
 
         if enabled {
-            if current == .notRegistered {
+            if current.shouldRegisterWhenEnabled {
                 try service.register()
             }
         } else if current.isRegistered {

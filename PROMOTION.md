@@ -80,9 +80,18 @@ The products overlap, but optimize for different things.
 | GPT-Live full-duplex conversation where Live is available | Direct `gpt-realtime-2.1` speech with semantic Codex handoff |
 | Instant, Medium, and High reasoning choices, with deeper work delegated to an OpenAI-managed background frontier model | Human-selected Codex model and thinking level inherited from the effective `config.toml` and validated before use |
 | Multiple agents, conversations, and projects | One explicit persistent Codex Session ID |
-| Desktop app on macOS and Windows, plus paired iOS access | Notch or Orb on macOS, local wake phrase, and launch at login |
+| Desktop app on macOS and Windows, plus paired iOS access | Notch or Orb on macOS, local wake phrase, and native launch at login in supported signed builds |
 | Available project context and connected tools | Optional Authority Pack and bounded Additional Context Providers |
 | Normal product setup and support | Inspectable GPLv3 source and a customizable public alpha |
+
+## Native speech proof point
+
+Emphasize that Voice Relay uses Apple's latest on-device SpeechAnalyzer for
+local wake-phrase recognition on macOS 26 or newer when every selected language
+asset is available. The implementation applies short-form and far-field hints,
+contextual wake phrases, a bounded transient audio-device retry, and automatic
+classic on-device fallback. Keep the boundary explicit: SpeechAnalyzer powers
+local wake detection, not the main Realtime conversation or Codex reasoning.
 
 Do not market Voice Relay as more natural than GPT-Live-1. Lead with ambient
 macOS access, explicit session ownership, open-source control, and personal
@@ -172,8 +181,9 @@ https://github.com/hyungchulc/voice-relay
 
 ## Honest alpha note
 
-The current downloadable build is ad-hoc signed and not notarized, so macOS may
-show an unidentified-developer warning and require **System Settings > Privacy
-& Security > Open Anyway**. APIs, setup, and packaging may change before 1.0.
-Capabilities remain subject to the user's Codex/ChatGPT desktop configuration,
-permissions, account access, and the current public alpha implementation.
+The current downloadable build is Apple Development signed and not notarized,
+so macOS may still require **System Settings > Privacy & Security > Open
+Anyway**. This is a developer alpha, not an App Store or Developer ID release.
+APIs, setup, and packaging may change before 1.0. Capabilities remain subject
+to the user's Codex/ChatGPT desktop configuration, permissions, account access,
+and the current public alpha implementation.

@@ -113,8 +113,7 @@ are never logged or bundled. Voice Relay does not embed an OpenAI API key,
 Remote enrollment, Session ID, private context, or other developer state.
 
 The current public alpha bundles its GPLv3 Codex Remote support source inside
-the app. It remains a developer preview because the build is ad-hoc signed and
-not notarized.
+the app. It remains a developer preview because it is not notarized.
 
 ## Build and launch
 
@@ -161,6 +160,16 @@ Realtime Voice, and confirms the ready state. The all-zero UUID shown in the
 field is a placeholder only. The stored Session ID starts empty, so Voice Relay
 creates and persists a new dedicated session during its first Remote warm-up.
 
+### Latest on-device SpeechAnalyzer
+
+Local wake-phrase recognition is a first-class native feature. On macOS 26 or
+newer, Voice Relay can use Apple's latest SpeechAnalyzer with short-form and
+far-field content hints, per-language asset checks, contextual wake phrases,
+one bounded retry while the audio device is switching, and automatic fallback
+to the classic on-device recognizer. SpeechAnalyzer is used only for local wake
+phrases; the main conversation still uses the selected Realtime voice and the
+paired Codex task.
+
 Open Settings later with `⌘,`. Settings exposes product and assistant names,
 permissions, the optional editable Session ID, wake phrases, system or custom
 speech languages, a user-facing latest SpeechAnalyzer preference, a documented
@@ -176,7 +185,9 @@ Connection, Permissions, and Advanced separate.
 
 General settings also exposes `Open Voice Relay at login`. It uses the native
 macOS Login Items service and reflects the current system registration or
-approval state rather than storing a second preference inside the app.
+approval state rather than storing a second preference inside the app. A
+missing Background Tasks record is treated as the registerable first-run state,
+not as a permanent build limitation.
 
 ## Optional Authority Pack
 
@@ -331,18 +342,20 @@ The smoke test requires the Voice Relay controller and desktop app host to be pa
 
 ## Release packaging
 
-For the public developer alpha, create an ad-hoc signed universal DMG:
+For the public developer alpha, create an Apple Development signed universal
+DMG. This is a developer build, not an App Store or notarized distribution:
 
 ```bash
-VOICE_RELAY_SOURCE_URL="https://github.com/example/voice-relay/archive/refs/tags/v0.4.0-alpha.2.tar.gz" \
-VOICE_RELAY_RELEASE_LABEL="0.4.0-alpha.2" \
+VOICE_RELAY_SIGNING_IDENTITY="Apple Development: Example Person (TEAMID)" \
+VOICE_RELAY_SOURCE_URL="https://github.com/example/voice-relay/archive/refs/tags/v0.4.0-alpha.3.tar.gz" \
+VOICE_RELAY_RELEASE_LABEL="0.4.0-alpha.3" \
 ./package-alpha-dmg.sh
 ```
 
 The DMG includes `Voice Relay.app`, an Applications shortcut, GPLv3 license,
 installation instructions, distribution notes, and the exact corresponding
-source URL. Because this path is not Developer ID signed or notarized, macOS
-may require **System Settings → Privacy & Security → Open Anyway**.
+source URL. Because this path is not notarized, macOS may require
+**System Settings → Privacy & Security → Open Anyway**.
 
 For a normal trusted public build, a Developer ID Application certificate is
 required:

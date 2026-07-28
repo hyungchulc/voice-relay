@@ -54,6 +54,9 @@ final class WakePhraseController {
         }
         self.phrases = SettingsStore.normalizedWakePhrases(phrases)
         self.preferModernSpeechAnalyzer = preferModernSpeechAnalyzer
+        Self.logger.info(
+            "Wake configuration locales=\(resolved.joined(separator: ","), privacy: .public) phrase_count=\(self.phrases.count)"
+        )
     }
 
     func startMonitoring() {
@@ -64,6 +67,7 @@ final class WakePhraseController {
         wantsMonitoring = true
         guard !isMonitoring,
               modernStartTask == nil,
+              modernSession == nil,
               !permissionRequestInFlight else {
             return
         }
@@ -113,7 +117,8 @@ final class WakePhraseController {
     private func startRecognitionIfPossible() {
         guard wantsMonitoring,
               !isMonitoring,
-              modernStartTask == nil else {
+              modernStartTask == nil,
+              modernSession == nil else {
             return
         }
         if #available(macOS 26.0, *),
@@ -231,7 +236,7 @@ final class WakePhraseController {
                     self.modernTransientRetryCount = 0
                     self.isMonitoring = true
                     Self.logger.info(
-                        "SpeechAnalyzer active locales=\(locales.map(\.identifier).joined(separator: ","), privacy: .public)"
+                        "SpeechAnalyzer active locales=\(locales.map(\.identifier).joined(separator: ","), privacy: .public) phrase_count=\(self.phrases.count)"
                     )
                     self.onState?(true)
                 case let .failure(error):
@@ -313,7 +318,7 @@ final class WakePhraseController {
 
         isMonitoring = true
         Self.logger.info(
-            "Legacy recognizer active locales=\(availableRecognizers.map(\.locale.identifier).joined(separator: ","), privacy: .public)"
+            "Legacy recognizer active locales=\(availableRecognizers.map(\.locale.identifier).joined(separator: ","), privacy: .public) phrase_count=\(self.phrases.count)"
         )
         onState?(true)
         tasks = zip(availableRecognizers, requests).enumerated().map {
@@ -393,6 +398,9 @@ final class WakePhraseController {
                 return
             }
             self.wantsMonitoring = false
+            Self.logger.notice(
+                "Wake matched lane=\(laneIndex) phrase_count=\(self.phrases.count) final=\(candidate.isFinal) command_tail=\(!candidate.match.command.isEmpty)"
+            )
             self.stopRecognition()
             self.onWake?(candidate.match)
         }

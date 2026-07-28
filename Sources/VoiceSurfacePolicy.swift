@@ -416,7 +416,7 @@ struct RealtimeStartupRetryState {
     private(set) var listeningReady = false
     private(set) var retryReserved = false
 
-    init(maximumTransportAttempts: Int = 2) {
+    init(maximumTransportAttempts: Int = 3) {
         self.maximumTransportAttempts = max(1, maximumTransportAttempts)
     }
 
@@ -703,35 +703,40 @@ enum WakePhrasePolicy {
         phrases rawPhrases: [String]
     ) -> WakePhraseMatch? {
         let phrases = SettingsStore.normalizedWakePhrases(rawPhrases)
-        let alternatives = phrases
-            .sorted { $0.count > $1.count }
-            .map(pattern(for:))
-            .joined(separator: "|")
-        guard !alternatives.isEmpty,
-              let expression = try? NSRegularExpression(
-                  pattern: #"^\s*(?:"# + alternatives + #")(?=$|[\s,.!?…。、])"#,
-                  options: [.caseInsensitive]
-              ) else {
-            return nil
+        let range = NSRange(
+            transcript.startIndex..<transcript.endIndex,
+            in: transcript
+        )
+        for phrase in phrases.sorted(by: { $0.count > $1.count }) {
+            guard let expression = try? NSRegularExpression(
+                pattern:
+                    #"^\s*(?:"# + pattern(for: phrase)
+                    + #")(?=$|[\s\p{P}])"#,
+                options: [.caseInsensitive]
+            ),
+            let match = expression.firstMatch(
+                in: transcript,
+                range: range
+            ),
+            let swiftRange = Range(match.range, in: transcript) else {
+                continue
+            }
+            let suffix = String(transcript[swiftRange.upperBound...])
+            let separators = CharacterSet.whitespacesAndNewlines
+                .union(.punctuationCharacters)
+            return WakePhraseMatch(
+                command: suffix.trimmingCharacters(in: separators)
+            )
         }
-        let range = NSRange(transcript.startIndex..<transcript.endIndex, in: transcript)
-        guard let match = expression.firstMatch(in: transcript, range: range),
-              let swiftRange = Range(match.range, in: transcript) else {
-            return nil
-        }
-
-        let suffix = String(transcript[swiftRange.upperBound...])
-        let separators = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
-        return WakePhraseMatch(command: suffix.trimmingCharacters(in: separators))
+        return nil
     }
 
     private static func pattern(for phrase: String) -> String {
-        if phrase == "릴레이야" {
-            return #"릴레이\s*야"#
-        }
         return phrase
-            .split(whereSeparator: \.isWhitespace)
-            .map { NSRegularExpression.escapedPattern(for: String($0)) }
-            .joined(separator: #"\s+"#)
+            .filter { !$0.isWhitespace }
+            .map {
+                NSRegularExpression.escapedPattern(for: String($0))
+            }
+            .joined(separator: #"[\s\p{P}]*"#)
     }
 }

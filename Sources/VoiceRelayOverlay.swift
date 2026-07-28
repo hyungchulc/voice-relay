@@ -1079,19 +1079,19 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         return true
     }
 
-    func startRealtimeAfterLaunchIfAuthorized() {
+    func startWakePhraseAfterLaunchIfAuthorized() {
         let authorization = AVCaptureDevice.authorizationStatus(for: .audio)
         guard authorization != .denied,
               authorization != .restricted else {
-            if config.wakePhraseEnabled {
-                wakePhrase.startMonitoring()
-            }
             return
         }
-        show { [weak self] in
-            guard let self, !self.voiceState.phase.isSessionActive else { return }
-            self.startRealtimeVoice()
+        show()
+        prewarmVoiceBackend()
+        guard config.wakePhraseEnabled,
+              !voiceState.phase.isSessionActive else {
+            return
         }
+        wakePhrase.startMonitoring()
     }
 
     func startWakePhraseAfterSettingsSave() {
@@ -1277,10 +1277,19 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         finishSurface: Bool,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
+        NSLog(
+            "Voice Relay Codex Remote request preparing generation=%d",
+            generation
+        )
         let options: CodexTurnOptions
         do {
             options = try codexTurnOptions(userText: text)
         } catch {
+            NSLog(
+                "Voice Relay Codex Remote request rejected generation=%d error=%@",
+                generation,
+                error.localizedDescription
+            )
             completeCodexRequest(
                 .failure(error),
                 generation: generation,
@@ -1293,6 +1302,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
         streamedAnswer = ""
         activeCodexGeneration = generation
+        NSLog(
+            "Voice Relay Codex Remote ask started generation=%d",
+            generation
+        )
         codexClient.ask(
             text,
             options: options,
@@ -1311,6 +1324,19 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             completion: { [weak self] result in
                 DispatchQueue.main.async {
                     guard let self else { return }
+                    switch result {
+                    case .success:
+                        NSLog(
+                            "Voice Relay Codex Remote ask completed generation=%d result=success",
+                            generation
+                        )
+                    case let .failure(error):
+                        NSLog(
+                            "Voice Relay Codex Remote ask completed generation=%d result=failure error=%@",
+                            generation,
+                            error.localizedDescription
+                        )
+                    }
                     if self.activeCodexGeneration == generation {
                         self.activeCodexGeneration = nil
                     }
@@ -2434,9 +2460,21 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         case "terminal":
             guard !isShowingTransientError else { return }
             completeVoiceStop(generation: generation)
+        case "turnError":
+            realtimeDraft = ""
+            isWaitingForReply = false
+            scheduleVoiceIdleTimeout()
+            showToast(
+                "그 요청만 처리하지 못했어. 다시 말해줘",
+                color: NSColor.systemOrange,
+                autoHideAfter: 3.0
+            )
         case "error":
             let message = (event["message"] as? String) ?? "Realtime 연결 오류"
             NSLog("Voice Relay Realtime failed: %@", message)
+            let wasEstablished = voiceState.phase != .starting
+            let interruptedAnswer = realtimeDraft
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             isWaitingForReply = false
             voiceIdleWorkItem?.cancel()
             mediaDetectionWorkItem?.cancel()
@@ -2448,7 +2486,11 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             nextVoiceStartAllowedAt = Date().addingTimeInterval(2.5)
             _ = voiceState.apply(generation: generation, phase: .failed)
             updateVoiceSurface()
-            showError(message)
+            showError(
+                message,
+                wasEstablished: wasEstablished,
+                interruptedAnswer: interruptedAnswer
+            )
             realtimeController.stop(generation: generation)
         default:
             break
@@ -2492,19 +2534,12 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         updateVoiceSurface()
 
         let exactPrefill = prefill?.trimmingCharacters(in: .whitespacesAndNewlines)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-            guard let self,
-                  self.voiceState.generation == generation,
-                  self.voiceState.phase == .starting else {
-                return
-            }
-            self.realtimeController.start(
-                generation: generation,
-                prefill: exactPrefill?.isEmpty == false ? exactPrefill : nil,
-                shouldGreet: self.conversationHistory.isEmpty
-                    && !SettingsStore.shared.completedFirstVoiceGreeting
-            )
-        }
+        realtimeController.start(
+            generation: generation,
+            prefill: exactPrefill?.isEmpty == false ? exactPrefill : nil,
+            shouldGreet: conversationHistory.isEmpty
+                && !SettingsStore.shared.completedFirstVoiceGreeting
+        )
     }
 
     private func resumeWakePhraseSoon() {
@@ -3051,7 +3086,11 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         }
     }
 
-    private func showError(_ message: String) {
+    private func showError(
+        _ message: String,
+        wasEstablished: Bool = false,
+        interruptedAnswer: String = ""
+    ) {
         errorCollapseWorkItem?.cancel()
         isShowingTransientError = true
         isHoverPreviewVisible = false
@@ -3068,17 +3107,34 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 "Voice Relay could not prepare its dedicated session.\nCheck the Session ID in Settings.",
                 "Voice용 전용 session을 준비하지 못했습니다.\n설정에서 Session ID를 확인해 주세요."
             )
+        } else if wasEstablished {
+            friendlyMessage = copy.text(
+                "The voice connection was interrupted.\nPlease try that request again.",
+                "답변 중 Voice 연결이 끊겼습니다.\n같은 요청을 다시 말해 주세요."
+            )
         } else {
             friendlyMessage = copy.text(
                 "Voice Relay could not start the voice connection.\nTry again in a moment.",
                 "Voice 연결을 시작하지 못했습니다.\n잠시 후 다시 시도해 주세요."
             )
         }
-        setAnswerText(friendlyMessage)
-        currentAnswerHeight = measuredAnswerHeight(for: friendlyMessage)
+        let displayedMessage =
+            interruptedAnswer.isEmpty || !wasEstablished
+                ? friendlyMessage
+                : "\(interruptedAnswer)\n\n\(friendlyMessage)"
+        setAnswerText(displayedMessage)
+        currentAnswerHeight = measuredAnswerHeight(for: displayedMessage)
         setAnswerVisible(true, animated: config.animateSurface)
         showToast(
-            copy.text("Voice connection failed", "Voice 연결 실패"),
+            wasEstablished
+                ? copy.text(
+                    "Voice connection interrupted",
+                    "Voice 연결 끊김"
+                )
+                : copy.text(
+                    "Voice connection failed",
+                    "Voice 연결 실패"
+                ),
             color: NSColor.systemRed
         )
 
@@ -4181,7 +4237,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = OnboardingWindowController(remoteClient: remoteClient)
         controller.onFinish = { [weak self] in
             self?.rebuildOverlay(show: true)
-            self?.overlayController?.startRealtimeAfterLaunchIfAuthorized()
+            self?.overlayController?.startWakePhraseAfterLaunchIfAuthorized()
         }
         return controller
     }()
@@ -4215,11 +4271,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsController.onConnectionRecoveryDidEnd = { [weak self] in
             guard SettingsStore.shared.onboardingCompleted else { return }
             self?.rebuildOverlay(show: true)
-            self?.overlayController?.startRealtimeAfterLaunchIfAuthorized()
+            self?.overlayController?.startWakePhraseAfterLaunchIfAuthorized()
         }
         if SettingsStore.shared.onboardingCompleted {
             rebuildOverlay(show: true)
-            overlayController?.startRealtimeAfterLaunchIfAuthorized()
+            overlayController?.startWakePhraseAfterLaunchIfAuthorized()
         } else {
             onboardingController.showWindow(nil)
         }
@@ -4233,7 +4289,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             self.rebuildOverlay(show: true)
-            self.overlayController?.startRealtimeAfterLaunchIfAuthorized()
+            self.overlayController?.startWakePhraseAfterLaunchIfAuthorized()
         }
         displayChangeWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: workItem)

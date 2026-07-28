@@ -3,6 +3,7 @@ import Foundation
 
 private final class FakeLaunchAtLoginService: LaunchAtLoginServicing {
     var status: LaunchAtLoginStatus
+    var registerError: Error?
     private(set) var registerCalls = 0
     private(set) var unregisterCalls = 0
     private(set) var openSettingsCalls = 0
@@ -13,6 +14,9 @@ private final class FakeLaunchAtLoginService: LaunchAtLoginServicing {
 
     func register() throws {
         registerCalls += 1
+        if let registerError {
+            throw registerError
+        }
         status = .enabled
     }
 
@@ -36,6 +40,119 @@ struct PolicyTests {
     }
 
     static func main() {
+        let echoReference = (0..<4_800).map { index in
+            Float(sin(Double(index) * 2 * .pi * 440 / 24_000)) * 0.20
+        }
+        var echoAdmission = RealtimeEchoAdmissionPolicy()
+        echoAdmission.appendPlaybackReference(
+            echoReference,
+            startTime: 10
+        )
+        echoAdmission.markPlaybackActive(at: 10)
+        let echoedInput = Array(echoReference.prefix(960)).map { $0 * 0.55 }
+        let echoOnly = echoAdmission.filterCapture(
+            echoedInput,
+            startTime: 10.08,
+            playbackActive: true
+        )
+        expect(
+            echoOnly.classification == .echoOnly
+                && echoOnly.samples.isEmpty
+                && abs(echoOnly.correlation) >= 0.68,
+            "rendered assistant audio must be removed from microphone capture"
+        )
+        expect(
+            !echoAdmission.shouldForwardServerEvent(
+                type: "input_audio_buffer.speech_started",
+                playbackActive: true,
+                now: 10.09
+            )
+                && !echoAdmission.shouldForwardServerEvent(
+                    type: "conversation.item.input_audio_transcription.completed",
+                    playbackActive: true,
+                    now: 10.10
+                ),
+            "unadmitted playback echo must not become a server speech turn"
+        )
+
+        var bargeInAdmission = RealtimeEchoAdmissionPolicy()
+        bargeInAdmission.appendPlaybackReference(
+            echoReference,
+            startTime: 20
+        )
+        bargeInAdmission.markPlaybackActive(at: 20)
+        let humanOverlay = zip(
+            echoedInput,
+            (0..<echoedInput.count).map { index in
+                Float(sin(Double(index) * 2 * .pi * 173 / 24_000)) * 0.16
+            }
+        ).map { $0 + $1 }
+        let admittedBargeIn = bargeInAdmission.filterCapture(
+            humanOverlay,
+            startTime: 20.08,
+            playbackActive: true
+        )
+        expect(
+            !admittedBargeIn.samples.isEmpty
+                && admittedBargeIn.classification != .echoOnly,
+            "human speech over assistant playback must remain in capture"
+        )
+        expect(
+            bargeInAdmission.shouldForwardServerEvent(
+                type: "input_audio_buffer.speech_started",
+                playbackActive: true,
+                now: 20.09
+            ),
+            "locally admitted residual speech must preserve barge-in"
+        )
+        bargeInAdmission.reset()
+        expect(
+            bargeInAdmission.filterCapture(
+                [0.2, -0.2, 0.1],
+                startTime: 30,
+                playbackActive: false
+            ).classification == .noPlaybackReference,
+            "ordinary microphone speech must pass when playback is inactive"
+        )
+
+        var audioAdmission = RealtimeAudioAdmissionPolicy()
+        audioAdmission.register(
+            responseID: "route-response",
+            responseKind: "route_classifier"
+        )
+        expect(
+            !audioAdmission.shouldAdmit(responseID: "route-response")
+                && !audioAdmission.shouldAdmit(responseID: ""),
+            "route-classifier audio must be rejected before native playback"
+        )
+        expect(
+            audioAdmission.shouldReportSuppression(
+                responseID: "route-response"
+            )
+                && !audioAdmission.shouldReportSuppression(
+                    responseID: "route-response"
+                ),
+            "classifier audio diagnostics must be emitted once per response"
+        )
+        expect(
+            audioAdmission.shouldAdmit(responseID: "codex-final"),
+            "spoken final responses must remain eligible for native playback"
+        )
+        audioAdmission.finish(responseID: "route-response")
+        expect(
+            audioAdmission.shouldAdmit(responseID: "route-response"),
+            "completed classifier responses must leave no stale audio suppression"
+        )
+        audioAdmission.register(
+            responseID: "route-reset",
+            responseKind: "route_classifier"
+        )
+        audioAdmission.reset()
+        expect(
+            audioAdmission.shouldAdmit(responseID: "route-reset"),
+            "session reset must clear classifier audio suppression"
+        )
+
         let notchedDisplay = DisplayGeometry(
             frame: NSRect(x: 0, y: 0, width: 2056, height: 1329),
             visibleFrame: NSRect(x: 0, y: 0, width: 2056, height: 1290),
@@ -664,8 +781,23 @@ struct PolicyTests {
             "the reserved retry should register as the second transport attempt"
         )
         expect(
+            startupRetry.reserveRetry(generation: 21),
+            "a second pre-ready failure should reserve one final recovery attempt"
+        )
+        expect(
             !startupRetry.reserveRetry(generation: 21),
-            "a replacement failure must not exceed the transport attempt bound"
+            "the final recovery attempt must not be reserved twice"
+        )
+        expect(
+            startupRetry.registerTransportAttempt(
+                generation: 21,
+                isRetry: true
+            ),
+            "the final reserved retry should register as the third transport attempt"
+        )
+        expect(
+            !startupRetry.reserveRetry(generation: 21),
+            "a third failure must stop at the bounded transport attempt limit"
         )
         startupRetry.begin(generation: 22)
         expect(
@@ -755,6 +887,56 @@ struct PolicyTests {
             ) == nil,
             "wake prefix inside a longer word must not match"
         )
+        let configuredAriaPhrases = ["아리아야", "Hey Aria", "Aria"]
+        expect(
+            WakePhrasePolicy.match(
+                "아리아야",
+                phrases: configuredAriaPhrases
+            ) == WakePhraseMatch(command: ""),
+            "the first configured wake phrase must match"
+        )
+        expect(
+            WakePhrasePolicy.match(
+                "Hey Aria",
+                phrases: configuredAriaPhrases
+            ) == WakePhraseMatch(command: ""),
+            "the second configured wake phrase must match"
+        )
+        expect(
+            WakePhrasePolicy.match(
+                "Aria",
+                phrases: configuredAriaPhrases
+            ) == WakePhraseMatch(command: ""),
+            "the third configured wake phrase must match"
+        )
+        expect(
+            WakePhrasePolicy.match(
+                "Hey, Aria, check the weather",
+                phrases: configuredAriaPhrases
+            ) == WakePhraseMatch(command: "check the weather"),
+            "dictation punctuation between wake words must be tolerated"
+        )
+        expect(
+            WakePhrasePolicy.match(
+                "아리아 야, 오늘 날씨",
+                phrases: configuredAriaPhrases
+            ) == WakePhraseMatch(command: "오늘 날씨"),
+            "dictation spacing inside a wake phrase must be tolerated"
+        )
+        expect(
+            WakePhrasePolicy.match(
+                "area",
+                phrases: configuredAriaPhrases
+            ) == nil,
+            "wake matching must not add unsafe homophone fuzziness"
+        )
+        expect(
+            WakePhrasePolicy.match(
+                "오늘 Aria",
+                phrases: configuredAriaPhrases
+            ) == nil,
+            "configured wake phrases must remain leading"
+        )
         let wakeOnlyMatch = WakePhraseMatch(command: "")
         let wakeCommandMatch = WakePhraseMatch(command: "들리니?")
         expect(
@@ -817,6 +999,32 @@ struct PolicyTests {
             approvalService.registerCalls == 0
                 && approvalManager.status.isRegistered,
             "approval-required launch items must stay registered"
+        )
+        let missingLoginService = FakeLaunchAtLoginService(
+            status: .notFound
+        )
+        let missingLoginManager = LaunchAtLoginManager(
+            service: missingLoginService
+        )
+        expect(
+            (try? missingLoginManager.setEnabled(true)) == .enabled
+                && missingLoginService.registerCalls == 1,
+            "a missing main-app BTM record must be registerable"
+        )
+        let failingLoginService = FakeLaunchAtLoginService(
+            status: .notFound
+        )
+        failingLoginService.registerError = CocoaError(
+            .fileNoSuchFile
+        )
+        let failingLoginManager = LaunchAtLoginManager(
+            service: failingLoginService
+        )
+        expect(
+            (try? failingLoginManager.setEnabled(true)) == nil
+                && failingLoginService.registerCalls == 1
+                && failingLoginManager.status == .notFound,
+            "registration errors must propagate without inventing enabled state"
         )
 
         var voiceState = VoiceSurfaceReducer()

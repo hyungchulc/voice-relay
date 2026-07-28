@@ -27,9 +27,9 @@ short-lived credential from the signed-in local Codex OAuth session and does
 not require a separate broker or private support checkout. Voice Relay does not
 request, embed, or store an OpenAI API key.
 
-An ad-hoc signature proves bundle integrity only. It is not Developer ID
-signing or Apple notarization, and Gatekeeper may block the app. A normal public
-binary release requires:
+An Apple Development signature identifies a developer build, but it is not
+Developer ID signing or Apple notarization, and Gatekeeper may still require
+Open Anyway. A normal trusted public binary release requires:
 
 1. a clean checkout and publication audit;
 2. a Developer ID Application certificate;
@@ -37,19 +37,20 @@ binary release requires:
 4. notarization and stapling;
 5. verification on a non-development Mac.
 
-The public alpha can still be packaged as an ad-hoc signed DMG for testers who
-accept that limitation:
+The public alpha packager requires an explicit Apple signing identity so an
+identity-less artifact cannot be uploaded accidentally:
 
 ```bash
-VOICE_RELAY_SOURCE_URL="https://github.com/example/voice-relay/archive/refs/tags/v0.4.0-alpha.2.tar.gz" \
-VOICE_RELAY_RELEASE_LABEL="0.4.0-alpha.2" \
+VOICE_RELAY_SIGNING_IDENTITY="Apple Development: Example Person (TEAMID)" \
+VOICE_RELAY_SOURCE_URL="https://github.com/example/voice-relay/archive/refs/tags/v0.4.0-alpha.3.tar.gz" \
+VOICE_RELAY_RELEASE_LABEL="0.4.0-alpha.3" \
 ./package-alpha-dmg.sh
 ```
 
 The DMG contains the universal app, an Applications shortcut, GPLv3 license,
 installation and Gatekeeper instructions, distribution notes, and the exact
-corresponding-source URL. It is ad-hoc signed, not Developer ID signed or
-notarized.
+corresponding-source URL. An Apple Development build is signed for development
+and testing, but is not notarized.
 
 ## Commercial option
 

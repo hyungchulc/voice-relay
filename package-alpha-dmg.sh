@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_URL="${VOICE_RELAY_SOURCE_URL:-}"
 RELEASE_DIR="${VOICE_RELAY_RELEASE_DIR:-${ROOT}/releases}"
 RELEASE_LABEL="${VOICE_RELAY_RELEASE_LABEL:-}"
+SIGNING_IDENTITY="${VOICE_RELAY_SIGNING_IDENTITY:-}"
 
 if [[ "$#" -ne 0 ]]; then
   echo "usage: $0" >&2
@@ -12,6 +13,10 @@ if [[ "$#" -ne 0 ]]; then
 fi
 if [[ "$SOURCE_URL" != https://github.com/*/archive/* ]]; then
   echo "Set VOICE_RELAY_SOURCE_URL to the exact public source archive for this build." >&2
+  exit 2
+fi
+if [[ -z "$SIGNING_IDENTITY" ]]; then
+  echo "Set VOICE_RELAY_SIGNING_IDENTITY to an Apple Development or Developer ID Application identity." >&2
   exit 2
 fi
 if ! /usr/bin/curl \
@@ -42,6 +47,24 @@ VOICE_RELAY_ARCHS="arm64 x86_64" \
 APP="$STAGE_DIR/build/Voice Relay.app"
 BINARY="$APP/Contents/MacOS/VoiceRelay"
 /usr/bin/lipo "$BINARY" -verify_arch arm64 x86_64
+/usr/bin/codesign \
+  --force \
+  --deep \
+  --options runtime \
+  --timestamp=none \
+  --entitlements "$ROOT/Resources/VoiceRelay.entitlements" \
+  --sign "$SIGNING_IDENTITY" \
+  "$APP"
+if [[ "$SIGNING_IDENTITY" == "Developer ID Application:"* ]]; then
+  SIGNING_KIND="developer-id-signed-unnotarized"
+  SIGNING_NOTE="This alpha is Developer ID signed but is not notarized."
+elif [[ "$SIGNING_IDENTITY" == "Apple Development:"* ]]; then
+  SIGNING_KIND="development-signed"
+  SIGNING_NOTE="This alpha is Apple Development signed for local development and testing. It is not a notarized public distribution build."
+else
+  SIGNING_KIND="identity-signed"
+  SIGNING_NOTE="This alpha is signed with the requested local identity but is not notarized."
+fi
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
 
 VERSION="$(
@@ -52,7 +75,7 @@ VERSION="$(
 if [[ -z "$RELEASE_LABEL" ]]; then
   RELEASE_LABEL="${VERSION}-alpha"
 fi
-BASE_NAME="Voice-Relay-${RELEASE_LABEL}-unsigned"
+BASE_NAME="Voice-Relay-${RELEASE_LABEL}-${SIGNING_KIND}"
 DMG="$RELEASE_DIR/${BASE_NAME}.dmg"
 CHECKSUM="$DMG.sha256"
 DIST_DIR="$STAGE_DIR/Voice Relay"
@@ -79,19 +102,27 @@ cat > "$DIST_DIR/INSTALL.md" <<'EOF'
 
 1. Drag `Voice Relay.app` to `Applications`.
 2. Open it from Applications.
-3. If macOS blocks this unsigned alpha, open System Settings, choose
+3. If macOS blocks this non-notarized alpha, open System Settings, choose
    Privacy & Security, then choose Open Anyway for Voice Relay.
-
-This alpha is ad-hoc signed but is not Developer ID signed or notarized.
 EOF
+printf '\n%s\n' "$SIGNING_NOTE" >> "$DIST_DIR/INSTALL.md"
 
-/usr/bin/hdiutil create \
-  -volname "Voice Relay ${RELEASE_LABEL}" \
-  -srcfolder "$DIST_DIR" \
-  -format UDZO \
-  -ov \
-  "$DMG" >/dev/null
-/usr/bin/hdiutil imageinfo "$DMG" >/dev/null
+if /usr/sbin/diskutil help image create from >/dev/null 2>&1; then
+  /usr/sbin/diskutil image create from \
+    --format UDZO \
+    --volumeName "Voice Relay ${RELEASE_LABEL}" \
+    "$DIST_DIR" \
+    "$DMG" >/dev/null
+  /usr/sbin/diskutil image info "$DMG" >/dev/null
+else
+  /usr/bin/hdiutil create \
+    -volname "Voice Relay ${RELEASE_LABEL}" \
+    -srcfolder "$DIST_DIR" \
+    -format UDZO \
+    -ov \
+    "$DMG" >/dev/null
+  /usr/bin/hdiutil imageinfo "$DMG" >/dev/null
+fi
 
 MOUNT_DIR="$STAGE_DIR/mount"
 mkdir -p "$MOUNT_DIR"
@@ -101,6 +132,9 @@ mkdir -p "$MOUNT_DIR"
   -nobrowse \
   -readonly \
   -quiet
+test -d "$MOUNT_DIR/Voice Relay.app"
+test -f "$MOUNT_DIR/INSTALL.md"
+test -f "$MOUNT_DIR/SOURCE.md"
 /usr/bin/codesign \
   --verify \
   --deep \

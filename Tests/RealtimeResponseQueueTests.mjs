@@ -94,6 +94,36 @@ receive({
   transcript: "내일 날씨 확인해줘",
 });
 assert.equal(responseCreates().length, 1, "routing starts one response");
+assert.deepEqual(
+  Array.from(responseCreates().at(-1).response.output_modalities),
+  ["text"],
+  "the route classifier must never create an audio response",
+);
+assert.equal(
+  responseCreates().at(-1).response.tool_choice,
+  "required",
+  "every accepted turn must mechanically require the routing tool",
+);
+assert.equal(
+  responseCreates().at(-1).response.parallel_tool_calls,
+  false,
+  "the route classifier must produce exactly one route decision",
+);
+assert.equal(
+  responseCreates().at(-1).response.tools.length,
+  1,
+  "the route classifier must expose only one tool",
+);
+assert.equal(
+  responseCreates().at(-1).response.tools[0].name,
+  "route_voice_turn",
+  "the required route tool must be route_voice_turn",
+);
+assert.equal(
+  responseCreates().at(-1).response.metadata.voice_relay_kind,
+  "route_classifier",
+  "route responses must remain distinguishable from spoken replies",
+);
 
 receive({
   type: "response.created",
@@ -114,6 +144,17 @@ assert.equal(
   nativeEvents("codexRequest").length,
   1,
   "Codex work starts immediately while progress speech waits"
+);
+receive({
+  type: "response.function_call_arguments.done",
+  name: "route_voice_turn",
+  call_id: "duplicate-route-call",
+  arguments: JSON.stringify({ kind: "codex" }),
+});
+assert.equal(
+  nativeEvents("codexRequest").length,
+  1,
+  "duplicate route completions must not start duplicate Codex work",
 );
 
 receive({
@@ -155,8 +196,8 @@ assert.match(
 );
 assert.match(
   responseCreates().at(-1).response.instructions,
-  /Let me check/,
-  "English handoff speech should have a natural Realtime example",
+  /different sentence shape each time/,
+  "Realtime handoff speech must explicitly reject a repeated sentence shape",
 );
 
 receive({
@@ -373,6 +414,334 @@ assert.equal(
   nativeEvents("assistantFinal").at(-1)?.text,
   "응.",
   "a direct Realtime reply must remain visible while it is spoken",
+);
+
+const messagesBeforeRouteFailure = nativeMessages.length;
+runtime.start({
+  generation: 3,
+  language: "ko-KR",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Relay",
+  wakePhrases: ["릴레이야"],
+  shouldGreet: false,
+});
+runtime.transportOpened({ generation: 3 });
+runtime.transportReady({ generation: 3 });
+runtime.receiveRealtimeEvent({
+  generation: 3,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    transcript: "스톡홀름 날씨 알려줘",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 3,
+  event: {
+    type: "response.created",
+    response: {
+      id: "route-failure-1",
+      metadata: { voice_relay_kind: "route_classifier" },
+    },
+  },
+});
+const assistantEventsBeforeInvalidRoute =
+  nativeEvents("assistantPartial").length
+  + nativeEvents("assistantFinal").length;
+runtime.receiveRealtimeEvent({
+  generation: 3,
+  event: {
+    type: "response.output_audio_transcript.delta",
+    response_id: "route-failure-1",
+    delta: "확인할 수 없어요.",
+  },
+});
+assert.equal(
+  nativeEvents("assistantPartial").length
+    + nativeEvents("assistantFinal").length,
+  assistantEventsBeforeInvalidRoute,
+  "a route-classifier answer must never escape into assistant output",
+);
+runtime.receiveRealtimeEvent({
+  generation: 3,
+  event: {
+    type: "response.function_call_arguments.done",
+    name: "unexpected_route_tool",
+    call_id: "unexpected-route-call",
+    arguments: JSON.stringify({ kind: "direct_chat" }),
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 3,
+  event: {
+    type: "response.done",
+    response: {
+      id: "route-failure-1",
+      metadata: { voice_relay_kind: "route_classifier" },
+      output: [{ type: "function_call", name: "unexpected_route_tool" }],
+    },
+  },
+});
+const routeFailureMessages = nativeMessages.slice(messagesBeforeRouteFailure);
+const routeFailureCreates = routeFailureMessages
+  .filter(message => message.type === "realtimeSend")
+  .map(message => JSON.parse(message.eventJSON))
+  .filter(event => event.type === "response.create");
+assert.equal(
+  routeFailureCreates.length,
+  2,
+  "a wrong or missing route tool call must retry the classifier exactly once",
+);
+assert.equal(
+  routeFailureCreates.at(-1).response.tool_choice,
+  "required",
+  "the retry must preserve the fail-closed tool requirement",
+);
+runtime.receiveRealtimeEvent({
+  generation: 3,
+  event: {
+    type: "response.created",
+    response: {
+      id: "route-failure-2",
+      metadata: { voice_relay_kind: "route_classifier" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 3,
+  event: {
+    type: "response.done",
+    response: {
+      id: "route-failure-2",
+      metadata: { voice_relay_kind: "route_classifier" },
+      output: [],
+    },
+  },
+});
+assert.equal(
+  nativeEvents("turnError").at(-1)?.code,
+  "route_classifier_failed",
+  "a second missing tool call must fail closed without killing the session",
+);
+assert.equal(
+  nativeEvents("codexRequest").filter(event => event.generation === 3).length,
+  0,
+  "the fail-closed route must not invent a Codex call without a tool result",
+);
+
+const messagesBeforeEchoBargeIn = nativeMessages.length;
+runtime.start({
+  generation: 4,
+  language: "ko-KR",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Relay",
+  wakePhrases: ["릴레이야"],
+  shouldGreet: false,
+});
+runtime.transportOpened({ generation: 4 });
+runtime.transportReady({ generation: 4 });
+runtime.receiveRealtimeEvent({
+  generation: 4,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    transcript: "안녕",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 4,
+  event: {
+    type: "response.created",
+    response: {
+      id: "route-echo-4",
+      metadata: { voice_relay_kind: "route_classifier" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 4,
+  event: {
+    type: "response.function_call_arguments.done",
+    name: "route_voice_turn",
+    call_id: "route-echo-call-4",
+    arguments: JSON.stringify({ kind: "direct_chat" }),
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 4,
+  event: {
+    type: "response.done",
+    response: {
+      id: "route-echo-4",
+      metadata: { voice_relay_kind: "route_classifier" },
+      output: [{ type: "function_call" }],
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 4,
+  event: {
+    type: "response.created",
+    response: { id: "direct-echo-4", metadata: {} },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 4,
+  event: {
+    type: "response.output_audio.delta",
+    response_id: "direct-echo-4",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 4,
+  event: {
+    type: "response.output_audio_transcript.done",
+    response_id: "direct-echo-4",
+    transcript: "반가워, 무엇을 도와줄까?",
+  },
+});
+const echoCheckStart = nativeMessages.length;
+runtime.receiveRealtimeEvent({
+  generation: 4,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    transcript: "반가워 무엇을 도와줄까",
+  },
+});
+const echoMessages = nativeMessages.slice(echoCheckStart);
+assert.equal(
+  echoMessages.filter(message => message.type === "playbackResume").length,
+  1,
+  "assistant playback echo must resume provisionally paused audio",
+);
+assert.equal(
+  echoMessages.filter(message => message.type === "playbackInterrupt").length,
+  0,
+  "assistant playback echo must never interrupt its own response",
+);
+assert.equal(
+  echoMessages.filter(message => message.type === "codexRequest").length,
+  0,
+  "assistant playback echo must never become a Codex request",
+);
+
+const humanBargeInStart = nativeMessages.length;
+runtime.receiveRealtimeEvent({
+  generation: 4,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    transcript: "아니, 내일 날씨부터 확인해줘",
+  },
+});
+const humanBargeInMessages = nativeMessages.slice(humanBargeInStart);
+assert.equal(
+  humanBargeInMessages
+    .filter(message => message.type === "playbackInterrupt").length,
+  1,
+  "a distinct human barge-in must stop buffered playback exactly once",
+);
+const humanCancellation = humanBargeInMessages
+  .filter(message => message.type === "realtimeSend")
+  .map(message => JSON.parse(message.eventJSON))
+  .find(event => event.type === "response.cancel");
+assert.equal(
+  humanCancellation?.response_id,
+  "direct-echo-4",
+  "human barge-in must cancel the response that was actually playing",
+);
+assert.equal(
+  humanBargeInMessages
+    .filter(message => message.type === "realtimeSend")
+    .map(message => JSON.parse(message.eventJSON))
+    .filter(event => event.type === "response.create").length,
+  0,
+  "the replacement turn must wait for correlated cancellation completion",
+);
+runtime.receiveRealtimeEvent({
+  generation: 4,
+  event: {
+    type: "error",
+    error: {
+      event_id: humanCancellation.event_id,
+      code: "invalid_request_error",
+    },
+  },
+});
+const postCancellationMessages =
+  nativeMessages.slice(messagesBeforeEchoBargeIn);
+assert.equal(
+  postCancellationMessages
+    .filter(message => message.type === "realtimeSend")
+    .map(message => JSON.parse(message.eventJSON))
+    .filter(event =>
+      event.type === "response.create"
+      && event.response?.metadata?.voice_relay_kind === "route_classifier"
+    ).length,
+  2,
+  "the replacement human turn must start once after cancellation resolves",
+);
+
+const messagesBeforeVariedHandoff = nativeMessages.length;
+runtime.start({
+  generation: 5,
+  language: "ko-KR",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Relay",
+  wakePhrases: ["릴레이야"],
+  shouldGreet: false,
+});
+runtime.transportOpened({ generation: 5 });
+runtime.transportReady({ generation: 5 });
+runtime.receiveRealtimeEvent({
+  generation: 5,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    transcript: "오늘 일정 확인해줘",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 5,
+  event: {
+    type: "response.created",
+    response: {
+      id: "route-handoff-5",
+      metadata: { voice_relay_kind: "route_classifier" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 5,
+  event: {
+    type: "response.function_call_arguments.done",
+    name: "route_voice_turn",
+    call_id: "route-handoff-call-5",
+    arguments: JSON.stringify({ kind: "codex" }),
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 5,
+  event: {
+    type: "response.done",
+    response: {
+      id: "route-handoff-5",
+      metadata: { voice_relay_kind: "route_classifier" },
+      output: [{ type: "function_call" }],
+    },
+  },
+});
+const variedHandoffRequest = nativeMessages
+  .slice(messagesBeforeVariedHandoff)
+  .filter(message => message.type === "realtimeSend")
+  .map(message => JSON.parse(message.eventJSON))
+  .find(event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind === "codex_progress"
+  );
+assert.match(
+  variedHandoffRequest?.response?.instructions || "",
+  /진행 멘트/,
+  "a later handoff prompt must exclude the recently spoken acknowledgement",
 );
 
 console.log("Realtime response queue tests passed");

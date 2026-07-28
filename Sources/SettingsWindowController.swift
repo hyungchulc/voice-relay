@@ -1361,13 +1361,13 @@ final class SettingsWindowController:
             launchAtLoginSettingsButton.isHidden = true
         case .notFound:
             launchAtLoginControl.state = .off
-            launchAtLoginControl.isEnabled = false
+            launchAtLoginControl.isEnabled = true
             launchAtLoginStatus.stringValue = localizedCopy.text(
-                "Unavailable for this app build",
-                "현재 앱 빌드에서는 사용할 수 없습니다."
+                "Not registered yet. Turn it on to create the login item.",
+                "아직 등록되지 않았습니다. 켜서 로그인 항목을 만드세요."
             )
-            launchAtLoginStatus.textColor = .systemRed
-            launchAtLoginSettingsButton.isHidden = false
+            launchAtLoginStatus.textColor = .secondaryLabelColor
+            launchAtLoginSettingsButton.isHidden = true
         }
     }
 
