@@ -17,20 +17,26 @@ streamed progress, and mid-turn steering.
 
 ## Thirty-second pitch
 
-Most voice assistants are separate chatbots. Voice Relay is different. It
-connects a native macOS Voice surface to the Codex/ChatGPT desktop app you are
-already signed into. Quick conversation stays on direct OpenAI Realtime Voice.
-Anything that needs current facts, tools, apps, files, memory, approvals, or
-deeper work moves to the same persistent Codex task. You hear a short handoff,
-see and hear live commentary, can steer the task while it is running, and can
-stop both Voice and Codex with one control. There is no OpenAI API key to copy
-or store.
+ChatGPT now has a powerful built-in Voice experience for Work and Codex. Voice
+Relay explores a different shape. It puts an open-source, always-ready notch or
+Orb on macOS, binds it to one deliberate Codex task, and lets you wake it
+locally or extend it with your own guidance and bounded current context. Quick
+conversation stays on direct OpenAI Realtime Voice. Substantive work uses the
+model and thinking level you selected in Codex, with the same tools, approvals,
+and session. You hear a short handoff, see and hear live commentary, can steer
+the task while it is running, and can stop both Voice and Codex with one
+control. There is no OpenAI API key to copy or store.
 
 ## Product proof points
 
 - **Native Codex execution**
   The desktop app remains the task, tool, approval, and session owner. Voice
   Relay does not simulate a separate agent runtime.
+- **Exact Codex model and thinking passthrough**
+  Choose the model and thinking level in Codex. Voice Relay reads the effective
+  `config.toml` profile through the desktop app, validates the model and
+  reasoning effort against `model/list`, and runs its dedicated task with those
+  exact choices.
 - **OAuth with no API-key setup**
   The signed-in desktop session supplies an in-memory, short-lived Realtime
   credential. No OpenAI API key is requested, embedded, or stored.
@@ -62,6 +68,29 @@ or store.
 - **Open source**
   The project is available under GPLv3. Official builds, setup, and support may
   be offered separately.
+
+## Primary competitive frame
+
+The closest comparison is OpenAI's built-in ChatGPT Voice in Work and Codex.
+The products overlap, but optimize for different things.
+
+| ChatGPT Voice in Work and Codex | Voice Relay |
+| --- | --- |
+| First-party integrated experience | Open-source Mac-first control surface |
+| GPT-Live full-duplex conversation where Live is available | Direct `gpt-realtime-2.1` speech with semantic Codex handoff |
+| Instant, Medium, and High reasoning choices, with deeper work delegated to an OpenAI-managed background frontier model | Human-selected Codex model and thinking level inherited from the effective `config.toml` and validated before use |
+| Multiple agents, conversations, and projects | One explicit persistent Codex Session ID |
+| Desktop app on macOS and Windows, plus paired iOS access | Notch or Orb on macOS, local wake phrase, and launch at login |
+| Available project context and connected tools | Optional Authority Pack and bounded Additional Context Providers |
+| Normal product setup and support | Inspectable GPLv3 source and a customizable public alpha |
+
+Do not market Voice Relay as more natural than GPT-Live-1. Lead with ambient
+macOS access, explicit session ownership, open-source control, and personal
+context extensibility.
+
+Planned, not current alpha: a direct model and thinking-level picker inside
+Voice Relay. The current build inherits the human-selected values from the
+desktop app's effective `config.toml`.
 
 ## Demo video outline
 
@@ -122,16 +151,17 @@ On-screen line:
 
 Voice Relay is now available as a public alpha.
 
-It is a native macOS voice interface for the Codex/ChatGPT desktop runtime, not
-a separate chatbot. Direct OpenAI Realtime Voice handles immediate
-conversation, while current, contextual, analytical, and tool-using work moves
-to one persistent Codex task.
+ChatGPT now has built-in Voice for Work and Codex, and its supported Live
+experience is powered by GPT-Live. Voice Relay explores a different direction.
+It is an open-source, always-ready macOS notch or Orb bound to one persistent
+Codex task. Direct OpenAI Realtime Voice handles immediate conversation, while
+current, contextual, analytical, and tool-using work moves to Codex.
 
 The desktop app keeps ownership of tools, approvals, Browser Use, Computer Use,
-skills, connectors, and session state. Voice Relay adds spoken handoff,
-streamed commentary, mid-turn voice steering, unified Stop and Escape, local
-wake phrases, optional Authority Packs, and bounded Additional Context
-Providers.
+skills, connectors, the selected model and thinking level, and session state.
+Voice Relay adds spoken handoff, streamed commentary, mid-turn voice steering,
+unified Stop and Escape, local wake phrases, optional Authority Packs, and
+bounded Additional Context Providers.
 
 It uses the existing signed-in OAuth session, never asks you to copy or store an
 OpenAI API key, and ships without private context or local developer state.

@@ -25,6 +25,7 @@ key to copy, embed, or store, and no separate task-owning agent stack.
 | Capability | What Voice Relay does |
 | --- | --- |
 | Full Codex desktop runtime | The Codex/ChatGPT desktop app remains the owner of tools, approvals, Browser Use, Computer Use, skills, connectors, and session state, subject to your app configuration and permissions. |
+| Exact Codex model and thinking passthrough | Choose the model and thinking level in Codex. Voice Relay reads the effective `config.toml` profile through the desktop app, validates the model and reasoning effort against `model/list`, and runs its dedicated task with those exact choices. |
 | OAuth, not API-key setup | Voice Relay uses the signed-in desktop session and keeps its short-lived Realtime credential in memory. It never asks for or bundles an OpenAI API key. |
 | Direct Realtime Voice | Microphone capture, WebSocket transport, transcript display, and audio playback stay on a native low-latency Realtime path. |
 | Persistent task continuity | Use an existing Session ID or let Voice Relay create and persist a dedicated task that keeps context across voice turns and restarts. |
@@ -56,21 +57,47 @@ hearing checks, and device-local time can stay direct. Personal state, current
 facts, lookups, analysis, verification, and work that may take more than about
 five seconds go to Codex. When the boundary is uncertain, Codex owns the turn.
 
-## Compared with a common API-wrapper design
+## Compared with ChatGPT Voice in Work and Codex
 
-| Common voice-agent approach | Voice Relay |
-| --- | --- |
-| A separate chatbot with a limited tool layer | A voice interface for the already-running Codex desktop runtime |
-| A separate API key, credential setup, and usage path | Existing Codex/ChatGPT OAuth plus an in-memory ephemeral Realtime credential |
-| A new stateless request for each utterance | One optional existing or app-created persistent Session ID |
-| Silent waiting while a remote model works | Spoken handoff, visible commentary, and the final answer in one response queue |
-| Follow-up speech becomes a separate turn | Semantic follow-up steering targets the active Codex turn |
-| Stop affects only audio playback | Stop and Escape interrupt both Voice and Codex execution |
-| Context is hard-coded into the app | User-selected Authority Packs and bounded Additional Context Providers |
+The closest comparison is now OpenAI's built-in
+[ChatGPT Voice in Work and Codex](https://help.openai.com/en/articles/20001275-chatgpt-work-and-codex),
+not a generic API wrapper. OpenAI documents GPT-Live as a full-duplex voice
+architecture, and the paid Live experience uses GPT-Live-1 where available.
+Voice Relay's current public alpha uses a direct `gpt-realtime-2.1` path and
+does not claim to match GPT-Live-1's conversational model behavior.
 
-Voice Relay does not recreate or proxy Codex features. It pairs a first-party
-Remote controller with the desktop app and leaves execution, permissions, and
-approvals where they already belong.
+| Area | ChatGPT Voice in Work and Codex | Voice Relay |
+| --- | --- | --- |
+| Best fit | The integrated first-party default for eligible ChatGPT users | An open, customizable, Mac-first control surface around one dedicated Codex task |
+| Voice experience | Built-in ChatGPT Voice. The Live option provides continuous GPT-Live full-duplex listening and speaking on supported accounts | Direct Realtime speech plus a semantic handoff to Codex for substantive work |
+| Task coordination | Can start, prioritize, interrupt, redirect, and coordinate multiple agents across active conversations and projects | Keeps voice work pinned to one explicit existing or app-created persistent Session ID |
+| Model and thinking control | ChatGPT Voice offers Instant, Medium, and High reasoning choices. GPT-Live can delegate deeper work to a background frontier model that OpenAI updates over time | Reads the human-selected Codex model and thinking level from the effective `config.toml`, validates both, and keeps the dedicated task on that explicit profile |
+| Surface | Built into the ChatGPT desktop app on macOS and Windows, with paired iOS remote access | macOS notch or movable Orb, local wake phrases, launch at login, and an always-ready surface outside the main app window |
+| Personal context | Uses available project context and supported connected tools | Adds opt-in Authority Packs and bounded Additional Context Providers |
+| Extensibility | First-party product behavior and workspace controls | GPLv3 source that can be inspected, modified, and self-hosted |
+| Setup and maturity | Supported first-party feature whose availability depends on plan, workspace, region, and app version | Public developer alpha requiring a signed-in desktop app, Remote pairing, and Gatekeeper override for the current DMG |
+
+GPT-Live-1 is the stronger choice for first-party integration, natural
+full-duplex conversation, multi-agent coordination, and paired iOS access.
+Voice Relay is for Mac users who want a persistent notch or Orb, a local wake
+phrase, one deliberate Codex session, inspectable source, and user-owned context
+extensions. It does not recreate or proxy Codex features. It leaves execution,
+permissions, and approvals in the desktop app. It also shows the effective
+model, thinking level, sandbox, and approval policy instead of treating the
+Codex execution profile as an opaque background delegation.
+
+Official references
+
+- [Introducing GPT-Live](https://openai.com/index/introducing-gpt-live/)
+- [ChatGPT Voice](https://help.openai.com/en/articles/20001274)
+- [ChatGPT Work and Codex](https://help.openai.com/en/articles/20001275-chatgpt-work-and-codex)
+
+## Planned next
+
+- **Direct Codex profile picker**
+  Choose the Codex model and thinking level inside Voice Relay. This is planned,
+  not part of the current public alpha. The current build inherits the
+  human-selected values from the desktop app's effective `config.toml`.
 
 ## Requirements
 
