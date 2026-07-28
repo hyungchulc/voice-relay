@@ -7,7 +7,70 @@
 
 > Public alpha. APIs, setup, and packaging may change before 1.0.
 
-Voice Relay is a native macOS notch companion whose main interface is Voice. Realtime Voice uses a native WebSocket and native audio engine, while substantive work is handed to a dedicated first-party Remote task in the already-running Codex/ChatGPT desktop app. It does not launch a second task-owning app-server.
+**Turn the full Codex desktop runtime into a native, persistent,
+context-aware voice assistant on macOS.**
+
+Voice Relay connects direct OpenAI Realtime Voice to the already-running
+Codex/ChatGPT desktop app. Fast conversation stays live in Realtime. Requests
+that need current facts, tools, apps, files, memory, approvals, or more than a
+few seconds are handed to the same dedicated Codex task. There is no OpenAI API
+key to copy, embed, or store, and no separate task-owning agent stack.
+
+[Download the public alpha](https://github.com/hyungchulc/voice-relay/releases)
+· [Build from source](#build-and-launch)
+· [See the launch kit](PROMOTION.md)
+
+## Why Voice Relay is different
+
+| Capability | What Voice Relay does |
+| --- | --- |
+| Full Codex desktop runtime | The Codex/ChatGPT desktop app remains the owner of tools, approvals, Browser Use, Computer Use, skills, connectors, and session state, subject to your app configuration and permissions. |
+| OAuth, not API-key setup | Voice Relay uses the signed-in desktop session and keeps its short-lived Realtime credential in memory. It never asks for or bundles an OpenAI API key. |
+| Direct Realtime Voice | Microphone capture, WebSocket transport, transcript display, and audio playback stay on a native low-latency Realtime path. |
+| Persistent task continuity | Use an existing Session ID or let Voice Relay create and persist a dedicated task that keeps context across voice turns and restarts. |
+| Live progress, not silent waiting | The handoff line, streamed Codex commentary, and final answer remain visible and play through the selected Realtime voice. |
+| Mid-turn voice steering | Add a correction or instruction while Codex is working and Voice Relay steers the active turn instead of starting a disconnected request. |
+| One stop control | Stop or Escape interrupts both Realtime output and the active Codex turn, then rejects late results. |
+| Personal operating context | Optional Authority Packs add persistent guidance. Optional Additional Context Providers add bounded current data only to Codex-bound turns. Both are blank and disabled in public builds. |
+| Native macOS surface | A notch-aware compact interface, a movable Orb fallback, local wake phrases, native permissions, launch at login, and system appearance support keep Voice as the primary surface. |
+
+## How it works
+
+```text
+You speak
+  |
+  +-> Immediate social or device-local request
+  |     -> OpenAI Realtime
+  |     -> native transcript and audio reply
+  |
+  +-> Current, personal, analytical, or tool-using request
+        -> short contextual handoff
+        -> persistent Codex/ChatGPT desktop task
+        -> app-owned tools, approvals, and session
+        -> streamed commentary and final answer
+        -> the same Realtime voice and visible surface
+```
+
+Realtime decides the route semantically. Greetings, thanks, identity questions,
+hearing checks, and device-local time can stay direct. Personal state, current
+facts, lookups, analysis, verification, and work that may take more than about
+five seconds go to Codex. When the boundary is uncertain, Codex owns the turn.
+
+## Compared with a common API-wrapper design
+
+| Common voice-agent approach | Voice Relay |
+| --- | --- |
+| A separate chatbot with a limited tool layer | A voice interface for the already-running Codex desktop runtime |
+| A separate API key, credential setup, and usage path | Existing Codex/ChatGPT OAuth plus an in-memory ephemeral Realtime credential |
+| A new stateless request for each utterance | One optional existing or app-created persistent Session ID |
+| Silent waiting while a remote model works | Spoken handoff, visible commentary, and the final answer in one response queue |
+| Follow-up speech becomes a separate turn | Semantic follow-up steering targets the active Codex turn |
+| Stop affects only audio playback | Stop and Escape interrupt both Voice and Codex execution |
+| Context is hard-coded into the app | User-selected Authority Packs and bounded Additional Context Providers |
+
+Voice Relay does not recreate or proxy Codex features. It pairs a first-party
+Remote controller with the desktop app and leaves execution, permissions, and
+approvals where they already belong.
 
 ## Requirements
 

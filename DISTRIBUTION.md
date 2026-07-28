@@ -24,7 +24,8 @@ Official builds, setup, and support may be offered separately.
 
 The app bundles the GPLv3 Codex Remote support source it needs. Realtime uses a
 short-lived credential from the signed-in local Codex OAuth session and does
-not require a separate broker, API key, or private support checkout.
+not require a separate broker or private support checkout. Voice Relay does not
+request, embed, or store an OpenAI API key.
 
 An ad-hoc signature proves bundle integrity only. It is not Developer ID
 signing or Apple notarization, and Gatekeeper may block the app. A normal public
@@ -36,7 +37,7 @@ binary release requires:
 4. notarization and stapling;
 5. verification on a non-development Mac.
 
-The public alpha can still be packaged as an unsigned DMG for testers who
+The public alpha can still be packaged as an ad-hoc signed DMG for testers who
 accept that limitation:
 
 ```bash
