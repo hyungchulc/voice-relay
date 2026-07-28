@@ -52,6 +52,29 @@ installation and Gatekeeper instructions, distribution notes, and the exact
 corresponding-source URL. An Apple Development build is signed for development
 and testing, but is not notarized.
 
+## GitHub release policy
+
+- Every alpha, beta, and release candidate is a GitHub prerelease.
+- No prerelease may carry the GitHub `Latest` marker.
+- Stable publication is locked until the user explicitly approves `v1.0.0`.
+- `publish-github-release.sh` enforces this policy and rejects other stable
+  tags instead of guessing release intent.
+- Each release must use an existing verified tag, non-empty release notes, and
+  the matching package assets.
+
+Example:
+
+```bash
+VOICE_RELAY_RELEASE_NOTES_FILE="./release-notes.md" \
+./publish-github-release.sh \
+  v0.4.0-alpha.8 \
+  releases/Voice-Relay-0.4.0-alpha.8-development-signed.dmg \
+  releases/Voice-Relay-0.4.0-alpha.8-development-signed.dmg.sha256
+```
+
+After explicit approval of the first stable release, set
+`VOICE_RELAY_STABLE_RELEASE_APPROVED=true` and publish exactly `v1.0.0`.
+
 ## Commercial option
 
 The copyright holder may separately sell official builds, setup, support,

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/voice-relay-release-policy.XXXXXX")"
+NOTES_FILE="$TEST_DIR/notes.md"
+ASSET_FILE="$TEST_DIR/asset.dmg"
+
+cleanup() {
+  /usr/bin/unlink "$NOTES_FILE" >/dev/null 2>&1 || true
+  /usr/bin/unlink "$ASSET_FILE" >/dev/null 2>&1 || true
+  /bin/rmdir "$TEST_DIR" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+printf 'Release notes\n' > "$NOTES_FILE"
+printf 'test asset\n' > "$ASSET_FILE"
+
+ALPHA_OUTPUT="$(
+  VOICE_RELAY_RELEASE_DRY_RUN=1 \
+  VOICE_RELAY_RELEASE_NOTES_FILE="$NOTES_FILE" \
+  "$ROOT/publish-github-release.sh" \
+    v0.4.0-alpha.8 \
+    "$ASSET_FILE"
+)"
+if [[ "$ALPHA_OUTPUT" != *"--prerelease"* ]]; then
+  echo "FAIL: alpha releases must be published with --prerelease" >&2
+  exit 1
+fi
+if [[ "$ALPHA_OUTPUT" == *"--latest"* ]]; then
+  echo "FAIL: alpha releases must never be published with --latest" >&2
+  exit 1
+fi
+
+if \
+  VOICE_RELAY_RELEASE_DRY_RUN=1 \
+  VOICE_RELAY_RELEASE_NOTES_FILE="$NOTES_FILE" \
+  "$ROOT/publish-github-release.sh" \
+    v1.0.0 \
+    "$ASSET_FILE" >/dev/null 2>&1
+then
+  echo "FAIL: v1.0.0 must require explicit stable-release approval" >&2
+  exit 1
+fi
+
+STABLE_OUTPUT="$(
+  VOICE_RELAY_RELEASE_DRY_RUN=1 \
+  VOICE_RELAY_STABLE_RELEASE_APPROVED=true \
+  VOICE_RELAY_RELEASE_NOTES_FILE="$NOTES_FILE" \
+  "$ROOT/publish-github-release.sh" \
+    v1.0.0 \
+    "$ASSET_FILE"
+)"
+if [[ "$STABLE_OUTPUT" != *"--latest"* ]]; then
+  echo "FAIL: an explicitly approved v1.0.0 must be published with --latest" >&2
+  exit 1
+fi
+if [[ "$STABLE_OUTPUT" == *"--prerelease"* ]]; then
+  echo "FAIL: an explicitly approved v1.0.0 must not be a prerelease" >&2
+  exit 1
+fi
+
+if \
+  VOICE_RELAY_RELEASE_DRY_RUN=1 \
+  VOICE_RELAY_STABLE_RELEASE_APPROVED=true \
+  VOICE_RELAY_RELEASE_NOTES_FILE="$NOTES_FILE" \
+  "$ROOT/publish-github-release.sh" \
+    v0.4.0 \
+    "$ASSET_FILE" >/dev/null 2>&1
+then
+  echo "FAIL: stable tags other than the explicitly approved v1.0.0 must be rejected" >&2
+  exit 1
+fi
+
+echo "Voice Relay release policy tests passed"

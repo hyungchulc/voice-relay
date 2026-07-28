@@ -365,6 +365,22 @@ installation instructions, distribution notes, and the exact corresponding
 source URL. Because this path is not notarized, macOS may require
 **System Settings → Privacy & Security → Open Anyway**.
 
+Publish every alpha, beta, and release-candidate tag as a GitHub prerelease.
+Until the user explicitly approves `v1.0.0`, the release helper rejects stable
+tags and never sets the GitHub `Latest` marker:
+
+```bash
+VOICE_RELAY_RELEASE_NOTES_FILE="./release-notes.md" \
+./publish-github-release.sh \
+  v0.4.0-alpha.8 \
+  releases/Voice-Relay-0.4.0-alpha.8-development-signed.dmg \
+  releases/Voice-Relay-0.4.0-alpha.8-development-signed.dmg.sha256
+```
+
+Only after explicit user approval for the first stable release may the same
+helper be invoked with `VOICE_RELAY_STABLE_RELEASE_APPROVED=true` and
+`v1.0.0`. The helper then marks that release as `Latest`.
+
 For a normal trusted public build, a Developer ID Application certificate is
 required:
 

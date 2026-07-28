@@ -2878,5 +2878,23 @@ require_text \
   "$ROOT/package-release.sh" \
   '/usr/bin/lipo "$BINARY" -verify_arch arm64 x86_64' \
   "release packaging must verify both architectures"
+require_text \
+  "$ROOT/publish-github-release.sh" \
+  'COMMAND+=(--prerelease)' \
+  "alpha release publishing must be prerelease by default"
+require_text \
+  "$ROOT/publish-github-release.sh" \
+  'VOICE_RELAY_STABLE_RELEASE_APPROVED' \
+  "stable release publishing must require explicit approval"
+require_text \
+  "$ROOT/publish-github-release.sh" \
+  '[[ "$TAG" == "v1.0.0" ]]' \
+  "the first stable release gate must be limited to v1.0.0"
+reject_text \
+  "$ROOT/publish-github-release.sh" \
+  'make_latest=legacy' \
+  "release publishing must not delegate latest selection to GitHub heuristics"
+
+"$ROOT/Tests/ReleasePolicyTests.sh"
 
 echo "Voice Relay source policy tests passed"
