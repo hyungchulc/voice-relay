@@ -26,6 +26,19 @@ reject_text() {
   fi
 }
 
+require_count() {
+  local file="$1"
+  local text="$2"
+  local expected="$3"
+  local message="$4"
+  local actual
+  actual="$(/usr/bin/grep -Foc -- "$text" "$file" || true)"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "FAIL: $message (expected $expected, found $actual)" >&2
+    exit 1
+  fi
+}
+
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'tool_choice: "required"' \
@@ -50,6 +63,20 @@ require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   "For English, natural variants include 'Let me check'" \
   "Realtime handoff prompts must use natural English examples"
+if /usr/bin/sed -n \
+  '/static let defaultRealtimeInstructions = """/,/^    """/p' \
+  "$ROOT/Sources/SettingsStore.swift" \
+  | /usr/bin/grep -Eq '[가-힣]'; then
+  echo "FAIL: the public default Realtime prompt must be English-only" >&2
+  exit 1
+fi
+if /usr/bin/sed -n \
+  '/function handoffProgressInstructions(text)/,/^      }/p' \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  | /usr/bin/grep -Eq '[가-힣]'; then
+  echo "FAIL: the internal handoff-generation prompt must be English-only" >&2
+  exit 1
+fi
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'strictLocalDateTimeRequest' \
@@ -139,18 +166,31 @@ require_text \
   "$ROOT/Helpers/voice-relay-app-remote.mjs" \
   'desktopOriginator: "Voice Relay"' \
   "public builds must use an isolated Remote controller identity"
-require_text \
+require_count \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'CodexAppRemoteClient(' \
-  "the runtime must connect through the already-running Codex/ChatGPT app"
-require_text \
+  1 \
+  "the app delegate must own exactly one Codex/ChatGPT Remote client"
+reject_text \
   "$ROOT/Sources/OnboardingWindowController.swift" \
   'CodexAppRemoteClient(' \
-  "onboarding must configure the Codex/ChatGPT app Remote"
-require_text \
+  "onboarding must reuse the app-owned Codex/ChatGPT Remote client"
+reject_text \
   "$ROOT/Sources/SettingsWindowController.swift" \
   'CodexAppRemoteClient(' \
-  "settings must inspect the live Codex/ChatGPT app Remote"
+  "settings must reuse the app-owned Codex/ChatGPT Remote client"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'OverlayController(codexClient: remoteClient)' \
+  "the overlay must reuse the app-owned Codex/ChatGPT Remote client"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'SettingsWindowController(' \
+  "settings must receive the app-owned Codex/ChatGPT Remote client"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'OnboardingWindowController(remoteClient: remoteClient)' \
+  "onboarding must receive the app-owned Codex/ChatGPT Remote client"
 reject_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'CodexAppServerClient(' \
@@ -193,7 +233,7 @@ require_text \
   "settings must let the user edit the optional dedicated Session ID"
 require_text \
   "$ROOT/Sources/SettingsWindowController.swift" \
-  'client.inspect(workspacePath: settings.codexWorkspacePath)' \
+  'remoteClient.inspect(workspacePath: settings.codexWorkspacePath)' \
   "connection checks must inspect Remote without mutating the saved task binding"
 reject_text \
   "$ROOT/Sources/SettingsWindowController.swift" \
@@ -881,8 +921,17 @@ require_text \
   "application termination must synchronously stop the Remote helper"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  'overlayController?.shutdownForApplicationTermination()' \
-  "application termination must not leave an orphaned Remote helper"
+  'remoteClient.shutdownSynchronously()' \
+  "the app delegate must synchronously reap its only Remote helper"
+require_count \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'remoteClient.shutdownSynchronously()' \
+  1 \
+  "only the app delegate may perform the final synchronous Remote shutdown"
+require_text \
+  "$ROOT/Sources/CodexAppRemoteClient.swift" \
+  'activeProcess.waitUntilExit()' \
+  "Remote shutdown must reap the helper before another helper can start"
 require_text \
   "$ROOT/Helpers/voice-relay-app-remote.mjs" \
   'path.join(helperRoot, "..", "Support")' \

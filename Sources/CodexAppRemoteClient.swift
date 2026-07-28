@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct CodexConnectionSnapshot {
@@ -121,7 +122,7 @@ final class CodexAppRemoteClient {
         let timeout: DispatchWorkItem
     }
 
-    private let workspacePath: String
+    private var workspacePath: String
     private let queue = DispatchQueue(label: "VoiceRelay.CodexAppRemote")
     private let queueSpecificKey = DispatchSpecificKey<Void>()
     private var process: Process?
@@ -173,10 +174,15 @@ final class CodexAppRemoteClient {
     }
 
     func inspect(
-        workspacePath _: String,
+        workspacePath: String,
         completion: @escaping (Result<CodexConnectionSnapshot, Error>) -> Void
     ) {
-        request(command: "inspect", params: [:], timeout: 60) { result in
+        request(
+            command: "inspect",
+            params: [:],
+            timeout: 60,
+            workspacePath: workspacePath
+        ) { result in
             completion(result.flatMap(Self.parseConnectionSnapshot))
         }
     }
@@ -226,6 +232,7 @@ final class CodexAppRemoteClient {
             command: "ask",
             params: params,
             timeout: 10 * 60,
+            workspacePath: options.workspacePath,
             onCommentary: onCommentary
         ) { [weak self] result in
             completion(result.flatMap { value in
@@ -509,12 +516,14 @@ final class CodexAppRemoteClient {
         command: String,
         params: JSONDictionary,
         timeout: TimeInterval,
+        workspacePath requestedWorkspacePath: String? = nil,
         onCommentary: ((CodexCommentary) -> Void)? = nil,
         completion: @escaping (Result<JSONDictionary, Error>) -> Void
     ) {
         queue.async { [weak self] in
             guard let self else { return }
             do {
+                self.updateWorkspaceIfNeeded(requestedWorkspacePath)
                 try self.startProcessIfNeeded()
             } catch {
                 completion(.failure(error))
@@ -608,6 +617,16 @@ final class CodexAppRemoteClient {
         standardInput = inputPipe.fileHandleForWriting
         standardOutput = outputPipe.fileHandleForReading
         standardError = errorPipe.fileHandleForReading
+    }
+
+    private func updateWorkspaceIfNeeded(_ requestedWorkspacePath: String?) {
+        guard let requestedWorkspacePath else { return }
+        let normalized = requestedWorkspacePath.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !normalized.isEmpty, normalized != workspacePath else { return }
+        stopProcessNow()
+        workspacePath = normalized
     }
 
     private func consume(_ data: Data) {
@@ -721,16 +740,33 @@ final class CodexAppRemoteClient {
             ])
         }
         try? standardInput?.close()
+        if let activeProcess, activeProcess.isRunning {
+            if !waitForExit(activeProcess, timeout: 0.4) {
+                activeProcess.terminate()
+            }
+            if !waitForExit(activeProcess, timeout: 0.8) {
+                Darwin.kill(activeProcess.processIdentifier, SIGKILL)
+                activeProcess.waitUntilExit()
+            }
+        }
         try? standardOutput?.close()
         try? standardError?.close()
-        if activeProcess?.isRunning == true {
-            activeProcess?.terminate()
-        }
         resetProcess(
             error: CodexAppRemoteError.processExited(
                 "The app closed the connection"
             )
         )
+    }
+
+    private func waitForExit(
+        _ activeProcess: Process,
+        timeout: TimeInterval
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while activeProcess.isRunning, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return !activeProcess.isRunning
     }
 
     private func helperURL() throws -> URL {

@@ -47,9 +47,10 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     ]
 
     private let store: SettingsStore
+    private let remoteClient: CodexAppRemoteClient
     private var settings: AppSettings
     private var step: Step = .welcome
-    private var probe: CodexAppRemoteClient?
+    private var probeGeneration = 0
     private var codexVerified = false
     private var voiceVerified = false
 
@@ -81,7 +82,11 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
 
     var onFinish: (() -> Void)?
 
-    init(store: SettingsStore = .shared) {
+    init(
+        remoteClient: CodexAppRemoteClient,
+        store: SettingsStore = .shared
+    ) {
+        self.remoteClient = remoteClient
         self.store = store
         settings = store.load()
         localizedCopy = AppCopy(preference: settings.appDisplayLanguage)
@@ -110,10 +115,6 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         render()
     }
 
-    deinit {
-        probe?.shutdown()
-    }
-
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
@@ -133,8 +134,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func shutdownSynchronously() {
-        probe?.shutdownSynchronously()
-        probe = nil
+        stopProbe()
     }
 
     private func buildFancyUI() {
@@ -1090,14 +1090,16 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
 
     private func verifyCodex(force: Bool = false) {
         guard force || !codexVerified else { return }
-        let client = makeProbe()
+        let generation = beginProbe()
         statusLabel.stringValue = localizedCopy.text(
             "Checking the Codex/ChatGPT Remote connection and configuration…",
             "Codex/ChatGPT Remote 연결과 설정을 확인 중…"
         )
-        client.inspect(workspacePath: settings.codexWorkspacePath) { [weak self, weak client] result in
+        remoteClient.inspect(workspacePath: settings.codexWorkspacePath) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, self.probe === client, self.step == .codex else { return }
+                guard let self,
+                      self.probeGeneration == generation,
+                      self.step == .codex else { return }
                 switch result {
                 case let .success(snapshot):
                     self.codexVerified = true
@@ -1137,7 +1139,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         }
         pairingCodeControl.stringValue = pairingCode
 
-        let client = makeProbe()
+        let generation = beginProbe()
         statusLabel.stringValue = pairingCode.isEmpty
             ? localizedCopy.text(
                 "Complete Voice Relay controller authorization in the browser…",
@@ -1148,9 +1150,11 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
                 "ChatGPT Remote와 연결 중…"
             )
         statusLabel.textColor = .secondaryLabelColor
-        client.pair(pairingCode: pairingCode) { [weak self, weak client] result in
+        remoteClient.pair(pairingCode: pairingCode) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, self.probe === client, self.step == .codex else { return }
+                guard let self,
+                      self.probeGeneration == generation,
+                      self.step == .codex else { return }
                 switch result {
                 case let .success(connection) where connection.remoteRPCReady:
                     self.store.codexAppConnectionCompleted = true
@@ -1190,14 +1194,16 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
 
     private func verifyVoice(force: Bool = false) {
         guard force || !voiceVerified else { return }
-        let client = makeProbe()
+        let generation = beginProbe()
         statusLabel.stringValue = localizedCopy.text(
             "Checking ChatGPT OAuth Realtime…",
             "ChatGPT OAuth Realtime 확인 중…"
         )
-        client.inspectRealtimeAvailability { [weak self, weak client] result in
+        remoteClient.inspectRealtimeAvailability { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, self.probe === client, self.step == .voice else { return }
+                guard let self,
+                      self.probeGeneration == generation,
+                      self.step == .voice else { return }
                 switch result {
                 case let .success(description):
                     self.voiceVerified = true
@@ -1214,13 +1220,9 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    private func makeProbe() -> CodexAppRemoteClient {
+    private func beginProbe() -> Int {
         stopProbe()
-        let client = CodexAppRemoteClient(
-            workspacePath: settings.codexWorkspacePath
-        )
-        probe = client
-        return client
+        return probeGeneration
     }
 
     private func captureSessionSelection() -> Bool {
@@ -1315,7 +1317,6 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func stopProbe() {
-        probe?.shutdown()
-        probe = nil
+        probeGeneration &+= 1
     }
 }

@@ -244,8 +244,8 @@ The smoke test requires the Voice Relay controller and desktop app host to be pa
 For the public developer alpha, create an ad-hoc signed universal DMG:
 
 ```bash
-VOICE_RELAY_SOURCE_URL="https://github.com/example/voice-relay/archive/refs/tags/v0.4.0-alpha.1.tar.gz" \
-VOICE_RELAY_RELEASE_LABEL="0.4.0-alpha.1" \
+VOICE_RELAY_SOURCE_URL="https://github.com/example/voice-relay/archive/refs/tags/v0.4.0-alpha.2.tar.gz" \
+VOICE_RELAY_RELEASE_LABEL="0.4.0-alpha.2" \
 ./package-alpha-dmg.sh
 ```
 

@@ -873,9 +873,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         phrases: config.wakePhrases,
         preferModernSpeechAnalyzer: config.preferModernSpeechAnalyzer
     )
-    private lazy var codexClient = CodexAppRemoteClient(
-        workspacePath: config.codexWorkspacePath
-    )
+    private let codexClient: CodexAppRemoteClient
     private lazy var realtimeController = DirectRealtimeController(
         model: config.realtimeModel,
         voice: config.realtimeVoice,
@@ -960,7 +958,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private var currentAnswerHeight: CGFloat = 0
     private var currentAnswerWidth: CGFloat = 0
 
-    override init() {
+    init(codexClient: CodexAppRemoteClient) {
+        self.codexClient = codexClient
         let initialScreen = DisplayGeometry.preferredScreen(
             for: config.overlayAnchor
         )
@@ -1027,7 +1026,6 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         }
         presenceMonitor.stop()
         realtimeController.shutdown()
-        codexClient.shutdown()
         DistributedNotificationCenter.default().removeObserver(self)
     }
 
@@ -1142,7 +1140,6 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             realtimeController.stop(generation: voiceState.generation)
         }
         realtimeController.shutdown()
-        codexClient.shutdown()
         assistantOutputLifecycle.cancelAll(
             generation: voiceState.generation
         )
@@ -1154,7 +1151,6 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
     func shutdownForApplicationTermination() {
         closeForRebuild()
-        codexClient.shutdownSynchronously()
     }
 
     @objc private func hidePanel() {
@@ -2276,16 +2272,6 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 voice: self.config.realtimeVoice,
                 completion: completion
             )
-        }
-        codexClient.onThreadCreated = { threadID in
-            do {
-                try SettingsStore.shared.setManagedCodexThreadID(threadID)
-            } catch {
-                NSLog(
-                    "Voice Relay task persistence failed: %@",
-                    error.localizedDescription
-                )
-            }
         }
     }
 
@@ -4172,9 +4158,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var overlayController: OverlayController?
     private var displayChangeWorkItem: DispatchWorkItem?
     private var statusItem: NSStatusItem?
-    private lazy var settingsController = SettingsWindowController()
+    private lazy var remoteClient: CodexAppRemoteClient = {
+        let client = CodexAppRemoteClient(
+            workspacePath: AppConfig.load().codexWorkspacePath
+        )
+        client.onThreadCreated = { threadID in
+            do {
+                try SettingsStore.shared.setManagedCodexThreadID(threadID)
+            } catch {
+                NSLog(
+                    "Voice Relay task persistence failed: %@",
+                    error.localizedDescription
+                )
+            }
+        }
+        return client
+    }()
+    private lazy var settingsController = SettingsWindowController(
+        remoteClient: remoteClient
+    )
     private lazy var onboardingController: OnboardingWindowController = {
-        let controller = OnboardingWindowController()
+        let controller = OnboardingWindowController(remoteClient: remoteClient)
         controller.onFinish = { [weak self] in
             self?.rebuildOverlay(show: true)
             self?.overlayController?.startRealtimeAfterLaunchIfAuthorized()
@@ -4258,6 +4262,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         if !SettingsStore.shared.onboardingCompleted {
             onboardingController.shutdownSynchronously()
         }
+        remoteClient.shutdownSynchronously()
     }
 
     @objc private func openSettings() {
@@ -4289,7 +4294,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func rebuildOverlay(show: Bool) {
         overlayController?.closeForRebuild()
-        let controller = OverlayController()
+        let controller = OverlayController(codexClient: remoteClient)
         controller.onSettingsRequested = { [weak self] in
             self?.openSettings()
         }

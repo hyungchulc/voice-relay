@@ -40,8 +40,8 @@ The public alpha can still be packaged as an unsigned DMG for testers who
 accept that limitation:
 
 ```bash
-VOICE_RELAY_SOURCE_URL="https://github.com/example/voice-relay/archive/refs/tags/v0.4.0-alpha.1.tar.gz" \
-VOICE_RELAY_RELEASE_LABEL="0.4.0-alpha.1" \
+VOICE_RELAY_SOURCE_URL="https://github.com/example/voice-relay/archive/refs/tags/v0.4.0-alpha.2.tar.gz" \
+VOICE_RELAY_RELEASE_LABEL="0.4.0-alpha.2" \
 ./package-alpha-dmg.sh
 ```
 

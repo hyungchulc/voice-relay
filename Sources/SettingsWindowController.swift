@@ -166,7 +166,8 @@ final class SettingsWindowController:
 
     private let store: SettingsStore
     private let launchAtLoginManager: LaunchAtLoginManager
-    private var probe: CodexAppRemoteClient?
+    private let remoteClient: CodexAppRemoteClient
+    private var probeGeneration = 0
     private var connectionRecoveryInFlight = false
 
     private let codexStatus = NSTextField(wrappingLabelWithString: "")
@@ -252,9 +253,11 @@ final class SettingsWindowController:
     var onConnectionRecoveryDidEnd: (() -> Void)?
 
     init(
+        remoteClient: CodexAppRemoteClient,
         store: SettingsStore = .shared,
         launchAtLoginManager: LaunchAtLoginManager = LaunchAtLoginManager()
     ) {
+        self.remoteClient = remoteClient
         self.store = store
         self.launchAtLoginManager = launchAtLoginManager
         let initialSettings = store.load()
@@ -277,10 +280,6 @@ final class SettingsWindowController:
         window.delegate = self
         applyCanvasAppearance()
         buildModernUI()
-    }
-
-    deinit {
-        probe?.shutdown()
     }
 
     @available(*, unavailable)
@@ -314,8 +313,7 @@ final class SettingsWindowController:
     }
 
     func shutdownSynchronously() {
-        probe?.shutdownSynchronously()
-        probe = nil
+        stopProbe()
     }
 
     private func rebuildModernUI(using nextCopy: AppCopy) {
@@ -1452,14 +1450,11 @@ final class SettingsWindowController:
         codexStatus.textColor = .secondaryLabelColor
         voiceStatus.stringValue = localizedCopy.text("Checking…", "확인 중…")
         voiceStatus.textColor = .secondaryLabelColor
-        stopProbe()
-        let client = CodexAppRemoteClient(
-            workspacePath: settings.codexWorkspacePath
-        )
-        probe = client
-        client.inspect(workspacePath: settings.codexWorkspacePath) { [weak self, weak client] result in
+        let generation = beginProbe()
+        remoteClient.inspect(workspacePath: settings.codexWorkspacePath) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, self.probe === client else { return }
+                guard let self,
+                      self.probeGeneration == generation else { return }
                 switch result {
                 case let .success(snapshot):
                     self.codexStatus.stringValue =
@@ -1473,9 +1468,10 @@ final class SettingsWindowController:
                 }
             }
         }
-        client.inspectRealtimeAvailability { [weak self, weak client] result in
+        remoteClient.inspectRealtimeAvailability { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, self.probe === client else { return }
+                guard let self,
+                      self.probeGeneration == generation else { return }
                 switch result {
                 case let .success(description):
                     self.voiceStatus.stringValue = description
@@ -1513,7 +1509,6 @@ final class SettingsWindowController:
     }
 
     private func performConnectionRecovery(resetLocalPairing: Bool) {
-        let settings = store.load()
         stopProbe()
         beginConnectionRecovery()
         connectionRecoveryStatus.stringValue = localizedCopy.text(
@@ -1521,14 +1516,12 @@ final class SettingsWindowController:
             "Codex Remote 복구 중…"
         )
         connectionRecoveryStatus.textColor = .secondaryLabelColor
-        let client = CodexAppRemoteClient(
-            workspacePath: settings.codexWorkspacePath
-        )
-        probe = client
+        let generation = beginProbe()
         let completion: (Result<CodexConnectionResetResult, Error>) -> Void = {
-            [weak self, weak client] result in
+            [weak self] result in
             DispatchQueue.main.async {
-                guard let self, self.probe === client else { return }
+                guard let self,
+                      self.probeGeneration == generation else { return }
                 self.stopProbe()
                 self.finishConnectionRecovery()
                 switch result {
@@ -1553,14 +1546,13 @@ final class SettingsWindowController:
             }
         }
         if resetLocalPairing {
-            client.forgetLocalPairing(completion: completion)
+            remoteClient.forgetLocalPairing(completion: completion)
         } else {
-            client.resetSession(completion: completion)
+            remoteClient.resetSession(completion: completion)
         }
     }
 
     @objc private func pairCodexConnection() {
-        let settings = store.load()
         guard let code = ManualPairingCode.normalized(
             pairingCodeControl.stringValue
         ) else {
@@ -1579,13 +1571,11 @@ final class SettingsWindowController:
             "ChatGPT와 연결 중…"
         )
         connectionRecoveryStatus.textColor = .secondaryLabelColor
-        let client = CodexAppRemoteClient(
-            workspacePath: settings.codexWorkspacePath
-        )
-        probe = client
-        client.pair(pairingCode: code) { [weak self, weak client] result in
+        let generation = beginProbe()
+        remoteClient.pair(pairingCode: code) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, self.probe === client else { return }
+                guard let self,
+                      self.probeGeneration == generation else { return }
                 self.stopProbe()
                 self.finishConnectionRecovery()
                 switch result {
@@ -1776,17 +1766,13 @@ final class SettingsWindowController:
     }
 
     private func performReset() {
-        let settings = store.load()
         resetButton.isEnabled = false
         saveButton.isEnabled = false
-        stopProbe()
-        let client = CodexAppRemoteClient(
-            workspacePath: settings.codexWorkspacePath
-        )
-        probe = client
-        client.resetConnection { [weak self, weak client] result in
+        let generation = beginProbe()
+        remoteClient.resetConnection { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, self.probe === client else { return }
+                guard let self,
+                      self.probeGeneration == generation else { return }
                 self.resetButton.isEnabled = true
                 self.saveButton.isEnabled = true
                 switch result {
@@ -2086,8 +2072,12 @@ final class SettingsWindowController:
     }
 
     private func stopProbe() {
-        probe?.shutdown()
-        probe = nil
+        probeGeneration &+= 1
+    }
+
+    private func beginProbe() -> Int {
+        stopProbe()
+        return probeGeneration
     }
 }
 
