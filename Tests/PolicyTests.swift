@@ -40,6 +40,42 @@ struct PolicyTests {
     }
 
     static func main() {
+        let hiddenTranscriptLog = VoiceRelayDiagnostics.rendered(
+            "diagnostic_test",
+            generation: 7,
+            fields: ["reason": "test"],
+            transcriptFields: ["userText": "weather near me"],
+            includeTranscriptContent: false
+        )
+        expect(
+            hiddenTranscriptLog.contains("content=redacted")
+                && !hiddenTranscriptLog.contains("weather near me"),
+            "transcript diagnostics must default to content redaction"
+        )
+        let visibleTranscriptLog = VoiceRelayDiagnostics.rendered(
+            "diagnostic_test",
+            generation: 7,
+            fields: [
+                "authorization": "Bearer should-never-appear",
+                "reason": "Bearer another-secret",
+            ],
+            transcriptFields: [
+                "userText":
+                    #"weather near me with sk-proj-supersecret123 and aaaabbbbbccccdddd1111.aaaabbbbbccccdddd2222.aaaabbbbb3333"#
+            ],
+            includeTranscriptContent: true
+        )
+        expect(
+            visibleTranscriptLog.contains("authorization=redacted")
+                && visibleTranscriptLog.contains("weather near me")
+                && visibleTranscriptLog.contains("[REDACTED]")
+                && !visibleTranscriptLog.contains("should-never-appear")
+                && !visibleTranscriptLog.contains("another-secret")
+                && !visibleTranscriptLog.contains("sk-proj-")
+                && !visibleTranscriptLog.contains("aaaabbbbbccccdddd"),
+            "all diagnostic values must redact credential canaries"
+        )
+
         var recoveryPolicy = AudioConfigurationRecoveryPolicy(
             quietWindow: 0.45
         )

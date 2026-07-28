@@ -35,6 +35,7 @@ final class WakePhraseController {
     private var recognitionGeneration = 0
     private var preferLegacyUntilPause = false
     private var modernTransientRetryCount = 0
+    private var captureStarted = false
 
     private(set) var isMonitoring = false
     var onWake: ((WakePhraseMatch) -> Void)?
@@ -60,7 +61,20 @@ final class WakePhraseController {
         )
     }
 
-    func startMonitoring() {
+    func startMonitoring(reason: String = "requested") {
+        VoiceRelayDiagnostics.flow(
+            "wake_monitor_start_requested",
+            generation: recognitionGeneration,
+            fields: [
+                "already_monitoring": String(isMonitoring),
+                "microphone_permission":
+                    String(AVCaptureDevice.authorizationStatus(for: .audio).rawValue),
+                "phrase_count": String(phrases.count),
+                "reason": reason,
+                "speech_permission":
+                    String(SFSpeechRecognizer.authorizationStatus().rawValue),
+            ]
+        )
         if !wantsMonitoring {
             preferLegacyUntilPause = false
             modernTransientRetryCount = 0
@@ -70,6 +84,15 @@ final class WakePhraseController {
               modernStartTask == nil,
               modernSession == nil,
               !permissionRequestInFlight else {
+            VoiceRelayDiagnostics.flow(
+                "wake_monitor_start_suppressed",
+                generation: recognitionGeneration,
+                fields: [
+                    "reason": isMonitoring
+                        ? "already_monitoring"
+                        : "startup_already_in_progress",
+                ]
+            )
             return
         }
         if SFSpeechRecognizer.authorizationStatus() == .authorized,
@@ -80,14 +103,19 @@ final class WakePhraseController {
         requestPermissionsAndStart()
     }
 
-    func pause() {
+    func pause(reason: String = "requested") {
         wantsMonitoring = false
         preferLegacyUntilPause = false
         modernTransientRetryCount = 0
-        stopRecognition()
+        stopRecognition(reason: reason)
     }
 
     private func requestPermissionsAndStart() {
+        VoiceRelayDiagnostics.flow(
+            "wake_permission_request_started",
+            generation: recognitionGeneration,
+            fields: ["reason": "wake_monitor_start"]
+        )
         permissionRequestInFlight = true
         SFSpeechRecognizer.requestAuthorization { [weak self] speechStatus in
             guard let self else { return }
@@ -95,6 +123,14 @@ final class WakePhraseController {
                 DispatchQueue.main.async {
                     self.permissionRequestInFlight = false
                     self.wantsMonitoring = false
+                    VoiceRelayDiagnostics.flow(
+                        "wake_permission_request_completed",
+                        generation: self.recognitionGeneration,
+                        fields: [
+                            "granted": "false",
+                            "permission": "speech_recognition",
+                        ]
+                    )
                     self.onError?("웨이크워드 음성 인식 권한이 필요해")
                 }
                 return
@@ -106,9 +142,25 @@ final class WakePhraseController {
                     self.permissionRequestInFlight = false
                     guard granted else {
                         self.wantsMonitoring = false
+                        VoiceRelayDiagnostics.flow(
+                            "wake_permission_request_completed",
+                            generation: self.recognitionGeneration,
+                            fields: [
+                                "granted": "false",
+                                "permission": "microphone",
+                            ]
+                        )
                         self.onError?("웨이크워드 마이크 권한이 필요해")
                         return
                     }
+                    VoiceRelayDiagnostics.flow(
+                        "wake_permission_request_completed",
+                        generation: self.recognitionGeneration,
+                        fields: [
+                            "granted": "true",
+                            "permission": "speech_and_microphone",
+                        ]
+                    )
                     self.startRecognitionIfPossible()
                 }
             }
@@ -125,9 +177,27 @@ final class WakePhraseController {
         if #available(macOS 26.0, *),
            preferModernSpeechAnalyzer,
            !preferLegacyUntilPause {
+            VoiceRelayDiagnostics.flow(
+                "wake_backend_selected",
+                generation: recognitionGeneration,
+                fields: [
+                    "backend": "speech_analyzer",
+                    "reason": "preferred_and_available",
+                ]
+            )
             startModernRecognitionIfPossible()
             return
         }
+        VoiceRelayDiagnostics.flow(
+            "wake_backend_selected",
+            generation: recognitionGeneration,
+            fields: [
+                "backend": "legacy_speech",
+                "reason": preferLegacyUntilPause
+                    ? "speech_analyzer_fallback"
+                    : "platform_or_preference",
+            ]
+        )
         startLegacyRecognitionIfPossible()
     }
 
@@ -172,6 +242,15 @@ final class WakePhraseController {
                 requestedLocaleCount: requestedLocales.count,
                 availableLocaleCount: selectedLocales.count
             ) else {
+                VoiceRelayDiagnostics.flow(
+                    "wake_backend_fallback",
+                    generation: generation,
+                    fields: [
+                        "from": "speech_analyzer",
+                        "reason": "no_supported_installed_locale",
+                        "to": "legacy_speech",
+                    ]
+                )
                 self.preferLegacyUntilPause = true
                 self.startLegacyRecognitionIfPossible()
                 return
@@ -188,7 +267,20 @@ final class WakePhraseController {
         locales: [Locale],
         generation: Int
     ) {
+        VoiceRelayDiagnostics.flow(
+            "wake_microphone_open_requested",
+            generation: generation,
+            fields: [
+                "backend": "speech_analyzer",
+                "input": AVCaptureDevice.default(for: .audio)?.localizedName
+                    ?? "system_default_unknown",
+                "input_selection": "macos_system_default",
+                "locale_count": String(locales.count),
+                "reason": "wake_monitoring",
+            ]
+        )
         let session = SpeechAnalyzerWakeSession(
+            diagnosticGeneration: generation,
             locales: locales,
             phrases: phrases,
             onTranscript: { [weak self] laneIndex, transcript, isFinal in
@@ -214,10 +306,22 @@ final class WakePhraseController {
                         return
                     }
                     Self.logger.error(
-                        "SpeechAnalyzer runtime failed, using legacy fallback: \(error.localizedDescription, privacy: .public)"
+                        "SpeechAnalyzer runtime failed, using legacy fallback: \(VoiceRelayDiagnostics.safe(error.localizedDescription), privacy: .public)"
+                    )
+                    VoiceRelayDiagnostics.flow(
+                        "wake_backend_failed",
+                        generation: generation,
+                        fields: [
+                            "backend": "speech_analyzer",
+                            "error_code": String((error as NSError).code),
+                            "error_domain": (error as NSError).domain,
+                            "stage": "runtime",
+                        ]
                     )
                     self.preferLegacyUntilPause = true
-                    self.stopRecognition()
+                    self.stopRecognition(
+                        reason: "speech_analyzer_runtime_failure"
+                    )
                     self.wantsMonitoring = true
                     self.scheduleRestart()
                 }
@@ -236,6 +340,16 @@ final class WakePhraseController {
                 case .success:
                     self.modernTransientRetryCount = 0
                     self.isMonitoring = true
+                    self.captureStarted = true
+                    VoiceRelayDiagnostics.flow(
+                        "wake_microphone_started",
+                        generation: generation,
+                        fields: [
+                            "backend": "speech_analyzer",
+                            "input_selection": "macos_system_default",
+                            "reason": "wake_monitoring",
+                        ]
+                    )
                     Self.logger.info(
                         "SpeechAnalyzer active locales=\(locales.map(\.identifier).joined(separator: ","), privacy: .public) phrase_count=\(self.phrases.count)"
                     )
@@ -252,7 +366,9 @@ final class WakePhraseController {
                         Self.logger.notice(
                             "SpeechAnalyzer audio device was still switching, retrying modern recognition once"
                         )
-                        self.stopRecognition()
+                        self.stopRecognition(
+                            reason: "speech_analyzer_start_retry"
+                        )
                         self.wantsMonitoring = true
                         self.scheduleRestart(
                             delay: WakeAnalyzerRetryPolicy.retryDelay
@@ -260,10 +376,22 @@ final class WakePhraseController {
                         return
                     }
                     Self.logger.error(
-                        "SpeechAnalyzer start failed, using legacy fallback: \(error.localizedDescription, privacy: .public)"
+                        "SpeechAnalyzer start failed, using legacy fallback: \(VoiceRelayDiagnostics.safe(error.localizedDescription), privacy: .public)"
+                    )
+                    VoiceRelayDiagnostics.flow(
+                        "wake_backend_failed",
+                        generation: generation,
+                        fields: [
+                            "backend": "speech_analyzer",
+                            "error_code": String((error as NSError).code),
+                            "error_domain": (error as NSError).domain,
+                            "stage": "startup",
+                        ]
                     )
                     self.preferLegacyUntilPause = true
-                    self.stopRecognition()
+                    self.stopRecognition(
+                        reason: "speech_analyzer_start_failure"
+                    )
                     self.wantsMonitoring = true
                     self.scheduleRestart()
                 }
@@ -278,6 +406,15 @@ final class WakePhraseController {
         }
         guard !availableRecognizers.isEmpty else {
             wantsMonitoring = false
+            VoiceRelayDiagnostics.flow(
+                "wake_backend_failed",
+                generation: recognitionGeneration,
+                fields: [
+                    "backend": "legacy_speech",
+                    "reason": "no_on_device_recognizer",
+                    "stage": "startup",
+                ]
+            )
             onError?("선택한 언어는 이 Mac에서 로컬 웨이크워드를 사용할 수 없어")
             return
         }
@@ -285,6 +422,18 @@ final class WakePhraseController {
         restartWorkItem?.cancel()
         recognitionGeneration += 1
         let generation = recognitionGeneration
+        VoiceRelayDiagnostics.flow(
+            "wake_microphone_open_requested",
+            generation: generation,
+            fields: [
+                "backend": "legacy_speech",
+                "input": AVCaptureDevice.default(for: .audio)?.localizedName
+                    ?? "system_default_unknown",
+                "input_selection": "macos_system_default",
+                "locale_count": String(availableRecognizers.count),
+                "reason": "wake_monitoring",
+            ]
+        )
         tasks.forEach { $0.cancel() }
         tasks.removeAll()
         completedLaneIndexes.removeAll()
@@ -297,6 +446,20 @@ final class WakePhraseController {
         }
 
         let inputNode = audioEngine.inputNode
+        let captureFormat = inputNode.outputFormat(forBus: 0)
+        VoiceRelayDiagnostics.flow(
+            "wake_microphone_capture_configured",
+            generation: generation,
+            fields: [
+                "backend": "legacy_speech",
+                "channels": String(captureFormat.channelCount),
+                "format": String(describing: captureFormat.commonFormat),
+                "sample_rate": String(
+                    format: "%.0f",
+                    captureFormat.sampleRate
+                ),
+            ]
+        )
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(
             onBus: 0,
@@ -313,11 +476,31 @@ final class WakePhraseController {
             inputNode.removeTap(onBus: 0)
             requests.removeAll()
             wantsMonitoring = false
+            VoiceRelayDiagnostics.flow(
+                "wake_backend_failed",
+                generation: generation,
+                fields: [
+                    "backend": "legacy_speech",
+                    "error_code": String((error as NSError).code),
+                    "error_domain": (error as NSError).domain,
+                    "stage": "audio_engine_start",
+                ]
+            )
             onError?("웨이크워드 마이크를 시작하지 못했어")
             return
         }
 
         isMonitoring = true
+        captureStarted = true
+        VoiceRelayDiagnostics.flow(
+            "wake_microphone_started",
+            generation: generation,
+            fields: [
+                "backend": "legacy_speech",
+                "input_selection": "macos_system_default",
+                "reason": "wake_monitoring",
+            ]
+        )
         Self.logger.info(
             "Legacy recognizer active locales=\(availableRecognizers.map(\.locale.identifier).joined(separator: ","), privacy: .public) phrase_count=\(self.phrases.count)"
         )
@@ -343,7 +526,9 @@ final class WakePhraseController {
                     if error != nil || result?.isFinal == true {
                         self.completedLaneIndexes.insert(laneIndex)
                         if self.completedLaneIndexes.count == self.tasks.count {
-                            self.stopRecognition()
+                            self.stopRecognition(
+                                reason: "legacy_recognition_cycle_completed"
+                            )
                             self.wantsMonitoring = true
                             self.scheduleRestart()
                         }
@@ -364,6 +549,17 @@ final class WakePhraseController {
               recognitionGeneration == generation else {
             return false
         }
+        VoiceRelayDiagnostics.flow(
+            "wake_transcript",
+            generation: generation,
+            fields: [
+                "backend":
+                    modernSession == nil ? "legacy_speech" : "speech_analyzer",
+                "final": String(isFinal),
+                "lane": String(laneIndex),
+            ],
+            transcriptFields: ["text": transcript]
+        )
         if let match = WakePhrasePolicy.match(
             transcript,
             phrases: phrases
@@ -403,8 +599,34 @@ final class WakePhraseController {
             Self.logger.notice(
                 "Wake matched lane=\(candidate.laneIndex) phrase_count=\(self.phrases.count) final=\(candidate.isFinal) command_tail=\(!candidate.match.command.isEmpty) command_length=\(candidate.match.command.count)"
             )
-            self.stopRecognition { [weak self] in
+            VoiceRelayDiagnostics.flow(
+                "wake_accepted",
+                generation: generation,
+                fields: [
+                    "backend":
+                        self.modernSession == nil
+                            ? "legacy_speech"
+                            : "speech_analyzer",
+                    "final": String(candidate.isFinal),
+                    "lane": String(candidate.laneIndex),
+                    "reason": candidate.match.command.isEmpty
+                        ? "wake_only"
+                        : "wake_with_command",
+                ],
+                transcriptFields: [
+                    "command": candidate.match.command,
+                    "text": transcript,
+                ]
+            )
+            self.stopRecognition(
+                reason: "wake_handoff"
+            ) { [weak self] in
                 guard let self, !self.wantsMonitoring else { return }
+                VoiceRelayDiagnostics.flow(
+                    "wake_microphone_released",
+                    generation: generation,
+                    fields: ["next": "realtime_start"]
+                )
                 self.onWake?(candidate.match)
             }
         }
@@ -419,7 +641,27 @@ final class WakePhraseController {
         return true
     }
 
-    private func stopRecognition(completion: (() -> Void)? = nil) {
+    private func stopRecognition(
+        reason: String,
+        completion: (() -> Void)? = nil
+    ) {
+        let stoppedGeneration = recognitionGeneration
+        let backend = modernSession == nil
+            ? "legacy_speech"
+            : "speech_analyzer"
+        let hadActiveCapture = captureStarted
+        captureStarted = false
+        VoiceRelayDiagnostics.flow(
+            "wake_monitor_stop_requested",
+            generation: stoppedGeneration,
+            fields: [
+                "backend": backend,
+                "capture_active": String(hadActiveCapture),
+                "legacy_tasks": String(tasks.count),
+                "modern_active": String(modernSession != nil),
+                "reason": reason,
+            ]
+        )
         restartWorkItem?.cancel()
         restartWorkItem = nil
         pendingWakeWorkItem?.cancel()
@@ -435,6 +677,15 @@ final class WakePhraseController {
                   self.recognitionGeneration == completionGeneration else {
                 return
             }
+            VoiceRelayDiagnostics.flow(
+                "wake_microphone_stopped",
+                generation: stoppedGeneration,
+                fields: [
+                    "backend": backend,
+                    "capture_was_active": String(hadActiveCapture),
+                    "reason": reason,
+                ]
+            )
             completion?()
         }
         requests.forEach { $0.endAudio() }
@@ -463,6 +714,16 @@ final class WakePhraseController {
 
     private func scheduleRestart(delay: TimeInterval = 0.8) {
         guard wantsMonitoring else { return }
+        VoiceRelayDiagnostics.flow(
+            "wake_monitor_restart_scheduled",
+            generation: recognitionGeneration,
+            fields: [
+                "delay_ms": String(Int(delay * 1_000)),
+                "reason": preferLegacyUntilPause
+                    ? "legacy_fallback"
+                    : "recognition_cycle",
+            ]
+        )
         let item = DispatchWorkItem { [weak self] in
             self?.startRecognitionIfPossible()
         }
@@ -482,6 +743,7 @@ final class WakePhraseController {
 
 @available(macOS 26.0, *)
 private final class SpeechAnalyzerWakeSession {
+    private let diagnosticGeneration: Int
     private let locales: [Locale]
     private let phrases: [String]
     private let onTranscript: (Int, String, Bool) -> Void
@@ -500,11 +762,13 @@ private final class SpeechAnalyzerWakeSession {
     private var failureReported = false
 
     init(
+        diagnosticGeneration: Int,
         locales: [Locale],
         phrases: [String],
         onTranscript: @escaping (Int, String, Bool) -> Void,
         onFailure: @escaping (Error) -> Void
     ) {
+        self.diagnosticGeneration = diagnosticGeneration
         self.locales = locales
         self.phrases = phrases
         self.onTranscript = onTranscript
@@ -550,6 +814,32 @@ private final class SpeechAnalyzerWakeSession {
                     ) else {
                     throw WakeRecognitionError.noCompatibleAudioFormat
                 }
+                VoiceRelayDiagnostics.flow(
+                    "wake_microphone_capture_configured",
+                    generation: diagnosticGeneration,
+                    fields: [
+                        "analysis_channels":
+                            String(analysisFormat.channelCount),
+                        "analysis_format":
+                            String(describing: analysisFormat.commonFormat),
+                        "analysis_sample_rate": String(
+                            format: "%.0f",
+                            analysisFormat.sampleRate
+                        ),
+                        "backend": "speech_analyzer",
+                        "conversion": String(
+                            !naturalFormat.isEqual(analysisFormat)
+                        ),
+                        "natural_channels":
+                            String(naturalFormat.channelCount),
+                        "natural_format":
+                            String(describing: naturalFormat.commonFormat),
+                        "natural_sample_rate": String(
+                            format: "%.0f",
+                            naturalFormat.sampleRate
+                        ),
+                    ]
+                )
 
                 let context = AnalysisContext()
                 context.contextualStrings[.general] = phrases

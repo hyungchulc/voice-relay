@@ -38,7 +38,12 @@ final class DirectRealtimeController: NSObject {
     private var webView: WKWebView?
     private var isReady = false
     private var isShutdown = false
-    private var pendingStart: (generation: Int, prefill: String?, shouldGreet: Bool)?
+    private var pendingStart: (
+        generation: Int,
+        prefill: String?,
+        shouldGreet: Bool,
+        reason: String
+    )?
     private var activeGeneration: Int?
     private var stoppingGenerations = Set<Int>()
     private var startupRetryState = RealtimeStartupRetryState()
@@ -159,13 +164,36 @@ final class DirectRealtimeController: NSObject {
     func start(
         generation: Int,
         prefill: String? = nil,
-        shouldGreet: Bool = true
+        shouldGreet: Bool = true,
+        reason: String = "manual"
     ) {
         if let previousGeneration = activeGeneration,
            previousGeneration != generation {
-            transport.stop(generation: previousGeneration)
+            VoiceRelayDiagnostics.flow(
+                "realtime_transport_stop_requested",
+                generation: previousGeneration,
+                fields: ["reason": "generation_replaced"]
+            )
+            transport.stop(
+                generation: previousGeneration,
+                reason: "generation_replaced"
+            )
         }
-        pendingStart = (generation, prefill, shouldGreet)
+        VoiceRelayDiagnostics.flow(
+            "realtime_host_start_requested",
+            generation: generation,
+            fields: [
+                "greet": String(shouldGreet),
+                "reason": reason,
+            ],
+            transcriptFields: ["prefill": prefill ?? ""]
+        )
+        pendingStart = (
+            generation,
+            prefill,
+            shouldGreet,
+            reason
+        )
         stoppingGenerations.remove(generation)
         startupRetryWorkItem?.cancel()
         startupRetryWorkItem = nil
@@ -175,7 +203,15 @@ final class DirectRealtimeController: NSObject {
         flushPendingStartIfReady()
     }
 
-    func stop(generation: Int) {
+    func stop(
+        generation: Int,
+        reason: String = "host_stop"
+    ) {
+        VoiceRelayDiagnostics.flow(
+            "realtime_host_stop_requested",
+            generation: generation,
+            fields: ["reason": reason]
+        )
         pendingStart = nil
         startupRetryWorkItem?.cancel()
         startupRetryWorkItem = nil
@@ -185,8 +221,17 @@ final class DirectRealtimeController: NSObject {
             stoppingGenerations.filter { $0 >= generation - 8 }
         )
         activeGeneration = nil
-        transport.stop(generation: generation)
-        evaluate(method: "stop", payload: ["generation": generation])
+        transport.stop(
+            generation: generation,
+            reason: reason
+        )
+        evaluate(
+            method: "stop",
+            payload: [
+                "generation": generation,
+                "reason": reason,
+            ]
+        )
     }
 
     func speakCodexCommentary(
@@ -214,8 +259,22 @@ final class DirectRealtimeController: NSObject {
         startupRetryWorkItem = nil
         startupRetryState.cancel()
         if let generation = activeGeneration {
-            transport.stop(generation: generation)
-            evaluate(method: "stop", payload: ["generation": generation])
+            VoiceRelayDiagnostics.flow(
+                "realtime_host_stop_requested",
+                generation: generation,
+                fields: ["reason": "controller_shutdown"]
+            )
+            transport.stop(
+                generation: generation,
+                reason: "controller_shutdown"
+            )
+            evaluate(
+                method: "stop",
+                payload: [
+                    "generation": generation,
+                    "reason": "controller_shutdown",
+                ]
+            )
         }
         transport.shutdown()
         activeGeneration = nil
@@ -247,6 +306,7 @@ final class DirectRealtimeController: NSObject {
                 "assistantName": assistantName,
                 "wakePhrases": wakePhrases,
                 "shouldGreet": pendingStart.shouldGreet,
+                "activationReason": pendingStart.reason,
             ]
         )
     }
@@ -265,6 +325,22 @@ final class DirectRealtimeController: NSObject {
             "phase": phase,
             "generation": generation,
         ])
+    }
+
+    private func acceptRuntimeReadySignal() {
+        guard !isReady else {
+            VoiceRelayDiagnostics.flow(
+                "realtime_runtime_protocol_violation",
+                fields: [
+                    "reason": "duplicate_script_ready",
+                    "source": "script_message",
+                ]
+            )
+            return
+        }
+        isReady = true
+        onEvent?(["type": "ready"])
+        flushPendingStartIfReady()
     }
 
     private static func originString(for url: URL?) -> String {
@@ -291,9 +367,7 @@ extension DirectRealtimeController: WKScriptMessageHandler {
             return
         }
         if type == "ready" {
-            isReady = true
-            onEvent?(body)
-            flushPendingStartIfReady()
+            acceptRuntimeReadySignal()
             return
         }
         if type == "credentialRequest" {
@@ -326,6 +400,8 @@ extension DirectRealtimeController: WKScriptMessageHandler {
         }
         if type == "diagnostic" {
             let stage = body["stage"] as? String ?? "unknown"
+            let generation =
+                (body["generation"] as? NSNumber)?.intValue
             let peer = body["peer"] as? String ?? "-"
             let ice = body["ice"] as? String ?? "-"
             let channel = body["channel"] as? String ?? "-"
@@ -336,6 +412,40 @@ extension DirectRealtimeController: WKScriptMessageHandler {
             let eventID = body["eventID"] as? String ?? "-"
             Self.logger.notice(
                 "Realtime diagnostic stage=\(stage, privacy: .public) peer=\(peer, privacy: .public) ice=\(ice, privacy: .public) channel=\(channel, privacy: .public) shape=\(shape, privacy: .public) kind=\(kind, privacy: .public) code=\(code, privacy: .public) error_type=\(errorType, privacy: .public) event_id=\(eventID, privacy: .public)"
+            )
+            var fields: [String: String] = [:]
+            for key in [
+                "callID",
+                "channel",
+                "code",
+                "errorType",
+                "eventID",
+                "ice",
+                "itemID",
+                "kind",
+                "peer",
+                "reason",
+                "responseID",
+                "shape",
+                "source",
+                "status",
+                "turnID",
+            ] {
+                if let value = body[key] as? String, !value.isEmpty {
+                    fields[key] = value
+                }
+            }
+            var transcriptFields: [String: String] = [:]
+            for key in ["assistantText", "text", "userText"] {
+                if let value = body[key] as? String, !value.isEmpty {
+                    transcriptFields[key] = value
+                }
+            }
+            VoiceRelayDiagnostics.flow(
+                stage,
+                generation: generation,
+                fields: fields,
+                transcriptFields: transcriptFields
             )
             return
         }
@@ -370,11 +480,27 @@ extension DirectRealtimeController: WKScriptMessageHandler {
         isRetry: Bool
     ) {
         guard generation == activeGeneration else { return }
+        VoiceRelayDiagnostics.flow(
+            "credential_request_started",
+            generation: generation,
+            fields: [
+                "attempt": isRetry ? "retry" : "initial",
+                "reason": "realtime_transport_start",
+            ]
+        )
         guard let credentialProvider = onCredentialRequest
             ?? onSDPOffer.map({ legacy in
                 { completion in legacy("", completion) }
             }) else {
             startupRetryState.cancel(generation: generation)
+            VoiceRelayDiagnostics.flow(
+                "credential_request_failed",
+                generation: generation,
+                fields: [
+                    "reason": "provider_unavailable",
+                    "status": "terminal",
+                ]
+            )
             onEvent?([
                 "type": "error",
                 "generation": generation,
@@ -391,6 +517,14 @@ extension DirectRealtimeController: WKScriptMessageHandler {
                         encodedCredential
                     ) else {
                         self.startupRetryState.cancel(generation: generation)
+                        VoiceRelayDiagnostics.flow(
+                            "credential_request_failed",
+                            generation: generation,
+                            fields: [
+                                "reason": "invalid_envelope",
+                                "status": "terminal",
+                            ]
+                        )
                         self.onEvent?([
                             "type": "error",
                             "generation": generation,
@@ -402,8 +536,24 @@ extension DirectRealtimeController: WKScriptMessageHandler {
                         generation: generation,
                         isRetry: isRetry
                     ) else {
+                        VoiceRelayDiagnostics.flow(
+                            "credential_result_ignored",
+                            generation: generation,
+                            fields: [
+                                "reason": "stale_or_duplicate_attempt",
+                            ]
+                        )
                         return
                     }
+                    VoiceRelayDiagnostics.flow(
+                        "credential_request_completed",
+                        generation: generation,
+                        fields: [
+                            "attempt": isRetry ? "retry" : "initial",
+                            "model": credential.model,
+                            "status": "success",
+                        ]
+                    )
                     self.transport.start(
                         generation: generation,
                         model: credential.model,
@@ -411,6 +561,15 @@ extension DirectRealtimeController: WKScriptMessageHandler {
                     )
                 case let .failure(error):
                     self.startupRetryState.cancel(generation: generation)
+                    VoiceRelayDiagnostics.flow(
+                        "credential_request_failed",
+                        generation: generation,
+                        fields: [
+                            "error_code": String((error as NSError).code),
+                            "error_domain": (error as NSError).domain,
+                            "status": "terminal",
+                        ]
+                    )
                     self.onEvent?([
                         "type": "error",
                         "generation": generation,
@@ -427,6 +586,16 @@ extension DirectRealtimeController: WKScriptMessageHandler {
     ) {
         guard generation == activeGeneration else { return }
         if startupRetryState.reserveRetry(generation: generation) {
+            VoiceRelayDiagnostics.flow(
+                "realtime_startup_retry_scheduled",
+                generation: generation,
+                fields: [
+                    "delay_ms": String(
+                        Int(RealtimeStartupRetryState.retryDelay * 1_000)
+                    ),
+                    "reason": message,
+                ]
+            )
             NSLog(
                 "Voice Relay Realtime startup retry generation=%d after=%@",
                 generation,
@@ -442,6 +611,11 @@ extension DirectRealtimeController: WKScriptMessageHandler {
                     return
                 }
                 self.startupRetryWorkItem = nil
+                VoiceRelayDiagnostics.flow(
+                    "realtime_startup_retry_started",
+                    generation: generation,
+                    fields: ["reason": "pre_ready_transport_failure"]
+                )
                 self.requestCredentialAndStartTransport(
                     generation: generation,
                     isRetry: true
@@ -455,8 +629,18 @@ extension DirectRealtimeController: WKScriptMessageHandler {
             return
         }
         if startupRetryState.hasReservedRetry(generation: generation) {
+            VoiceRelayDiagnostics.flow(
+                "realtime_transport_failure_deduplicated",
+                generation: generation,
+                fields: ["reason": message]
+            )
             return
         }
+        VoiceRelayDiagnostics.flow(
+            "realtime_transport_failure_terminal",
+            generation: generation,
+            fields: ["reason": message]
+        )
         onEvent?([
             "type": "error",
             "generation": generation,
@@ -506,8 +690,18 @@ extension DirectRealtimeController: WKScriptMessageHandler {
             return
         }
         NSLog(
-            "Voice Relay Codex bridge accepted request generation=%d",
-            generation
+            "Voice Relay Codex bridge accepted request generation=%d call_id=%@ text=%@",
+            generation,
+            callID,
+            VoiceRelayDiagnostics.logsTranscriptContent
+                ? text
+                : "<redacted>"
+        )
+        VoiceRelayDiagnostics.flow(
+            "codex_bridge_request_accepted",
+            generation: generation,
+            fields: ["callID": callID],
+            transcriptFields: ["text": text]
         )
         guard let onCodexRequest else {
             NSLog(
@@ -530,8 +724,18 @@ extension DirectRealtimeController: WKScriptMessageHandler {
                 switch result {
                 case let .success(output):
                     NSLog(
-                        "Voice Relay Codex bridge completed generation=%d result=success",
-                        generation
+                        "Voice Relay Codex bridge completed generation=%d call_id=%@ result=success",
+                        generation,
+                        callID
+                    )
+                    VoiceRelayDiagnostics.flow(
+                        "codex_bridge_request_completed",
+                        generation: generation,
+                        fields: [
+                            "callID": callID,
+                            "status": "success",
+                        ],
+                        transcriptFields: ["assistantText": output]
                     )
                     self.evaluate(
                         method: "resolveCodex",
@@ -543,9 +747,21 @@ extension DirectRealtimeController: WKScriptMessageHandler {
                     )
                 case let .failure(error):
                     NSLog(
-                        "Voice Relay Codex bridge completed generation=%d result=failure error=%@",
+                        "Voice Relay Codex bridge completed generation=%d call_id=%@ result=failure error=%@",
                         generation,
+                        callID,
                         error.localizedDescription
+                    )
+                    VoiceRelayDiagnostics.flow(
+                        "codex_bridge_request_completed",
+                        generation: generation,
+                        fields: [
+                            "callID": callID,
+                            "status": "failure",
+                        ],
+                        transcriptFields: [
+                            "assistantText": error.localizedDescription
+                        ]
                     )
                     self.evaluate(
                         method: "resolveCodex",
@@ -645,9 +861,13 @@ extension DirectRealtimeController: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         webView.evaluateJavaScript("Boolean(window.VoiceRelayNativeVoice?.start)") { [weak self] result, _ in
             guard let self, (result as? Bool) == true else { return }
-            self.isReady = true
-            self.onEvent?(["type": "ready"])
-            self.flushPendingStartIfReady()
+            VoiceRelayDiagnostics.flow(
+                "realtime_runtime_navigation_verified",
+                fields: [
+                    "ready_signal_received": String(self.isReady),
+                    "source": "navigation_probe",
+                ]
+            )
         }
     }
 }
@@ -725,6 +945,12 @@ private extension DirectRealtimeController {
           return false;
         }
         const eventId = nextClientEventId("cancel");
+        diagnostic("response_cancel_requested", session.generation, {
+          eventID: eventId,
+          reason: "admitted_barge_in",
+          responseID: session.activeResponseId,
+          turnID: String(session.activeUserTurn?.id || "")
+        });
         session.responseCancelPending = true;
         session.expectedCancelEventIds.add(eventId);
         const sent = dataSend({
@@ -1027,9 +1253,14 @@ private extension DirectRealtimeController {
 
       function suppressRepeatedUserAudioTurn(
         generation,
-        stage
+        stage,
+        text = "",
+        extra = {}
       ) {
-        diagnostic(stage, generation);
+        diagnostic(stage, generation, {
+          ...extra,
+          text: String(text || "")
+        });
         send({
           type: "playbackResume",
           generation: session.generation
@@ -1174,6 +1405,11 @@ private extension DirectRealtimeController {
         const command = session.codexSpeechQueue.shift();
         session.codexSpeechInFlight = true;
         session.activeCodexSpeech = command;
+        diagnostic("codex_speech_response_requested", session.generation, {
+          reason: command.kind,
+          source: command.eventId,
+          turnID: String(session.activeUserTurn?.id || "")
+        });
         if (command.marksAwaitingFinal) {
           resetAssistantDraft();
           session.awaitingFinal = true;
@@ -1348,6 +1584,11 @@ private extension DirectRealtimeController {
         session.routeInFlight = true;
         session.routeClassifierRetryCount = 0;
         rememberAcceptedUserTurn(turn.text);
+        diagnostic("user_turn_started", session.generation, {
+          source: turn.inputText ? "prefill" : "realtime_transcript",
+          text: turn.text,
+          turnID: String(turn.id || "")
+        });
         resetAssistantDraft();
         if (turn.inputText) {
           dataSend({
@@ -1360,12 +1601,14 @@ private extension DirectRealtimeController {
           });
         }
         session.userTurnCount += 1;
-        if (!turn.transcriptAlreadyReported) {
+        if (!turn.transcriptAlreadyReported
+            && !turn.playbackContended) {
           send({
             type: "userTranscript",
             generation: session.generation,
             text: turn.text
           });
+          turn.transcriptAlreadyReported = true;
         }
         requestRouteDecision();
         state("thinking", session.generation);
@@ -1374,7 +1617,8 @@ private extension DirectRealtimeController {
       function acceptUserTurn(
         text,
         inputText = false,
-        transcriptAlreadyReported = false
+        transcriptAlreadyReported = false,
+        playbackContended = false
       ) {
         if (!session || session.lifecycle !== "active") return false;
         const value = String(text || "").trim();
@@ -1382,17 +1626,40 @@ private extension DirectRealtimeController {
         if (isRepeatedPrimaryUserTurn(value)) {
           suppressRepeatedUserAudioTurn(
             session.generation,
-            "duplicate_user_turn_acceptance_suppressed"
+            "duplicate_user_turn_acceptance_suppressed",
+            value
           );
           return false;
         }
+        const turnID = `turn-${session.generation}-${++session.turnSequence}`;
         session.acceptedTurnQueue.push({
+          id: turnID,
           text: value,
           inputText: Boolean(inputText),
-          transcriptAlreadyReported: Boolean(transcriptAlreadyReported)
+          transcriptAlreadyReported: Boolean(transcriptAlreadyReported),
+          playbackContended: Boolean(playbackContended)
+        });
+        diagnostic("user_turn_queued", session.generation, {
+          reason: playbackContended
+            ? "playback_contended"
+            : "normal",
+          source: inputText ? "prefill" : "realtime_transcript",
+          text: value,
+          turnID
         });
         processNextAcceptedTurn();
         return true;
+      }
+
+      function reportActiveUserTurnIfNeeded() {
+        const turn = session?.activeUserTurn;
+        if (!turn || turn.transcriptAlreadyReported) return;
+        send({
+          type: "userTranscript",
+          generation: session.generation,
+          text: turn.text
+        });
+        turn.transcriptAlreadyReported = true;
       }
 
       function completeAcceptedTurn() {
@@ -1602,6 +1869,13 @@ private extension DirectRealtimeController {
         switch (event.type) {
           case "input_audio_buffer.speech_started":
             session.currentUserTranscript = "";
+            diagnostic("vad_speech_started", generation, {
+              reason: session.audioResponseIds.size > 0
+                ? "during_playback"
+                : "microphone_input",
+              responseID: String(session.activeResponseId || ""),
+              turnID: String(session.activeUserTurn?.id || "")
+            });
             if (session.activeResponseId) {
               cancelActiveResponseForBargeIn();
             }
@@ -1612,11 +1886,19 @@ private extension DirectRealtimeController {
             });
             break;
           case "input_audio_buffer.speech_stopped":
+            diagnostic("vad_speech_stopped", generation, {
+              text: String(session.currentUserTranscript || ""),
+              turnID: String(session.activeUserTurn?.id || "")
+            });
             break;
           case "conversation.item.input_audio_transcription.delta": {
             const delta = String(event.delta || "");
             if (!delta) break;
             session.currentUserTranscript += delta;
+            diagnostic("realtime_transcript_partial", generation, {
+              itemID: String(event.item_id || event.item?.id || ""),
+              text: session.currentUserTranscript
+            });
             send({
               type: "userTranscriptPartial",
               generation: session.generation,
@@ -1627,29 +1909,67 @@ private extension DirectRealtimeController {
           case "conversation.item.input_audio_transcription.completed": {
             const text = String(event.transcript || "").trim();
             session.currentUserTranscript = "";
-            if (!isMeaningfulSpeechTranscript(text)) break;
+            const itemID = String(
+              event.item_id || event.item?.id || ""
+            ).trim();
+            diagnostic("realtime_transcript_completed", generation, {
+              itemID,
+              text
+            });
+            if (!isMeaningfulSpeechTranscript(text)) {
+              diagnostic("non_meaningful_transcript_suppressed", generation, {
+                itemID,
+                text
+              });
+              break;
+            }
             if (registerCompletedUserAudioItem(event)) {
               suppressRepeatedUserAudioTurn(
                 generation,
-                "duplicate_user_audio_item_suppressed"
+                "duplicate_user_audio_item_suppressed",
+                text,
+                { itemID }
               );
               break;
             }
             if (isRepeatedUserTurnDuringActiveRequest(text)) {
               suppressRepeatedUserAudioTurn(
                 generation,
-                "replayed_user_turn_suppressed"
+                "replayed_user_turn_suppressed",
+                text,
+                { itemID }
               );
               break;
             }
             if (isLikelyAssistantPlaybackEcho(text)) {
               suppressRepeatedUserAudioTurn(
                 generation,
-                "playback_echo_transcript_suppressed"
+                "playback_echo_transcript_suppressed",
+                text,
+                { itemID }
               );
               break;
             }
+            pruneRecentAssistantPlaybackTexts();
             const hadBufferedPlayback = session.audioResponseIds.size > 0;
+            const hadRecentPlaybackTail =
+              session.recentAssistantPlaybackTexts.length > 0;
+            const playbackContended =
+              hadBufferedPlayback
+              || session.finalAudioResponseIds.size > 0
+              || session.assistantPlaybackTextByResponseId.size > 0
+              || hadRecentPlaybackTail;
+            if (playbackContended) {
+              diagnostic("playback_contended_transcript_admitted", generation, {
+                itemID,
+                reason: hadBufferedPlayback
+                  ? "buffered_playback"
+                  : hadRecentPlaybackTail
+                    ? "recent_playback_tail"
+                    : "playback_tail",
+                text
+              });
+            }
             if (session.activeResponseId || hadBufferedPlayback) {
               send({
                 type: "playbackInterrupt",
@@ -1671,7 +1991,7 @@ private extension DirectRealtimeController {
               }
               break;
             }
-            acceptUserTurn(text, false);
+            acceptUserTurn(text, false, false, playbackContended);
             if (hadBufferedPlayback) {
               finishInterruptedPlaybackForBargeIn();
             }
@@ -1703,7 +2023,50 @@ private extension DirectRealtimeController {
             }
             session.pendingCalls.add(callId);
             const kind = normalizeRouteKind(args.kind);
-            diagnostic("route_decision", generation, { kind });
+            const activeTurn = session.activeUserTurn;
+            diagnostic("route_decision", generation, {
+              callID: callId,
+              kind,
+              reason: activeTurn?.playbackContended
+                ? "playback_contended"
+                : "normal",
+              text,
+              turnID: String(activeTurn?.id || "")
+            });
+            const suppressiblePlaybackKinds = new Set([
+              "direct_chat",
+              "ignore",
+              "local_presence",
+              "local_wake"
+            ]);
+            if (activeTurn?.playbackContended
+                && suppressiblePlaybackKinds.has(kind)) {
+              session.pendingCalls.delete(callId);
+              dataSend({
+                type: "conversation.item.create",
+                item: {
+                  type: "function_call_output",
+                  call_id: callId,
+                  output: JSON.stringify({
+                    status: "suppressed",
+                    reason: "probable assistant playback echo"
+                  })
+                }
+              });
+              diagnostic(
+                "playback_contended_social_turn_suppressed",
+                generation,
+                {
+                  callID: callId,
+                  kind,
+                  text,
+                  turnID: String(activeTurn?.id || "")
+                }
+              );
+              completeAcceptedTurn();
+              break;
+            }
+            reportActiveUserTurnIfNeeded();
             if (kind === "stop_session") {
               session.pendingCalls.delete(callId);
               beginSemanticStop(text);
@@ -1808,9 +2171,7 @@ private extension DirectRealtimeController {
             session.activeResponseId = String(event.response?.id || "");
             session.responseCancelPending = false;
             const responseKind = String(
-              event.response?.metadata?.voice_relay_kind
-                || session.activeCodexSpeech?.kind
-                || ""
+              event.response?.metadata?.voice_relay_kind || ""
             );
             if (responseKind.startsWith("codex_")) {
               session.codexSpeechResponseKinds.set(
@@ -1818,6 +2179,11 @@ private extension DirectRealtimeController {
                 responseKind
               );
             }
+            diagnostic("realtime_response_created", generation, {
+              responseID: session.activeResponseId,
+              source: responseKind || "unclassified",
+              turnID: String(session.activeUserTurn?.id || "")
+            });
             if (
               event.response?.metadata?.voice_relay_kind === "semantic_stop"
             ) {
@@ -1851,6 +2217,13 @@ private extension DirectRealtimeController {
               event.transcript,
               true
             );
+            diagnostic("assistant_audio_transcript_completed", generation, {
+              assistantText: String(event.transcript || ""),
+              responseID: responseId,
+              source: activeCodexSpeechKind(responseId)
+                || "realtime_direct",
+              turnID: String(session.activeUserTurn?.id || "")
+            });
             if (isTransientCodexSpeechKind(activeCodexSpeechKind(responseId))
                 || session.progressResponseIds.has(responseId)
                 || session.stopAcknowledgementResponseIds.has(responseId)) {
@@ -1925,9 +2298,14 @@ private extension DirectRealtimeController {
             ));
             diagnostic("response_done", generation, {
               kind: responseKind || "unclassified",
-              shape: phases.join(",") || "empty"
+              shape: phases.join(",") || "empty",
+              responseID: responseId,
+              status: String(event.response?.status || ""),
+              text,
+              turnID: String(session.activeUserTurn?.id || "")
             });
-            if (isAwaitingRouteDecision()) {
+            if (responseKind === "route_classifier"
+                && isAwaitingRouteDecision()) {
               if (session.routeClassifierRetryCount < 1) {
                 session.routeClassifierRetryCount += 1;
                 if (!responseId || session.activeResponseId === responseId) {
@@ -2054,6 +2432,7 @@ private extension DirectRealtimeController {
           spokenCodexCommentaryTexts: [],
           awaitingFinal: false,
           userTurnCount: 0,
+          turnSequence: 0,
           acceptedTurnQueue: [],
           activeUserTurn: null,
           routeInFlight: false,
@@ -2074,6 +2453,10 @@ private extension DirectRealtimeController {
             ? payload.wakePhrases.map(value => String(value || "")).filter(Boolean)
             : []
         };
+        diagnostic("realtime_session_start_requested", generation, {
+          reason: String(payload.activationReason || "manual"),
+          text: String(payload.prefill || "")
+        });
         diagnostic("credential_requested", generation);
         send({ type: "credentialRequest", generation });
       }
@@ -2105,6 +2488,15 @@ private extension DirectRealtimeController {
           `Also accept these configured languages: ${JSON.stringify(acceptedLanguageCodes)}. ` +
           "Reply in the language actually spoken by the user. " +
           "When a short utterance is ambiguous, prefer the primary input language and never switch scripts from weak evidence.";
+        diagnostic("realtime_media_configured", generation, {
+          channel: "input_and_output",
+          kind: "server_vad",
+          reason: "session_update",
+          shape:
+            "pcm24k;threshold=0.68;prefix_ms=300;silence_ms=1200;create_response=false;interrupt_response=false",
+          source: "gpt-4o-mini-transcribe",
+          status: String(startPayload.voice || "")
+        });
         dataSend({
           type: "session.update",
           session: {
@@ -2205,6 +2597,9 @@ private extension DirectRealtimeController {
 
       function stop(payload) {
         const generation = Number(payload.generation || 0);
+        diagnostic("realtime_session_stop_requested", generation, {
+          reason: String(payload.reason || "host_stop")
+        });
         if (activeStartGeneration === generation) {
           activeStartGeneration = 0;
         }
@@ -2239,6 +2634,13 @@ private extension DirectRealtimeController {
           pruneRecentAssistantPlaybackTexts();
         }
         session.audioResponseIds.delete(responseId);
+        diagnostic("assistant_playback_drained", generation, {
+          assistantText: playedText,
+          responseID: responseId,
+          source: responseKind || "realtime_direct",
+          status: wasFinal ? "final" : "transient",
+          turnID: String(session.activeUserTurn?.id || "")
+        });
         if (responseKind.startsWith("codex_")) {
           finishActiveCodexSpeech(responseId);
         }
@@ -2264,6 +2666,12 @@ private extension DirectRealtimeController {
             || session.generation !== Number(payload.generation)) return;
         session.codexInFlight = false;
         session.pendingCalls.delete(payload.callId);
+        diagnostic("codex_result_received", session.generation, {
+          assistantText: String(payload.output || payload.error || ""),
+          callID: String(payload.callId || ""),
+          status: payload.error ? "failure" : "success",
+          turnID: String(session.activeUserTurn?.id || "")
+        });
         const output = JSON.stringify(payload.error
           ? { status: "error", message: String(payload.error) }
           : { status: "ok", answer: String(payload.output || "") });
@@ -2300,6 +2708,11 @@ private extension DirectRealtimeController {
         session.spokenCodexCommentaryIds.add(messageId);
         const speechText = codexCommentarySpeechDelta(text);
         if (!speechText) return;
+        diagnostic("codex_commentary_received", generation, {
+          assistantText: speechText,
+          source: messageId,
+          turnID: String(session.activeUserTurn?.id || "")
+        });
         enqueueCodexSpeech(
           "codex_commentary",
           `Say exactly this and nothing else: ${JSON.stringify(speechText)}`

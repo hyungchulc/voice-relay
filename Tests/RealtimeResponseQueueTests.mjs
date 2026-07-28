@@ -1164,4 +1164,198 @@ assert.equal(
   "looped or repeated transcription events must not create a second Codex request",
 );
 
+const postFinalEchoStart = nativeMessages.length;
+runtime.start({
+  generation: 10,
+  language: "en-US",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Aria",
+  wakePhrases: ["Hey Aria"],
+  shouldGreet: false,
+  activationReason: "wake_with_command",
+});
+runtime.transportOpened({ generation: 10 });
+runtime.transportReady({ generation: 10 });
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "post-final-user-1",
+    transcript: "Check the weather near me.",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.created",
+    response: {
+      id: "post-final-route-1",
+      metadata: { voice_relay_kind: "route_classifier" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.function_call_arguments.done",
+    name: "route_voice_turn",
+    call_id: "post-final-call-1",
+    arguments: JSON.stringify({ kind: "codex" }),
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.done",
+    response: {
+      id: "post-final-route-1",
+      metadata: { voice_relay_kind: "route_classifier" },
+      output: [{ type: "function_call" }],
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.created",
+    response: {
+      id: "post-final-progress-1",
+      metadata: { voice_relay_kind: "codex_progress" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.done",
+    response: {
+      id: "post-final-progress-1",
+      status: "completed",
+      metadata: { voice_relay_kind: "codex_progress" },
+      output: [],
+    },
+  },
+});
+runtime.resolveCodex({
+  generation: 10,
+  callId: "post-final-call-1",
+  output: "The current weather is clear.",
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.created",
+    response: {
+      id: "post-final-speech-1",
+      metadata: { voice_relay_kind: "codex_final" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.output_audio.delta",
+    response_id: "post-final-speech-1",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.output_audio_transcript.done",
+    response_id: "post-final-speech-1",
+    transcript: "The current weather is clear.",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.done",
+    response: {
+      id: "post-final-speech-1",
+      status: "completed",
+      metadata: { voice_relay_kind: "codex_final" },
+      output: [],
+    },
+  },
+});
+runtime.playbackDrained({
+  generation: 10,
+  responseId: "post-final-speech-1",
+});
+const novelPlaybackEchoStart = nativeMessages.length;
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "post-final-echo-item",
+    transcript: "I will check that now.",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.created",
+    response: {
+      id: "post-final-echo-route",
+      metadata: { voice_relay_kind: "route_classifier" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.function_call_arguments.done",
+    name: "route_voice_turn",
+    call_id: "post-final-echo-call",
+    arguments: JSON.stringify({ kind: "direct_chat" }),
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 10,
+  event: {
+    type: "response.done",
+    response: {
+      id: "post-final-echo-route",
+      metadata: { voice_relay_kind: "route_classifier" },
+      output: [{ type: "function_call" }],
+    },
+  },
+});
+const novelPlaybackEchoMessages =
+  nativeMessages.slice(novelPlaybackEchoStart);
+assert.equal(
+  novelPlaybackEchoMessages.filter(message =>
+    message.type === "diagnostic"
+    && message.stage === "playback_contended_social_turn_suppressed"
+  ).length,
+  1,
+  "a novel self-echo after Codex final playback must be suppressed after semantic routing",
+);
+assert.equal(
+  novelPlaybackEchoMessages.filter(message =>
+    message.type === "userTranscript"
+  ).length,
+  0,
+  "a suppressed post-final playback echo must never appear as a user turn",
+);
+assert.equal(
+  novelPlaybackEchoMessages
+    .filter(message => message.type === "realtimeSend")
+    .map(message => JSON.parse(message.eventJSON))
+    .filter(event =>
+      event.type === "response.create"
+      && event.response?.metadata?.voice_relay_kind !== "route_classifier"
+    ).length,
+  0,
+  "a suppressed post-final playback echo must never create a second spoken reply",
+);
+assert.equal(
+  nativeMessages
+    .slice(postFinalEchoStart)
+    .filter(message => message.type === "codexRequest").length,
+  1,
+  "a post-final playback echo must never create a second Codex request",
+);
+
 console.log("Realtime response queue tests passed");

@@ -1024,7 +1024,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         cancelAnswerLayout()
         stopSurfaceDisplayLink()
         orbReplyPanel.orderOut(nil)
-        wakePhrase.pause()
+        wakePhrase.pause(reason: "overlay_deinit")
         if let localEscapeMonitor {
             NSEvent.removeMonitor(localEscapeMonitor)
         }
@@ -1098,7 +1098,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
               !voiceState.phase.isSessionActive else {
             return
         }
-        wakePhrase.startMonitoring()
+        wakePhrase.startMonitoring(reason: "app_launch")
     }
 
     func startWakePhraseAfterSettingsSave() {
@@ -1140,11 +1140,17 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         isReplyPreviewVisible = false
         replyRetainUntil = .distantPast
         realtimeDraft = ""
-        wakePhrase.pause()
+        wakePhrase.pause(reason: "surface_rebuild")
         if voiceState.phase.isSessionActive {
-            cancelActiveCodexRequest(generation: voiceState.generation)
+            cancelActiveCodexRequest(
+                generation: voiceState.generation,
+                reason: "surface_rebuild"
+            )
             voiceState.requestStop()
-            realtimeController.stop(generation: voiceState.generation)
+            realtimeController.stop(
+                generation: voiceState.generation,
+                reason: "surface_rebuild"
+            )
         }
         realtimeController.shutdown()
         assistantOutputLifecycle.cancelAll(
@@ -1173,9 +1179,15 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         replyRetainUntil = .distantPast
         realtimeDraft = ""
         if voiceState.phase.isSessionActive {
-            cancelActiveCodexRequest(generation: voiceState.generation)
+            cancelActiveCodexRequest(
+                generation: voiceState.generation,
+                reason: "panel_hidden"
+            )
             voiceState.requestStop()
-            realtimeController.stop(generation: voiceState.generation)
+            realtimeController.stop(
+                generation: voiceState.generation,
+                reason: "panel_hidden"
+            )
         }
         lastAnswer = ""
         setAnswerText("")
@@ -1284,6 +1296,11 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         finishSurface: Bool,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
+        VoiceRelayDiagnostics.flow(
+            "codex_request_preparing",
+            generation: generation,
+            transcriptFields: ["userText": text]
+        )
         NSLog(
             "Voice Relay Codex Remote request preparing generation=%d",
             generation
@@ -1292,6 +1309,12 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         do {
             options = try codexTurnOptions(userText: text)
         } catch {
+            VoiceRelayDiagnostics.flow(
+                "codex_request_rejected",
+                generation: generation,
+                fields: ["reason": error.localizedDescription],
+                transcriptFields: ["userText": text]
+            )
             NSLog(
                 "Voice Relay Codex Remote request rejected generation=%d error=%@",
                 generation,
@@ -1309,6 +1332,11 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
         streamedAnswer = ""
         activeCodexGeneration = generation
+        VoiceRelayDiagnostics.flow(
+            "codex_request_started",
+            generation: generation,
+            transcriptFields: ["userText": text]
+        )
         NSLog(
             "Voice Relay Codex Remote ask started generation=%d",
             generation
@@ -1326,6 +1354,14 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                         commentary,
                         generation: generation
                     )
+                    VoiceRelayDiagnostics.flow(
+                        "codex_commentary_received_host",
+                        generation: generation,
+                        fields: ["messageID": commentary.messageID],
+                        transcriptFields: [
+                            "assistantText": commentary.text
+                        ]
+                    )
                 }
             },
             completion: { [weak self] result in
@@ -1333,11 +1369,29 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                     guard let self else { return }
                     switch result {
                     case .success:
+                        if case let .success(reply) = result {
+                            VoiceRelayDiagnostics.flow(
+                                "codex_final_received_host",
+                                generation: generation,
+                                fields: ["status": "success"],
+                                transcriptFields: [
+                                    "assistantText": reply
+                                ]
+                            )
+                        }
                         NSLog(
                             "Voice Relay Codex Remote ask completed generation=%d result=success",
                             generation
                         )
                     case let .failure(error):
+                        VoiceRelayDiagnostics.flow(
+                            "codex_final_received_host",
+                            generation: generation,
+                            fields: [
+                                "reason": error.localizedDescription,
+                                "status": "failure",
+                            ]
+                        )
                         NSLog(
                             "Voice Relay Codex Remote ask completed generation=%d result=failure error=%@",
                             generation,
@@ -1429,7 +1483,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
     @objc private func toggleVoiceInput() {
         if voiceState.phase.isSessionActive {
-            requestVoiceSessionStop(generation: voiceState.generation)
+            requestVoiceSessionStop(
+                generation: voiceState.generation,
+                reason: "voice_toggle"
+            )
         } else {
             startRealtimeVoice()
         }
@@ -2191,7 +2248,9 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
     private func wireCallbacks() {
         panel.onCancel = { [weak self] in
-            self?.cancelActiveInteractionAndCollapse()
+            self?.cancelActiveInteractionAndCollapse(
+                reason: "panel_cancel"
+            )
         }
     }
 
@@ -2223,11 +2282,11 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             || isWaitingForReply
             || answerTargetVisible
         guard hasCancellableInteraction else { return false }
-        cancelActiveInteractionAndCollapse()
+        cancelActiveInteractionAndCollapse(reason: "escape")
         return true
     }
 
-    private func cancelActiveInteractionAndCollapse() {
+    private func cancelActiveInteractionAndCollapse(reason: String) {
         hoverStartWorkItem?.cancel()
         hoverStartWorkItem = nil
         hoverCollapseWorkItem?.cancel()
@@ -2244,10 +2303,16 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         )
 
         if activeCodexGeneration == voiceState.generation {
-            cancelActiveCodexRequest(generation: voiceState.generation)
+            cancelActiveCodexRequest(
+                generation: voiceState.generation,
+                reason: reason
+            )
         }
         if voiceState.phase.isSessionActive {
-            requestVoiceSessionStop(generation: voiceState.generation)
+            requestVoiceSessionStop(
+                generation: voiceState.generation,
+                reason: reason
+            )
         }
 
         isWaitingForReply = false
@@ -2327,6 +2392,15 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
     private func wireWakePhrase() {
         wakePhrase.onWake = { [weak self] match in
+            VoiceRelayDiagnostics.flow(
+                "wake_to_realtime_handoff",
+                fields: [
+                    "reason": match.command.isEmpty
+                        ? "wake_only"
+                        : "wake_with_command",
+                ],
+                transcriptFields: ["command": match.command]
+            )
             self?.startRealtimeVoice(
                 prefill: match.command,
                 acknowledgeWake: match.command.isEmpty
@@ -2341,12 +2415,35 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private func handleRealtimeVoiceEvent(_ event: [String: Any]) {
         guard let type = event["type"] as? String else { return }
         if type == "ready" {
+            VoiceRelayDiagnostics.flow(
+                "realtime_runtime_ready",
+                fields: ["source": "embedded_runtime"]
+            )
             return
         }
         guard let generation = (event["generation"] as? NSNumber)?.intValue,
               generation == voiceState.generation else {
             return
         }
+        var eventFields = ["type": type]
+        for key in ["code", "kind", "phase", "responseId"] {
+            if let value = event[key] as? String, !value.isEmpty {
+                eventFields[key] = value
+            }
+        }
+        let eventText = event["text"] as? String ?? ""
+        let userEventTypes: Set<String> = [
+            "userTranscript",
+            "userTranscriptPartial",
+        ]
+        VoiceRelayDiagnostics.flow(
+            "realtime_host_event",
+            generation: generation,
+            fields: eventFields,
+            transcriptFields: userEventTypes.contains(type)
+                ? ["userText": eventText]
+                : ["assistantText": eventText]
+        )
 
         switch type {
         case "state":
@@ -2504,7 +2601,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             mediaDetectionWorkItem = nil
             assistantOutputLifecycle.cancelAll(generation: generation)
             if activeCodexGeneration == generation {
-                cancelActiveCodexRequest(generation: generation)
+                cancelActiveCodexRequest(
+                    generation: generation,
+                    reason: "realtime_error"
+                )
             }
             nextVoiceStartAllowedAt = Date().addingTimeInterval(2.5)
             _ = voiceState.apply(generation: generation, phase: .failed)
@@ -2514,7 +2614,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 wasEstablished: wasEstablished,
                 interruptedAnswer: interruptedAnswer
             )
-            realtimeController.stop(generation: generation)
+            realtimeController.stop(
+                generation: generation,
+                reason: "realtime_error"
+            )
         default:
             break
         }
@@ -2526,6 +2629,17 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     ) {
         guard !voiceState.phase.isSessionActive,
               Date() >= nextVoiceStartAllowedAt else {
+            VoiceRelayDiagnostics.flow(
+                "realtime_start_suppressed",
+                generation: voiceState.generation,
+                fields: [
+                    "active": String(voiceState.phase.isSessionActive),
+                    "reason": voiceState.phase.isSessionActive
+                        ? "session_already_active"
+                        : "restart_cooldown",
+                ],
+                transcriptFields: ["prefill": prefill ?? ""]
+            )
             return
         }
         nextVoiceStartAllowedAt = Date().addingTimeInterval(0.8)
@@ -2543,8 +2657,21 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         realtimeStopAcknowledgementFallbackWorkItem?.cancel()
         realtimeStopAcknowledgementFallbackWorkItem = nil
         setAnswerVisible(false, animated: config.animateSurface)
-        wakePhrase.pause()
+        wakePhrase.pause(reason: "realtime_handoff")
         let generation = voiceState.begin()
+        VoiceRelayDiagnostics.flow(
+            "realtime_surface_starting",
+            generation: generation,
+            fields: [
+                "reason": prefill?.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ).isEmpty == false
+                    ? "wake_with_command"
+                    : (acknowledgeWake ? "wake_only" : "manual"),
+                "wake_microphone": "paused",
+            ],
+            transcriptFields: ["prefill": prefill ?? ""]
+        )
         assistantOutputLifecycle.reset(generation: generation)
         userActivityGeneration = nil
         assistantFinalGeneration = nil
@@ -2565,7 +2692,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             prefill: exactPrefill?.isEmpty == false ? exactPrefill : nil,
             shouldGreet: acknowledgeWake
                 || (conversationHistory.isEmpty
-                    && !SettingsStore.shared.completedFirstVoiceGreeting)
+                    && !SettingsStore.shared.completedFirstVoiceGreeting),
+            reason: exactPrefill?.isEmpty == false
+                ? "wake_with_command"
+                : (acknowledgeWake ? "wake_only" : "manual")
         )
     }
 
@@ -2582,14 +2712,20 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 externalAudioPlaying: externalAudioPlaying,
                 assistantOutputActive: self.assistantOutputLifecycle.isActive
             ) else {
-                self.wakePhrase.pause()
+                self.wakePhrase.pause(
+                    reason: externalAudioPlaying
+                        ? "external_audio_active"
+                        : "voice_or_assistant_output_active"
+                )
                 if !self.voiceState.phase.isSessionActive,
                    externalAudioPlaying {
                     self.scheduleWakePhraseResumeCheck()
                 }
                 return
             }
-            self.wakePhrase.startMonitoring()
+            self.wakePhrase.startMonitoring(
+                reason: "voice_session_completed"
+            )
         }
         wakeResumeWorkItem = workItem
         DispatchQueue.main.asyncAfter(
@@ -2628,7 +2764,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                   self.voiceState.phase.isSessionActive else {
                 return
             }
-            self.requestVoiceSessionStop(generation: generation)
+            self.requestVoiceSessionStop(
+                generation: generation,
+                reason: "idle_timeout"
+            )
         }
         voiceIdleWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
@@ -2687,7 +2826,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         ) else {
             return
         }
-        requestVoiceSessionStop(generation: generation)
+        requestVoiceSessionStop(
+            generation: generation,
+            reason: "external_audio_yield"
+        )
     }
 
     private func resetExternalAudioMonitoring() {
@@ -2700,7 +2842,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         userActivityGeneration = nil
     }
 
-    private func requestVoiceSessionStop(generation: Int) {
+    private func requestVoiceSessionStop(
+        generation: Int,
+        reason: String = "user_request"
+    ) {
         guard voiceState.generation == generation,
               voiceState.phase.isSessionActive else {
             return
@@ -2711,11 +2856,22 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         mediaDetectionWorkItem = nil
         assistantOutputLifecycle.cancelAll(generation: generation)
         if activeCodexGeneration == generation {
-            cancelActiveCodexRequest(generation: generation)
+            cancelActiveCodexRequest(
+                generation: generation,
+                reason: reason
+            )
         }
+        VoiceRelayDiagnostics.flow(
+            "voice_session_stop_requested",
+            generation: generation,
+            fields: ["reason": reason]
+        )
         voiceState.requestStop()
         updateVoiceSurface()
-        realtimeController.stop(generation: generation)
+        realtimeController.stop(
+            generation: generation,
+            reason: reason
+        )
 
         voiceStopFallbackWorkItem?.cancel()
         let fallback = DispatchWorkItem { [weak self] in
@@ -2744,8 +2900,16 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         mediaDetectionWorkItem = nil
         assistantOutputLifecycle.cancelAll(generation: generation)
         if activeCodexGeneration == generation {
-            cancelActiveCodexRequest(generation: generation)
+            cancelActiveCodexRequest(
+                generation: generation,
+                reason: "spoken_stop"
+            )
         }
+        VoiceRelayDiagnostics.flow(
+            "spoken_stop_accepted",
+            generation: generation,
+            fields: ["reason": "semantic_stop"]
+        )
         voiceState.requestStop()
         updateVoiceSurface()
 
@@ -2756,7 +2920,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                   self.voiceState.phase == .stopping else {
                 return
             }
-            self.requestVoiceSessionStop(generation: generation)
+            self.requestVoiceSessionStop(
+                generation: generation,
+                reason: "spoken_stop_timeout"
+            )
         }
         realtimeStopAcknowledgementFallbackWorkItem = fallback
         DispatchQueue.main.asyncAfter(
@@ -2772,7 +2939,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         }
         realtimeStopAcknowledgementFallbackWorkItem?.cancel()
         realtimeStopAcknowledgementFallbackWorkItem = nil
-        requestVoiceSessionStop(generation: generation)
+        requestVoiceSessionStop(
+            generation: generation,
+            reason: "spoken_stop_completed"
+        )
     }
 
     private func completeVoiceStop(generation: Int) {
@@ -2799,24 +2969,66 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         )
     }
 
-    private func cancelActiveCodexRequest(generation: Int) {
+    private func cancelActiveCodexRequest(
+        generation: Int,
+        reason: String = "host_cancel"
+    ) {
         guard activeCodexGeneration == generation else { return }
+        VoiceRelayDiagnostics.flow(
+            "codex_interrupt_requested",
+            generation: generation,
+            fields: ["reason": reason]
+        )
         activeCodexGeneration = nil
         cancelledCodexGenerations.insert(generation)
         isWaitingForReply = false
         codexClient.interruptActiveTurn { [weak self] result in
-            guard case let .failure(error) = result else { return }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.codexClient.shutdown()
-                if self.panel.isVisible {
-                    self.showToast(
-                        "Codex 중단 확인 실패, 연결을 닫았어",
-                        color: .systemOrange,
-                        autoHideAfter: 3
+            switch result {
+            case .success:
+                VoiceRelayDiagnostics.flow(
+                    "codex_interrupt_completed",
+                    generation: generation,
+                    fields: [
+                        "reason": reason,
+                        "status": "success",
+                    ]
+                )
+                return
+            case let .failure(error):
+                VoiceRelayDiagnostics.flow(
+                    "codex_interrupt_completed",
+                    generation: generation,
+                    fields: [
+                        "error_code": String((error as NSError).code),
+                        "error_domain": (error as NSError).domain,
+                        "reason": reason,
+                        "status": "failure",
+                    ]
+                )
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.codexClient.shutdown()
+                    VoiceRelayDiagnostics.flow(
+                        "codex_connection_closed",
+                        generation: generation,
+                        fields: [
+                            "reason": "interrupt_confirmation_failed",
+                        ]
+                    )
+                    if self.panel.isVisible {
+                        self.showToast(
+                            "Codex 중단 확인 실패, 연결을 닫았어",
+                            color: .systemOrange,
+                            autoHideAfter: 3
+                        )
+                    }
+                    NSLog(
+                        "Voice Relay turn interrupt failed: %@",
+                        VoiceRelayDiagnostics.safe(
+                            error.localizedDescription
+                        )
                     )
                 }
-                NSLog("Voice Relay turn interrupt failed: %@", error.localizedDescription)
             }
         }
     }

@@ -1,5 +1,128 @@
 import Darwin
 import Foundation
+import OSLog
+
+enum VoiceRelayDiagnostics {
+    private static let logger = Logger(
+        subsystem: "com.hyungchulc.voice-relay",
+        category: "flow"
+    )
+    static let transcriptLoggingKey =
+        "voiceRelay.diagnostics.logTranscripts"
+
+    static var logsTranscriptContent: Bool {
+        UserDefaults.standard.bool(forKey: transcriptLoggingKey)
+    }
+
+    static func flow(
+        _ stage: String,
+        generation: Int? = nil,
+        fields: [String: String] = [:],
+        transcriptFields: [String: String] = [:]
+    ) {
+        let entry = rendered(
+            stage,
+            generation: generation,
+            fields: fields,
+            transcriptFields: transcriptFields,
+            includeTranscriptContent: logsTranscriptContent
+        )
+        logger.notice("Voice Relay flow \(entry, privacy: .public)")
+    }
+
+    static func rendered(
+        _ stage: String,
+        generation: Int? = nil,
+        fields: [String: String] = [:],
+        transcriptFields: [String: String] = [:],
+        includeTranscriptContent: Bool
+    ) -> String {
+        var parts = ["stage=\(stage)"]
+        if let generation {
+            parts.append("generation=\(generation)")
+        }
+        for key in fields.keys.sorted() {
+            guard !isSensitiveField(key) else {
+                parts.append("\(key)=redacted")
+                continue
+            }
+            parts.append(
+                "\(key)=\(singleLine(redactingSecrets(fields[key] ?? "")))"
+            )
+        }
+        if includeTranscriptContent {
+            for key in transcriptFields.keys.sorted() {
+                guard !isSensitiveField(key) else {
+                    parts.append("\(key)=redacted")
+                    continue
+                }
+                parts.append(
+                    "\(key)=\(quoted(redactingSecrets(transcriptFields[key] ?? "")))"
+                )
+            }
+        } else if !transcriptFields.isEmpty {
+            parts.append("content=redacted")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    static func safe(_ value: String) -> String {
+        singleLine(redactingSecrets(value))
+    }
+
+    private static func isSensitiveField(_ key: String) -> Bool {
+        let normalized = key
+            .lowercased()
+            .filter(\.isLetter)
+        return normalized.contains("authorization")
+            || normalized.contains("credential")
+            || normalized.contains("secret")
+            || normalized.contains("token")
+            || normalized.contains("apikey")
+    }
+
+    private static func redactingSecrets(_ value: String) -> String {
+        var redacted = value
+        let patterns = [
+            #"(?i)\bBearer\s+[A-Za-z0-9._~+/\-=]+"#,
+            #"\bsk-[A-Za-z0-9_-]{8,}\b"#,
+            #"(?i)openai-insecure-api-key\.[A-Za-z0-9._-]+"#,
+            #"(?i)(api[_-]?key|authorization|credential|token)\s*[:=]\s*["']?[^\s"',}]+"#,
+            #"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b"#,
+        ]
+        for pattern in patterns {
+            guard let expression = try? NSRegularExpression(
+                pattern: pattern
+            ) else {
+                continue
+            }
+            let range = NSRange(
+                redacted.startIndex..<redacted.endIndex,
+                in: redacted
+            )
+            redacted = expression.stringByReplacingMatches(
+                in: redacted,
+                range: range,
+                withTemplate: "[REDACTED]"
+            )
+        }
+        return redacted
+    }
+
+    private static func singleLine(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\t", with: "\\t")
+    }
+
+    private static func quoted(_ value: String) -> String {
+        let escaped = singleLine(value)
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
+    }
+}
 
 struct AppSettings: Equatable {
     var productName: String

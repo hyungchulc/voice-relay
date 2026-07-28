@@ -59,6 +59,14 @@ require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'code: "route_classifier_failed"' \
   "a missing route tool call must fail closed without killing Realtime"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"realtime_runtime_ready_duplicate_suppressed"' \
+  "runtime readiness must have one producer instead of suppressing a duplicate"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"realtime_runtime_navigation_verified"' \
+  "navigation completion must verify loading without producing another ready event"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'diagnostic("server_error", generation' \
@@ -69,8 +77,28 @@ require_text \
   "recoverable Realtime event errors must stay scoped to one turn"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'diagnostic("route_decision", generation, { kind })' \
+  'diagnostic("route_decision", generation' \
   "route decisions must be diagnosable without logging the transcript"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'diagnostic("realtime_media_configured", generation' \
+  "Realtime media configuration must be diagnosable before capture begins"
+require_text \
+  "$ROOT/Sources/SettingsStore.swift" \
+  'logger.notice("Voice Relay flow \(entry, privacy: .public)")' \
+  "Voice Relay flow diagnostics must remain readable in Unified Logging"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '"microphone_started"' \
+  "native microphone startup must have a canonical lifecycle record"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '"microphone_stopped"' \
+  "native microphone teardown must have a canonical lifecycle record"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  '"wake_microphone_started"' \
+  "wake microphone startup must have a canonical lifecycle record"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'Voice Relay Codex bridge accepted request generation=%d' \
@@ -2271,7 +2299,7 @@ require_text \
   "Escape must stop active voice work even while another app owns keyboard focus"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  'cancelActiveInteractionAndCollapse()' \
+  'cancelActiveInteractionAndCollapse(reason: "escape")' \
   "Escape must share one cancellation-and-collapse path"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
