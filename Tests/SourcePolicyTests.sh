@@ -2685,8 +2685,40 @@ require_text \
   "fresh public settings must not select a provider folder"
 require_text \
   "$ROOT/Helpers/voice-relay-app-remote.mjs" \
-  'buildAdditionalContext(' \
-  "the public helper must load explicitly selected providers per Codex turn"
+  'buildOptionalAdditionalContext(' \
+  "the public helper must load selected providers without blocking the Codex turn"
+require_text \
+  "$ROOT/Helpers/voice-relay-app-remote.mjs" \
+  'event: "contextOmitted"' \
+  "optional context omission must leave one typed diagnostic"
+require_text \
+  "$ROOT/Helpers/voice-relay-context.mjs" \
+  'path.dirname(process.execPath)' \
+  "GUI-launched providers must inherit the helper's actual Node runtime directory"
+reject_text \
+  "$ROOT/Helpers/voice-relay-context.mjs" \
+  '/opt/homebrew/bin' \
+  "provider runtime discovery must not hard-code one Node installation"
+require_text \
+  "$ROOT/Helpers/voice-relay-context.mjs" \
+  'buildOptionalContextPrefix' \
+  "invalid optional Authority Pack data must be omittable without blocking Codex"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  '"fingerprint_mismatch"' \
+  "a stale optional Authority Pack must degrade with a fixed diagnostic"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'SettingsStore.normalizedLocalPath(' \
+  "runtime provider dispatch must not repeat strict Settings-save validation"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"I couldn'\''t complete that request. Please try again."' \
+  "Codex failure speech must use deterministic English copy"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'If status is error, give one short friendly retry suggestion' \
+  "Realtime must not infer a capability explanation from a raw Codex error"
 require_text \
   "$ROOT/Helpers/voice-relay-context.mjs" \
   'providers.length > maximumProviderCount' \

@@ -31,6 +31,7 @@ struct CodexClientSmoke {
                     sandbox: "read-only",
                     approvalPolicy: "on-request",
                     additionalContext: nil,
+                    additionalContextProvidersEnabled: false,
                     additionalContextProvidersRoot: nil
                 ),
                 completion: { result in

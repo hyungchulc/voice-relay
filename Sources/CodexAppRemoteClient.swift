@@ -28,6 +28,7 @@ struct CodexTurnOptions {
     let sandbox: String
     let approvalPolicy: String
     let additionalContext: [String: [String: String]]?
+    let additionalContextProvidersEnabled: Bool
     let additionalContextProvidersRoot: String?
 }
 
@@ -40,6 +41,13 @@ struct CodexAppConnectionResult {
 struct CodexCommentary: Equatable {
     let messageID: String
     let text: String
+}
+
+struct CodexContextOmission: Equatable {
+    let source: String
+    let reason: String
+    let fallback: String
+    let providerIndex: Int?
 }
 
 struct CodexConnectionResetResult {
@@ -118,6 +126,7 @@ final class CodexAppRemoteClient {
         let command: String
         let completion: (Result<JSONDictionary, Error>) -> Void
         let onCommentary: ((CodexCommentary) -> Void)?
+        let onContextOmission: ((CodexContextOmission) -> Void)?
         var deliveredCommentaryIDs: Set<String>
         let timeout: DispatchWorkItem
     }
@@ -209,6 +218,7 @@ final class CodexAppRemoteClient {
         _ prompt: String,
         options: CodexTurnOptions,
         onCommentary: ((CodexCommentary) -> Void)? = nil,
+        onContextOmission: ((CodexContextOmission) -> Void)? = nil,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
         var params: JSONDictionary = [
@@ -224,6 +234,8 @@ final class CodexAppRemoteClient {
         if let context = options.additionalContext {
             params["additionalContext"] = context
         }
+        params["additionalContextProvidersEnabled"] =
+            options.additionalContextProvidersEnabled
         if let providersRoot = options.additionalContextProvidersRoot,
            !providersRoot.isEmpty {
             params["additionalContextProvidersRoot"] = providersRoot
@@ -233,7 +245,8 @@ final class CodexAppRemoteClient {
             params: params,
             timeout: 10 * 60,
             workspacePath: options.workspacePath,
-            onCommentary: onCommentary
+            onCommentary: onCommentary,
+            onContextOmission: onContextOmission
         ) { [weak self] result in
             completion(result.flatMap { value in
                 guard let answer = value["answer"] as? String,
@@ -518,6 +531,7 @@ final class CodexAppRemoteClient {
         timeout: TimeInterval,
         workspacePath requestedWorkspacePath: String? = nil,
         onCommentary: ((CodexCommentary) -> Void)? = nil,
+        onContextOmission: ((CodexContextOmission) -> Void)? = nil,
         completion: @escaping (Result<JSONDictionary, Error>) -> Void
     ) {
         queue.async { [weak self] in
@@ -541,6 +555,7 @@ final class CodexAppRemoteClient {
                 command: command,
                 completion: completion,
                 onCommentary: onCommentary,
+                onContextOmission: onContextOmission,
                 deliveredCommentaryIDs: [],
                 timeout: timeoutItem
             )
@@ -655,6 +670,31 @@ final class CodexAppRemoteClient {
                 )
                 continue
             }
+            if object["event"] as? String == "contextOmitted",
+               let requestID = object["requestId"] as? String,
+               let source = object["source"] as? String,
+               let reason = object["reason"] as? String,
+               let fallback = object["fallback"] as? String,
+               let request = pending[requestID],
+               request.command == "ask",
+               Self.allowedContextOmissionSources.contains(source),
+               Self.allowedContextOmissionReasons.contains(reason),
+               fallback == "without_optional_context" {
+                let rawProviderIndex = (object["providerIndex"] as? NSNumber)?
+                    .intValue
+                let providerIndex = rawProviderIndex.flatMap {
+                    (0..<8).contains($0) ? $0 : nil
+                }
+                request.onContextOmission?(
+                    CodexContextOmission(
+                        source: source,
+                        reason: reason,
+                        fallback: fallback,
+                        providerIndex: providerIndex
+                    )
+                )
+                continue
+            }
             if object["event"] as? String == "threadBound",
                let threadID = object["threadID"] as? String,
                !threadID.isEmpty {
@@ -681,6 +721,29 @@ final class CodexAppRemoteClient {
             }
         }
     }
+
+    private static let allowedContextOmissionSources: Set<String> = [
+        "authority_pack",
+        "additional_context",
+    ]
+
+    private static let allowedContextOmissionReasons: Set<String> = [
+        "authority_shape_invalid",
+        "authority_kind_invalid",
+        "authority_incomplete",
+        "authority_too_large",
+        "combined_context_too_large",
+        "provider_root_unavailable",
+        "provider_configuration_invalid",
+        "provider_start_failed",
+        "provider_timeout",
+        "provider_output_too_large",
+        "provider_exit_nonzero",
+        "provider_output_empty",
+        "provider_output_stale",
+        "provider_output_invalid",
+        "providers_output_too_large",
+    ]
 
     @discardableResult
     private func writeLine(_ object: JSONDictionary) -> Bool {

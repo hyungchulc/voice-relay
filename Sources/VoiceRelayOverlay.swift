@@ -1211,35 +1211,55 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             sandbox: config.codexSandbox,
             approvalPolicy: config.codexApprovalPolicy,
             additionalContext: nil,
+            additionalContextProvidersEnabled: false,
             additionalContextProvidersRoot: nil
         )
     }
 
-    private func codexTurnOptions(userText: String) throws -> CodexTurnOptions {
+    private func codexTurnOptions(
+        userText: String,
+        generation: Int
+    ) throws -> CodexTurnOptions {
         let connection = try codexConnectionOptions()
         let liveSettings = SettingsStore.shared.load()
         let context: [String: [String: String]]?
         if config.includeAuthorityPack {
-            let snapshot = try AuthorityPackComposer.snapshot(
-                from: config.authorityPackRoot
-            )
-            guard snapshot.fingerprint == config.authorityPackFingerprint else {
-                throw NSError(
-                    domain: "VoiceRelay.AuthorityPack",
-                    code: 1,
-                    userInfo: [
-                        NSLocalizedDescriptionKey:
-                            "Authority Pack이 바뀌었어. Settings에서 다시 저장해 새 session으로 연결해야 해"
+            do {
+                let snapshot = try AuthorityPackComposer.snapshot(
+                    from: config.authorityPackRoot
+                )
+                if snapshot.fingerprint == config.authorityPackFingerprint {
+                    context = snapshot.context
+                } else {
+                    context = nil
+                    VoiceRelayDiagnostics.flow(
+                        "context_omitted",
+                        generation: generation,
+                        fields: [
+                            "fallback": "without_optional_context",
+                            "reason": "fingerprint_mismatch",
+                            "source": "authority_pack",
+                        ]
+                    )
+                }
+            } catch {
+                context = nil
+                VoiceRelayDiagnostics.flow(
+                    "context_omitted",
+                    generation: generation,
+                    fields: [
+                        "fallback": "without_optional_context",
+                        "reason": "snapshot_unavailable",
+                        "source": "authority_pack",
                     ]
                 )
             }
-            context = snapshot.context
         } else {
             context = nil
         }
-        let additionalContextProvidersRoot = liveSettings
-            .includeAdditionalContextProviders
-            ? try SettingsStore.validatedAdditionalContextProvidersRoot(
+        let providersEnabled = liveSettings.includeAdditionalContextProviders
+        let additionalContextProvidersRoot = providersEnabled
+            ? SettingsStore.normalizedLocalPath(
                 liveSettings.additionalContextProvidersRoot
             )
             : nil
@@ -1252,6 +1272,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             sandbox: connection.sandbox,
             approvalPolicy: connection.approvalPolicy,
             additionalContext: context,
+            additionalContextProvidersEnabled: providersEnabled,
             additionalContextProvidersRoot: additionalContextProvidersRoot
         )
     }
@@ -1307,7 +1328,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         )
         let options: CodexTurnOptions
         do {
-            options = try codexTurnOptions(userText: text)
+            options = try codexTurnOptions(
+                userText: text,
+                generation: generation
+            )
         } catch {
             VoiceRelayDiagnostics.flow(
                 "codex_request_rejected",
@@ -1361,6 +1385,23 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                         transcriptFields: [
                             "assistantText": commentary.text
                         ]
+                    )
+                }
+            },
+            onContextOmission: { omission in
+                DispatchQueue.main.async {
+                    var fields = [
+                        "fallback": omission.fallback,
+                        "reason": omission.reason,
+                        "source": omission.source,
+                    ]
+                    if let providerIndex = omission.providerIndex {
+                        fields["providerIndex"] = String(providerIndex)
+                    }
+                    VoiceRelayDiagnostics.flow(
+                        "context_omitted",
+                        generation: generation,
+                        fields: fields
                     )
                 }
             },

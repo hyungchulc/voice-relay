@@ -8,6 +8,21 @@ const maximumProviderBytes = 32 * 1024;
 const maximumCombinedProviderBytes = 96 * 1024;
 const providerTimeoutMs = 5_000;
 
+class VoiceRelayContextError extends Error {
+  constructor(reason, message, details = {}) {
+    super(message);
+    this.name = "VoiceRelayContextError";
+    this.reason = reason;
+    if (Number.isInteger(details.providerIndex)) {
+      this.providerIndex = details.providerIndex;
+    }
+  }
+}
+
+function contextError(reason, message, details = {}) {
+  return new VoiceRelayContextError(reason, message, details);
+}
+
 export function contextPrefix(authorityContext, additionalContext = "") {
   const fragments = [];
   let totalBytes = 0;
@@ -17,19 +32,31 @@ export function contextPrefix(authorityContext, additionalContext = "") {
       suppliedKeys.length !== 1 ||
       suppliedKeys[0] !== "voice_relay.authority.pack"
     ) {
-      throw new Error("Authority Pack context shape is invalid");
+      throw contextError(
+        "authority_shape_invalid",
+        "Authority Pack context shape is invalid",
+      );
     }
     const entry = authorityContext["voice_relay.authority.pack"];
     if (entry?.kind !== "application") {
-      throw new Error("Authority Pack context kind is invalid");
+      throw contextError(
+        "authority_kind_invalid",
+        "Authority Pack context kind is invalid",
+      );
     }
     const value = String(entry?.value || "").trim();
     if (!value) {
-      throw new Error("Authority Pack context is incomplete");
+      throw contextError(
+        "authority_incomplete",
+        "Authority Pack context is incomplete",
+      );
     }
     totalBytes += Buffer.byteLength(value, "utf8");
     if (totalBytes > 800 * 1024) {
-      throw new Error("Authority Pack context is too large");
+      throw contextError(
+        "authority_too_large",
+        "Authority Pack context is too large",
+      );
     }
     fragments.push(value);
   }
@@ -37,7 +64,10 @@ export function contextPrefix(authorityContext, additionalContext = "") {
   if (localValue) {
     totalBytes += Buffer.byteLength(localValue, "utf8");
     if (totalBytes > 896 * 1024) {
-      throw new Error("Combined Voice Relay context is too large");
+      throw contextError(
+        "combined_context_too_large",
+        "Combined Voice Relay context is too large",
+      );
     }
     fragments.push(
       [
@@ -55,6 +85,52 @@ export function contextPrefix(authorityContext, additionalContext = "") {
   return `${fragments.join("\n\n")}\n\n# Incoming voice request\n`;
 }
 
+export function buildOptionalContextPrefix(
+  authorityContext,
+  additionalContext = "",
+) {
+  let activeAuthorityContext = authorityContext;
+  let activeAdditionalContext = String(additionalContext || "");
+  const omissions = [];
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return {
+        prefix: contextPrefix(
+          activeAuthorityContext,
+          activeAdditionalContext,
+        ),
+        omissions,
+      };
+    } catch (error) {
+      if (!(error instanceof VoiceRelayContextError)) throw error;
+      if (
+        String(error.reason || "").startsWith("authority_") &&
+        activeAuthorityContext
+      ) {
+        omissions.push({
+          source: "authority_pack",
+          reason: error.reason,
+        });
+        activeAuthorityContext = undefined;
+        continue;
+      }
+      if (
+        error.reason === "combined_context_too_large" &&
+        activeAdditionalContext.trim()
+      ) {
+        omissions.push({
+          source: "additional_context",
+          reason: error.reason,
+        });
+        activeAdditionalContext = "";
+        continue;
+      }
+      throw error;
+    }
+  }
+  return { prefix: "", omissions };
+}
+
 function providerExecutables(rawRoot) {
   const requestedRoot = String(rawRoot || "").trim();
   if (!requestedRoot) return [];
@@ -62,11 +138,17 @@ function providerExecutables(rawRoot) {
   try {
     root = fs.realpathSync(requestedRoot);
   } catch {
-    throw new Error("Additional Context Providers are unavailable");
+    throw contextError(
+      "provider_root_unavailable",
+      "Additional Context Providers are unavailable",
+    );
   }
   const rootStat = fs.statSync(root, { throwIfNoEntry: false });
   if (!rootStat?.isDirectory()) {
-    throw new Error("Additional Context Providers are unavailable");
+    throw contextError(
+      "provider_root_unavailable",
+      "Additional Context Providers are unavailable",
+    );
   }
   const providers = fs.readdirSync(root, { withFileTypes: true })
     .sort((left, right) => left.name.localeCompare(right.name))
@@ -85,7 +167,10 @@ function providerExecutables(rawRoot) {
     providers.length === 0 ||
     providers.length > maximumProviderCount
   ) {
-    throw new Error("Additional Context Providers are not configured correctly");
+    throw contextError(
+      "provider_configuration_invalid",
+      "Additional Context Providers are not configured correctly",
+    );
   }
   return providers;
 }
@@ -93,7 +178,10 @@ function providerExecutables(rawRoot) {
 function normalizedProviderOutput(raw) {
   const value = String(raw || "").trim();
   if (!value) {
-    throw new Error("An Additional Context Provider returned no context");
+    throw contextError(
+      "provider_output_empty",
+      "An Additional Context Provider returned no context",
+    );
   }
   let parsed;
   try {
@@ -118,7 +206,10 @@ function normalizedProviderOutput(raw) {
       generatedAt > now + 30_000 ||
       expiresAt <= now
     ) {
-      throw new Error("An Additional Context Provider returned stale context");
+      throw contextError(
+        "provider_output_stale",
+        "An Additional Context Provider returned stale context",
+      );
     }
     return parsed.text.trim();
   }
@@ -128,17 +219,39 @@ function normalizedProviderOutput(raw) {
   if (compatibleSections.length > 0) {
     return compatibleSections.join("\n\n");
   }
-  throw new Error("An Additional Context Provider returned invalid context");
+  throw contextError(
+    "provider_output_invalid",
+    "An Additional Context Provider returned invalid context",
+  );
 }
 
-function runAdditionalContextProvider(executable, prompt, homeRoot) {
+function providerExecutionPath() {
+  const candidates = [
+    path.dirname(process.execPath),
+    ...String(process.env.PATH || "").split(path.delimiter),
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ];
+  return [...new Set(
+    candidates.map((entry) => entry.trim()).filter(Boolean),
+  )].join(path.delimiter);
+}
+
+function runAdditionalContextProvider(
+  executable,
+  providerIndex,
+  prompt,
+  homeRoot,
+) {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, [], {
       stdio: ["pipe", "pipe", "ignore"],
       env: {
         HOME: homeRoot,
         LANG: process.env.LANG || "en_US.UTF-8",
-        PATH: process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin",
+        PATH: providerExecutionPath(),
       },
     });
     const chunks = [];
@@ -153,23 +266,39 @@ function runAdditionalContextProvider(executable, prompt, homeRoot) {
     };
     const timer = setTimeout(() => {
       try { child.kill("SIGKILL"); } catch {}
-      finish(new Error("An Additional Context Provider timed out"));
+      finish(contextError(
+        "provider_timeout",
+        "An Additional Context Provider timed out",
+        { providerIndex },
+      ));
     }, providerTimeoutMs);
     child.on("error", () => {
-      finish(new Error("An Additional Context Provider could not start"));
+      finish(contextError(
+        "provider_start_failed",
+        "An Additional Context Provider could not start",
+        { providerIndex },
+      ));
     });
     child.stdout.on("data", (chunk) => {
       byteCount += chunk.length;
       if (byteCount > maximumProviderBytes) {
         try { child.kill("SIGKILL"); } catch {}
-        finish(new Error("An Additional Context Provider returned too much data"));
+        finish(contextError(
+          "provider_output_too_large",
+          "An Additional Context Provider returned too much data",
+          { providerIndex },
+        ));
         return;
       }
       chunks.push(chunk);
     });
     child.on("close", (code) => {
       if (code !== 0) {
-        finish(new Error("An Additional Context Provider failed"));
+        finish(contextError(
+          "provider_exit_nonzero",
+          "An Additional Context Provider failed",
+          { providerIndex },
+        ));
         return;
       }
       try {
@@ -190,19 +319,68 @@ export async function buildAdditionalContext(
   prompt,
   options = {},
 ) {
-  const providers = providerExecutables(rawRoot);
+  let providers;
+  try {
+    providers = providerExecutables(rawRoot);
+  } catch (error) {
+    if (error instanceof VoiceRelayContextError) throw error;
+    throw contextError(
+      "provider_root_unavailable",
+      "Additional Context Providers are unavailable",
+    );
+  }
   if (providers.length === 0) return "";
   const homeRoot = path.resolve(
     String(options.homeRoot || process.env.HOME || os.homedir()),
   );
   const results = await Promise.all(
-    providers.map((provider) =>
-      runAdditionalContextProvider(provider, prompt, homeRoot)
+    providers.map((provider, providerIndex) =>
+      runAdditionalContextProvider(
+        provider,
+        providerIndex,
+        prompt,
+        homeRoot,
+      )
     ),
   );
   const value = results.join("\n\n").trim();
   if (Buffer.byteLength(value, "utf8") > maximumCombinedProviderBytes) {
-    throw new Error("Additional Context Providers returned too much data");
+    throw contextError(
+      "providers_output_too_large",
+      "Additional Context Providers returned too much data",
+    );
   }
   return value;
+}
+
+export async function buildOptionalAdditionalContext(
+  rawRoot,
+  prompt,
+  options = {},
+) {
+  if (!String(rawRoot || "").trim()) {
+    return {
+      context: "",
+      omission: {
+        source: "additional_context",
+        reason: "provider_root_unavailable",
+      },
+    };
+  }
+  try {
+    return {
+      context: await buildAdditionalContext(rawRoot, prompt, options),
+      omission: null,
+    };
+  } catch (error) {
+    if (!(error instanceof VoiceRelayContextError)) throw error;
+    const omission = {
+      source: "additional_context",
+      reason: error.reason,
+    };
+    if (Number.isInteger(error.providerIndex)) {
+      omission.providerIndex = error.providerIndex;
+    }
+    return { context: "", omission };
+  }
 }

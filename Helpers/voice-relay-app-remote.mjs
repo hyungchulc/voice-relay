@@ -6,8 +6,8 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  buildAdditionalContext,
-  contextPrefix,
+  buildOptionalAdditionalContext,
+  buildOptionalContextPrefix,
 } from "./voice-relay-context.mjs";
 import {
   requestRealtimeCredential,
@@ -311,12 +311,47 @@ async function ask(params, requestId) {
       },
       requestId,
     );
-    const additionalContext = await buildAdditionalContext(
-      params.additionalContextProvidersRoot,
-      String(params.prompt || ""),
+    const providersEnabled =
+      params.additionalContextProvidersEnabled === true ||
+      Boolean(String(params.additionalContextProvidersRoot || "").trim());
+    const additionalContextResult = providersEnabled
+      ? await buildOptionalAdditionalContext(
+          params.additionalContextProvidersRoot,
+          String(params.prompt || ""),
+        )
+      : { context: "", omission: null };
+    if (additionalContextResult.omission) {
+      write({
+        event: "contextOmitted",
+        requestId,
+        source: additionalContextResult.omission.source,
+        reason: additionalContextResult.omission.reason,
+        fallback: "without_optional_context",
+        ...(Number.isInteger(
+          additionalContextResult.omission.providerIndex,
+        )
+          ? {
+              providerIndex:
+                additionalContextResult.omission.providerIndex,
+            }
+          : {}),
+      });
+    }
+    const prefixResult = buildOptionalContextPrefix(
+      params.additionalContext,
+      additionalContextResult.context,
     );
+    for (const omission of prefixResult.omissions) {
+      write({
+        event: "contextOmitted",
+        requestId,
+        source: omission.source,
+        reason: omission.reason,
+        fallback: "without_optional_context",
+      });
+    }
     const result = await backend.ask(String(params.prompt || ""), {
-      prefix: contextPrefix(params.additionalContext, additionalContext),
+      prefix: prefixResult.prefix,
       requestIdPrefix: "voice-relay",
       requestTag: "voice_relay_request_id",
       preferredThreadId: threadID,

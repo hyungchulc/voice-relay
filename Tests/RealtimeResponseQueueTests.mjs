@@ -1502,4 +1502,50 @@ assert.equal(
   "a post-final conversational receipt must stay on the direct Realtime path",
 );
 
+const codexFailureStart = nativeMessages.length;
+runtime.start({
+  generation: 11,
+  language: "en-US",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Relay",
+  wakePhrases: ["Hey Relay"],
+  shouldGreet: false,
+});
+runtime.transportOpened({ generation: 11 });
+runtime.transportReady({ generation: 11 });
+runtime.resolveCodex({
+  generation: 11,
+  callId: "failed-codex-call",
+  error: "An Additional Context Provider failed (APP_REMOTE_FAILED)",
+});
+const codexFailureEvents = nativeMessages
+  .slice(codexFailureStart)
+  .filter(message => message.type === "realtimeSend")
+  .map(message => JSON.parse(message.eventJSON));
+const failureOutputEvent = codexFailureEvents.find(event =>
+  event.type === "conversation.item.create"
+  && event.item?.type === "function_call_output"
+  && event.item?.call_id === "failed-codex-call"
+);
+assert.deepEqual(
+  JSON.parse(failureOutputEvent?.item?.output || "{}"),
+  { status: "error" },
+  "raw Codex diagnostics must never be given back to Realtime to explain",
+);
+const failureSpeech = codexFailureEvents.find(event =>
+  event.type === "response.create"
+  && event.response?.metadata?.voice_relay_kind === "codex_final"
+);
+assert.match(
+  failureSpeech?.response?.instructions || "",
+  /Say exactly this and nothing else: "I couldn't complete that request\. Please try again\."/,
+  "Codex failure speech must use deterministic generic copy",
+);
+assert.doesNotMatch(
+  failureSpeech?.response?.instructions || "",
+  /Additional Context Provider|APP_REMOTE_FAILED|weather|reliably/,
+  "Codex failure speech must not fabricate a provider or capability explanation",
+);
+
 console.log("Realtime response queue tests passed");

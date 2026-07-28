@@ -2737,8 +2737,9 @@ private extension DirectRealtimeController {
           status: payload.error ? "failure" : "success",
           turnID: String(session.activeUserTurn?.id || "")
         });
-        const output = JSON.stringify(payload.error
-          ? { status: "error", message: String(payload.error) }
+        const didFail = Boolean(payload.error);
+        const output = JSON.stringify(didFail
+          ? { status: "error" }
           : { status: "ok", answer: String(payload.output || "") });
         dataSend({
           type: "conversation.item.create",
@@ -2750,7 +2751,14 @@ private extension DirectRealtimeController {
         });
         enqueueCodexSpeech(
           "codex_final",
-          "Speak the Codex result faithfully and concisely in the user's language. Do not add unsupported facts. If status is error, give one short friendly retry suggestion without exposing raw diagnostics.",
+          didFail
+            ? `Say exactly this and nothing else: ${JSON.stringify(
+                String(session.startPayload?.language || "")
+                    .toLowerCase().startsWith("ko")
+                  ? "그 요청을 완료하지 못했어. 다시 시도해줘."
+                  : "I couldn't complete that request. Please try again."
+              )}`
+            : "Speak the Codex result faithfully and concisely in the user's language. Do not add unsupported facts.",
           {
             marksAwaitingFinal: true,
             detached: false
