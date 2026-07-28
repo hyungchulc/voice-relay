@@ -1,5 +1,10 @@
 # Voice Relay architecture
 
+Voice Relay supports macOS 14 or newer and recommends the latest stable macOS
+release. The minimum matches the current ChatGPT desktop requirement because
+Voice Relay connects to the desktop Chat/Work/Codex runtime. Current
+development and validation use macOS 27 beta.
+
 ## Product boundary
 
 Voice Relay is a Mac-only native Voice surface with two related connection layers:
@@ -45,8 +50,15 @@ dedicated Voice Relay task.
 ## Realtime voice path
 
 ```text
-microphone
-  -> AVAudioEngine 24 kHz mono PCM16 capture
+local wake plane
+  -> system default microphone
+  -> SpeechAnalyzer or local Speech recognition
+  -> fully quiesced before handoff
+
+active Realtime plane
+  -> one Voice Processing AVAudioEngine
+  -> system default microphone and output
+  -> 24 kHz mono PCM16 capture
   -> URLSessionWebSocketTask
   -> gpt-realtime-2.1
   -> media-free WKWebView routing reducer
@@ -55,6 +67,19 @@ microphone
   -> function_call_output
   -> native PCM16 playback and transcript
 ```
+
+The two audio planes are mutually exclusive. A wake match is delivered only
+after the active SpeechAnalyzer has finished cancellation, released its
+reserved assets, removed its tap, and stopped its engine. Realtime audio starts
+only after the server session is ready. It uses the current macOS default input
+and output without selecting, pinning, or changing an audio device.
+
+Realtime keeps Apple Voice Processing active only for the bounded conversation
+lease. On macOS 14 or newer it enables advanced other-audio ducking at Apple's
+minimum level. The public API minimizes attenuation but cannot guarantee zero
+ducking while AEC is active. Keeping Realtime always connected would extend
+that attenuation, network microphone streaming, and idle failure exposure, so
+idle monitoring remains local.
 
 Swift requests a short-lived Realtime credential with the signed-in local Codex
 OAuth session, keeps both OAuth and ephemeral values only in memory, and
@@ -181,10 +206,10 @@ Codex task. Quit terminates the app through AppKit.
 
 ## Distribution boundary
 
-`build.sh` creates a universal ad-hoc app for local testing. Its explicit
-bundle-identifier designated requirement stays stable across local rebuilds so
-macOS permission identity does not depend on a changing ad-hoc CDHash. Local
-builds carry the same audio-input entitlement as release builds; an authorized
+`build.sh` creates a universal app and uses an explicit Apple signing identity
+when one is supplied. Its ad-hoc fallback exists only for local source testing
+and keeps an explicit bundle-identifier designated requirement. All builds
+carry the same audio-input entitlement as release builds; an authorized
 permission without that entitlement is not treated as a working capture path.
 `package-release.sh` creates a hardened Developer ID build and can notarize when
 a notarytool Keychain profile is supplied. Public release proof requires

@@ -7,6 +7,7 @@ import Speech
 private struct AppConfig {
     let productName: String
     let assistantName: String
+    let userDisplayName: String
     let appearanceMode: AppAppearanceMode
     let autoSpeak: Bool
     let speechLocale: String
@@ -48,6 +49,12 @@ private struct AppConfig {
         return AppConfig(
             productName: settings.productName,
             assistantName: settings.assistantName,
+            userDisplayName: SettingsStore.normalizedDisplayName(
+                settings.userDisplayName,
+                fallback: AppCopy(
+                    preference: settings.appDisplayLanguage
+                ).text("Me", "나")
+            ),
             appearanceMode: AppAppearanceMode.parse(settings.appearanceMode),
             autoSpeak: boolValue(
                 env["VOICE_RELAY_SPEAK"],
@@ -2320,7 +2327,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
     private func wireWakePhrase() {
         wakePhrase.onWake = { [weak self] match in
-            self?.startRealtimeVoice(prefill: match.command)
+            self?.startRealtimeVoice(
+                prefill: match.command,
+                acknowledgeWake: match.command.isEmpty
+            )
         }
         wakePhrase.onError = { [weak self] message in
             guard let self else { return }
@@ -2464,13 +2474,26 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             realtimeDraft = ""
             isWaitingForReply = false
             scheduleVoiceIdleTimeout()
+            let copy = AppCopy(
+                preference: SettingsStore.shared.load().appDisplayLanguage
+            )
             showToast(
-                "그 요청만 처리하지 못했어. 다시 말해줘",
+                copy.text(
+                    "I couldn't complete that request. Please try again.",
+                    "그 요청만 처리하지 못했어. 다시 말해줘"
+                ),
                 color: NSColor.systemOrange,
                 autoHideAfter: 3.0
             )
         case "error":
-            let message = (event["message"] as? String) ?? "Realtime 연결 오류"
+            let copy = AppCopy(
+                preference: SettingsStore.shared.load().appDisplayLanguage
+            )
+            let message = (event["message"] as? String)
+                ?? copy.text(
+                    "Realtime connection error",
+                    "Realtime 연결 오류"
+                )
             NSLog("Voice Relay Realtime failed: %@", message)
             let wasEstablished = voiceState.phase != .starting
             let interruptedAnswer = realtimeDraft
@@ -2497,7 +2520,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         }
     }
 
-    private func startRealtimeVoice(prefill: String? = nil) {
+    private func startRealtimeVoice(
+        prefill: String? = nil,
+        acknowledgeWake: Bool = false
+    ) {
         guard !voiceState.phase.isSessionActive,
               Date() >= nextVoiceStartAllowedAt else {
             return
@@ -2537,8 +2563,9 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         realtimeController.start(
             generation: generation,
             prefill: exactPrefill?.isEmpty == false ? exactPrefill : nil,
-            shouldGreet: conversationHistory.isEmpty
-                && !SettingsStore.shared.completedFirstVoiceGreeting
+            shouldGreet: acknowledgeWake
+                || (conversationHistory.isEmpty
+                    && !SettingsStore.shared.completedFirstVoiceGreeting)
         )
     }
 
@@ -3213,7 +3240,9 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             if index > 0 {
                 result.append(NSAttributedString(string: "\n\n"))
             }
-            let label = entry.speaker == .user ? "나" : config.assistantName
+            let label = entry.speaker == .user
+                ? config.userDisplayName
+                : config.assistantName
             result.append(
                 NSAttributedString(
                     string: "\(label)\n",
@@ -3239,7 +3268,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             }
             result.append(
                 NSAttributedString(
-                    string: "나\n",
+                    string: "\(config.userDisplayName)\n",
                     attributes: [
                         .font: NSFont.systemFont(ofSize: 11.5, weight: .semibold),
                         .foregroundColor: currentColors().secondaryText,

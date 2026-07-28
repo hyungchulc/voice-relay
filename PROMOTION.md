@@ -2,6 +2,9 @@
 
 This kit keeps public descriptions aligned with the current public alpha. It
 can be reused for GitHub, a product page, a launch post, or a demo video.
+State the platform boundary plainly: macOS 14 or newer is required, the latest
+stable macOS release is recommended, and current development and validation use
+macOS 27 beta.
 
 ## Core positioning
 

@@ -700,6 +700,34 @@ require_text \
   'playback_echo_transcript_suppressed' \
   "assistant playback transcripts must be rejected as new user turns"
 require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'duplicate_user_audio_item_suppressed' \
+  "completed Realtime input items must be consumed exactly once"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'replayed_user_turn_suppressed' \
+  "a processed user turn must not loop back during its own answer playback"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'duplicate_user_turn_acceptance_suppressed' \
+  "the final user-turn acceptance boundary must reject replayed requests"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'duplicate_active_control_turn_suppressed' \
+  "active Codex controls must not retain a replay of the primary request"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'primaryUserTurnGuardUntil' \
+  "one primary request identity must remain guarded through answer playback"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  '"I couldn'\''t complete that request. Please try again."' \
+  "turn failure copy must provide the English system-language path"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'preference: SettingsStore.shared.load().appDisplayLanguage' \
+  "transient Voice failures must resolve the configured display language"
+require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'playback_backpressure_drop' \
   "playback backpressure must degrade without killing the Realtime session"
@@ -2074,6 +2102,90 @@ require_text \
   '"type": "conversation.item.truncate"' \
   "barge-in must truncate unplayed native audio"
 require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '"voice-relay-truncate-\(generation)-\(controlEventSequence)"' \
+  "truncate errors must be correlated to the exact client event"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'boundedRenderedFrames = min(' \
+  "truncate time must be bounded by locally scheduled audio"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'pendingBargeInPCM' \
+  "confirmed barge-in must preserve speech captured during local echo confirmation"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'detachedSpeechKinds' \
+  "detached Codex speech must never truncate a server conversation item"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'audioConfigurationStartupGrace' \
+  "audio recovery must debounce Voice Processing configuration churn"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'audioConfigurationRecoveryPolicy.registerChange' \
+  "audio recovery must use a trailing-edge generation policy"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'restartVoiceProcessingEngineInPlace' \
+  "audio changes must try the existing voice-processing graph first"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'audio_recovered_in_place' \
+  "successful in-place audio recovery must be observable"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'audio_recovery_unstable' \
+  "a running graph without capture or render progress must consume a bounded recovery attempt"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'case "input_audio_buffer.speech_started":' \
+  "Realtime must handle admitted speech as an immediate interruption boundary"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'cancelActiveResponseForBargeIn();' \
+  "admitted speech must cancel the active server response before transcription completes"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'voiceProcessingOtherAudioDuckingConfiguration' \
+  "Voice Processing must explicitly minimize ducking of unrelated Mac audio"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'enableAdvancedDucking: true' \
+  "advanced ducking must react to local and remote speech activity"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'duckingLevel: .min' \
+  "unrelated Mac audio must use Apple's minimum supported ducking level"
+require_text \
+  "$ROOT/Resources/Info.plist" \
+  '<string>14.0</string>' \
+  "the app bundle must require macOS 14 or newer"
+require_text \
+  "$ROOT/build.sh" \
+  'apple-macos14.0' \
+  "all release architectures must compile for the macOS 14 deployment target"
+reject_text \
+  "$ROOT/build.sh" \
+  'apple-macos13.0' \
+  "the retired macOS 13 deployment target must not return"
+require_text \
+  "$ROOT/README.md" \
+  'Current development and validation environment: macOS 27 beta' \
+  "public requirements must identify the current macOS 27 beta development environment"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'causalEventId.startsWith("voice-relay-truncate-")' \
+  "a rejected best-effort truncate must not tear down the active voice turn"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'if (normalizedResponseId) return "";' \
+  "a later route response must not inherit a stale Codex speech kind"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'speechKind === "codex_commentary"' \
+  "raw Codex commentary must remain the only visible commentary snapshot"
+require_text \
   "$ROOT/Helpers/voice-relay-app-remote.mjs" \
   'event: "commentary"' \
   "Codex commentary must stay distinct from the final answer"
@@ -2193,6 +2305,22 @@ require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
   'modernSession == nil' \
   "wake recognition must reject duplicate starts while a modern session opens"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'modernWakeSession.stop(completion: finish)' \
+  "Realtime handoff must wait for the modern wake session to finish teardown"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'await analyzerToCancel.cancelAndFinishNow()' \
+  "SpeechAnalyzer cancellation must finish before Realtime receives the wake"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'private let lifecycleLock = NSLock()' \
+  "wake startup and teardown must share one lifecycle exclusion boundary"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'self.onWake?(candidate.match)' \
+  "the wake callback must run only from the generation-bound teardown completion"
 reject_text \
   "$ROOT/Sources/VoiceSurfacePolicy.swift" \
   'if phrase == "릴레이야"' \
@@ -2231,8 +2359,20 @@ require_text \
   "modern wake recognition must compose split analyzer ranges before activation"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  'startRealtimeVoice(prefill: match.command)' \
+  'prefill: match.command,' \
   "the stabilized wake command tail must reach Realtime"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'acknowledgeWake: match.command.isEmpty' \
+  "a wake-only activation must request an immediate Realtime acknowledgement"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'transport.prepareAudio(generation: generation)' \
+  "Realtime must not enable Voice Processing before the server session is ready"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'emitDiagnostic("unadmitted_playback_turn_suppressed")' \
+  "unadmitted playback-window turns must leave a privacy-safe diagnostic"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'acceptUserTurn(prefill, true)' \
@@ -2321,6 +2461,22 @@ require_text \
   "$ROOT/Sources/SettingsStore.swift" \
   'assistantName: "Relay"' \
   "fresh public installs must use Relay as the assistant name"
+require_text \
+  "$ROOT/Sources/SettingsStore.swift" \
+  'var userDisplayName: String' \
+  "the visible user identity must be a persisted setting"
+require_text \
+  "$ROOT/Sources/OnboardingWindowController.swift" \
+  'userNameLabel.stringValue = localizedCopy.text(' \
+  "onboarding must allow users to set their visible name"
+require_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  'settings.userDisplayName = SettingsStore.normalizedDisplayName(' \
+  "Settings must save the configured visible user name"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'config.userDisplayName' \
+  "conversation history must render the configured visible user name"
 require_text \
   "$ROOT/Sources/SettingsStore.swift" \
   'static let defaultWakePhrases = ["Relay", "Hey Relay"]' \

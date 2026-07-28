@@ -668,8 +668,8 @@ struct WakePhraseMatch: Equatable {
 }
 
 enum WakePhraseCapturePolicy {
-    static let wakeOnlyGrace: TimeInterval = 0.82
-    static let commandTailGrace: TimeInterval = 0.58
+    static let wakeOnlyGrace: TimeInterval = 0.55
+    static let commandTailGrace: TimeInterval = 1.05
     static let finalizedGrace: TimeInterval = 0.16
 
     static func activationDelay(

@@ -775,6 +775,14 @@ private extension DirectRealtimeController {
         const error = event?.error || {};
         const causalEventId = String(error.event_id || "");
         const responseId = String(session?.activeResponseId || "");
+        if (causalEventId.startsWith("voice-relay-truncate-")) {
+          diagnostic("truncate_rejected", generation, {
+            code: String(error.code || ""),
+            errorType: String(error.type || ""),
+            eventID: causalEventId
+          });
+          return;
+        }
         diagnostic("server_error", generation, {
           code: String(error.code || ""),
           errorType: String(error.type || ""),
@@ -871,6 +879,9 @@ private extension DirectRealtimeController {
         const value = `${current}${String(delta || "")}`.trim();
         if (!value) return;
         session.transientAssistantTranscripts.set(normalizedResponseId, value);
+        if (speechKind === "codex_commentary") {
+          return;
+        }
         send({
           type: "assistantProgress",
           generation: session.generation,
@@ -886,7 +897,9 @@ private extension DirectRealtimeController {
         replace = false
       ) {
         if (!session) return;
-        const normalizedResponseId = String(responseId || "");
+        const normalizedResponseId = String(
+          responseId || session.activeResponseId || ""
+        );
         const value = String(text || "");
         if (!normalizedResponseId || !value) return;
         const previous = String(
@@ -935,13 +948,115 @@ private extension DirectRealtimeController {
           );
       }
 
+      function rememberAcceptedUserTurn(text) {
+        if (!session) return;
+        const normalized = normalizedEchoText(text);
+        if (!normalized) return;
+        session.primaryUserTurnKey = normalized;
+        session.primaryUserTurnGuardUntil =
+          Number.POSITIVE_INFINITY;
+        session.recentAcceptedUserTurns.push(normalized);
+        if (session.recentAcceptedUserTurns.length > 8) {
+          session.recentAcceptedUserTurns.shift();
+        }
+      }
+
+      function protectCompletedPrimaryUserTurn() {
+        if (!session || !session.primaryUserTurnKey) return;
+        session.primaryUserTurnGuardUntil = Math.max(
+          Number(session.primaryUserTurnGuardUntil || 0),
+          Date.now() + 6_000
+        );
+      }
+
+      function isRepeatedPrimaryUserTurn(text) {
+        if (!session || !session.primaryUserTurnKey) return false;
+        const normalized = normalizedEchoText(text);
+        if (!normalized
+            || normalized !== session.primaryUserTurnKey) {
+          return false;
+        }
+        const primaryTurnIsActive =
+          session.routeInFlight
+          || session.codexInFlight
+          || session.controlRouteInFlight
+          || session.codexSpeechInFlight
+          || Boolean(session.activeResponseId)
+          || session.audioResponseIds.size > 0
+          || session.finalAudioResponseIds.size > 0;
+        return primaryTurnIsActive
+          || Date.now()
+            <= Number(session.primaryUserTurnGuardUntil || 0);
+      }
+
+      function isRepeatedUserTurnDuringActiveRequest(text) {
+        if (!session) return false;
+        if (isRepeatedPrimaryUserTurn(text)) return true;
+        pruneRecentAssistantPlaybackTexts();
+        const requestOrPlaybackIsActive =
+          session.routeInFlight
+          || session.codexInFlight
+          || session.audioResponseIds.size > 0
+          || session.assistantPlaybackTextByResponseId.size > 0
+          || session.recentAssistantPlaybackTexts.length > 0;
+        if (!requestOrPlaybackIsActive) return false;
+        const normalized = normalizedEchoText(text);
+        return Boolean(
+          normalized
+          && session.recentAcceptedUserTurns.includes(normalized)
+        );
+      }
+
+      function registerCompletedUserAudioItem(event) {
+        if (!session) return false;
+        const itemId = String(
+          event?.item_id || event?.item?.id || ""
+        ).trim();
+        if (!itemId) return false;
+        if (session.completedUserAudioItemIds.has(itemId)) {
+          return true;
+        }
+        session.completedUserAudioItemIds.add(itemId);
+        if (session.completedUserAudioItemIds.size > 64) {
+          const oldest = session.completedUserAudioItemIds.values()
+            .next().value;
+          if (oldest) session.completedUserAudioItemIds.delete(oldest);
+        }
+        return false;
+      }
+
+      function suppressRepeatedUserAudioTurn(
+        generation,
+        stage
+      ) {
+        diagnostic(stage, generation);
+        send({
+          type: "playbackResume",
+          generation: session.generation
+        });
+        send({
+          type: "userTranscriptPartial",
+          generation: session.generation,
+          text: ""
+        });
+      }
+
       function isLikelyAssistantPlaybackEcho(text) {
         if (!session) return false;
         const candidate = normalizedEchoText(text);
-        if (candidate.length < 4) return false;
+        if (!candidate) return false;
         pruneRecentAssistantPlaybackTexts();
+        const activeSources = [
+          ...session.assistantPlaybackTextByResponseId.values()
+        ];
+        if (activeSources.some(sourceText =>
+          normalizedEchoText(sourceText) === candidate
+        )) {
+          return true;
+        }
+        if (candidate.length < 4) return false;
         const sources = [
-          ...session.assistantPlaybackTextByResponseId.values(),
+          ...activeSources,
           ...session.recentAssistantPlaybackTexts.map(item => item.text)
         ];
         return sources.some(sourceText => {
@@ -963,6 +1078,7 @@ private extension DirectRealtimeController {
         if (!session || !session.awaitingFinal || !value) return false;
         const key = String(responseId || `text:${value}`);
         if (session.reportedAssistantResponses.has(key)) return false;
+        rememberAssistantPlaybackText(key, value, true);
         session.currentAssistantTranscript = value;
         flushAssistantDraft();
         session.reportedAssistantResponses.add(key);
@@ -1011,11 +1127,39 @@ private extension DirectRealtimeController {
       }
 
       function activeCodexSpeechKind(responseId = "") {
+        const normalizedResponseId = String(responseId || "");
         const responseKind = String(
-          session?.codexSpeechResponseKinds?.get(String(responseId || "")) || ""
+          session?.codexSpeechResponseKinds?.get(normalizedResponseId) || ""
         );
         if (responseKind) return responseKind;
+        if (normalizedResponseId) return "";
         return String(session?.activeCodexSpeech?.kind || "");
+      }
+
+      function codexCommentarySpeechDelta(text) {
+        if (!session) return "";
+        const value = String(text || "").trim();
+        if (!value) return "";
+        for (const previous of session.spokenCodexCommentaryTexts
+          .slice()
+          .reverse()) {
+          if (value === previous || previous.startsWith(value)) {
+            return "";
+          }
+          if (value.startsWith(previous)) {
+            const suffix = value.slice(previous.length).trim();
+            session.spokenCodexCommentaryTexts.push(value);
+            if (session.spokenCodexCommentaryTexts.length > 8) {
+              session.spokenCodexCommentaryTexts.shift();
+            }
+            return suffix;
+          }
+        }
+        session.spokenCodexCommentaryTexts.push(value);
+        if (session.spokenCodexCommentaryTexts.length > 8) {
+          session.spokenCodexCommentaryTexts.shift();
+        }
+        return value;
       }
 
       function startNextCodexSpeech() {
@@ -1203,6 +1347,7 @@ private extension DirectRealtimeController {
         session.activeUserTurn = turn;
         session.routeInFlight = true;
         session.routeClassifierRetryCount = 0;
+        rememberAcceptedUserTurn(turn.text);
         resetAssistantDraft();
         if (turn.inputText) {
           dataSend({
@@ -1231,17 +1376,28 @@ private extension DirectRealtimeController {
         inputText = false,
         transcriptAlreadyReported = false
       ) {
-        if (!session || session.lifecycle !== "active") return;
+        if (!session || session.lifecycle !== "active") return false;
+        const value = String(text || "").trim();
+        if (!value) return false;
+        if (isRepeatedPrimaryUserTurn(value)) {
+          suppressRepeatedUserAudioTurn(
+            session.generation,
+            "duplicate_user_turn_acceptance_suppressed"
+          );
+          return false;
+        }
         session.acceptedTurnQueue.push({
-          text: String(text || "").trim(),
+          text: value,
           inputText: Boolean(inputText),
           transcriptAlreadyReported: Boolean(transcriptAlreadyReported)
         });
         processNextAcceptedTurn();
+        return true;
       }
 
       function completeAcceptedTurn() {
         if (!session || session.lifecycle !== "active") return;
+        protectCompletedPrimaryUserTurn();
         session.routeInFlight = false;
         session.activeUserTurn = null;
         if (session.acceptedTurnQueue.length > 0) {
@@ -1316,9 +1472,19 @@ private extension DirectRealtimeController {
       }
 
       function queueActiveCodexControlTurn(text) {
-        if (!session || session.lifecycle !== "active") return;
-        session.activeCodexControlQueue.push(String(text || "").trim());
+        if (!session || session.lifecycle !== "active") return false;
+        const value = String(text || "").trim();
+        if (!value) return false;
+        if (isRepeatedPrimaryUserTurn(value)) {
+          suppressRepeatedUserAudioTurn(
+            session.generation,
+            "duplicate_active_control_turn_suppressed"
+          );
+          return false;
+        }
+        session.activeCodexControlQueue.push(value);
         startNextActiveCodexControlTurn();
+        return true;
       }
 
       function beginSemanticStop(text) {
@@ -1436,6 +1602,9 @@ private extension DirectRealtimeController {
         switch (event.type) {
           case "input_audio_buffer.speech_started":
             session.currentUserTranscript = "";
+            if (session.activeResponseId) {
+              cancelActiveResponseForBargeIn();
+            }
             send({
               type: "userTranscriptPartial",
               generation: session.generation,
@@ -1459,20 +1628,25 @@ private extension DirectRealtimeController {
             const text = String(event.transcript || "").trim();
             session.currentUserTranscript = "";
             if (!isMeaningfulSpeechTranscript(text)) break;
-            if (isLikelyAssistantPlaybackEcho(text)) {
-              diagnostic(
-                "playback_echo_transcript_suppressed",
-                generation
+            if (registerCompletedUserAudioItem(event)) {
+              suppressRepeatedUserAudioTurn(
+                generation,
+                "duplicate_user_audio_item_suppressed"
               );
-              send({
-                type: "playbackResume",
-                generation: session.generation
-              });
-              send({
-                type: "userTranscriptPartial",
-                generation: session.generation,
-                text: ""
-              });
+              break;
+            }
+            if (isRepeatedUserTurnDuringActiveRequest(text)) {
+              suppressRepeatedUserAudioTurn(
+                generation,
+                "replayed_user_turn_suppressed"
+              );
+              break;
+            }
+            if (isLikelyAssistantPlaybackEcho(text)) {
+              suppressRepeatedUserAudioTurn(
+                generation,
+                "playback_echo_transcript_suppressed"
+              );
               break;
             }
             const hadBufferedPlayback = session.audioResponseIds.size > 0;
@@ -1697,13 +1871,15 @@ private extension DirectRealtimeController {
                     );
                   }
                 }
-                send({
-                  type: "assistantProgress",
-                  generation: session.generation,
-                  responseId,
-                  kind: speechKind,
-                  text
-                });
+                if (speechKind !== "codex_commentary") {
+                  send({
+                    type: "assistantProgress",
+                    generation: session.generation,
+                    responseId,
+                    kind: speechKind,
+                    text
+                  });
+                }
               }
               break;
             }
@@ -1858,6 +2034,10 @@ private extension DirectRealtimeController {
           audioResponseIds: new Set(),
           assistantPlaybackTextByResponseId: new Map(),
           recentAssistantPlaybackTexts: [],
+          recentAcceptedUserTurns: [],
+          primaryUserTurnKey: "",
+          primaryUserTurnGuardUntil: 0,
+          completedUserAudioItemIds: new Set(),
           progressResponseIds: new Set(),
           stopAcknowledgementResponseIds: new Set(),
           expectedCancelEventIds: new Set(),
@@ -1871,6 +2051,7 @@ private extension DirectRealtimeController {
           codexSpeechResponseKinds: new Map(),
           transientAssistantTranscripts: new Map(),
           spokenCodexCommentaryIds: new Set(),
+          spokenCodexCommentaryTexts: [],
           awaitingFinal: false,
           userTurnCount: 0,
           acceptedTurnQueue: [],
@@ -2001,8 +2182,11 @@ private extension DirectRealtimeController {
             type: "response.create",
             response: {
               tool_choice: "none",
+              metadata: {
+                voice_relay_kind: "wake_acknowledgement"
+              },
               instructions:
-                `You are ${session.assistantName} in ${session.productName}. Give one brief friendly greeting in ${startPayload.language || "the system language"}, then stop and listen. Do not mention tools or capabilities.`
+                `You are ${session.assistantName} in ${session.productName}. The user just called your configured wake phrase. Give one very brief, natural acknowledgement in ${startPayload.language || "the system language"} that you heard them and are listening, then stop and listen. Choose fresh wording freely instead of using a fixed stock phrase. Do not mention tools, routing, or capabilities.`
             }
           });
           state("speaking", generation);
@@ -2060,6 +2244,7 @@ private extension DirectRealtimeController {
         }
         processNextAcceptedTurn();
         if (wasFinal) {
+          protectCompletedPrimaryUserTurn();
           send({
             type: "assistantPlaybackDrained",
             generation,
@@ -2113,9 +2298,11 @@ private extension DirectRealtimeController {
           return;
         }
         session.spokenCodexCommentaryIds.add(messageId);
+        const speechText = codexCommentarySpeechDelta(text);
+        if (!speechText) return;
         enqueueCodexSpeech(
           "codex_commentary",
-          `Say exactly this and nothing else: ${JSON.stringify(text)}`
+          `Say exactly this and nothing else: ${JSON.stringify(speechText)}`
         );
       }
 

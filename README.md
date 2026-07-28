@@ -101,7 +101,12 @@ Official references
 
 ## Requirements
 
-- macOS 13 or newer
+- macOS 14 or newer
+- The latest stable macOS release is recommended
+- Current development and validation environment: macOS 27 beta
+- This minimum follows the current
+  [ChatGPT desktop requirement](https://help.openai.com/en/articles/9395554-what-are-the-system-requirements-for-the-chatgpt-macos-app),
+  because Voice Relay connects to the desktop Chat/Work/Codex runtime
 - The Codex/ChatGPT desktop app installed, running, and signed in
 - Xcode Command Line Tools for local builds
 - Node.js 20 or newer for the current Remote helper
@@ -321,7 +326,10 @@ preserve a clear copyright chain for optional commercial licensing. See
 
 ## Verification
 
-`build.sh` compiles the app, runs the local policy tests, validates both property lists, and applies an ad-hoc signature. A manual Codex app Remote smoke harness is also included:
+`build.sh` compiles the app, runs the local policy tests, validates both property
+lists, and signs with `VOICE_RELAY_SIGNING_IDENTITY` when provided. Without an
+explicit identity it uses an ad-hoc signature for local source testing only. A
+manual Codex app Remote smoke harness is also included:
 
 ```bash
 xcrun swiftc \
@@ -347,8 +355,8 @@ DMG. This is a developer build, not an App Store or notarized distribution:
 
 ```bash
 VOICE_RELAY_SIGNING_IDENTITY="Apple Development: Example Person (TEAMID)" \
-VOICE_RELAY_SOURCE_URL="https://github.com/example/voice-relay/archive/refs/tags/v0.4.0-alpha.3.tar.gz" \
-VOICE_RELAY_RELEASE_LABEL="0.4.0-alpha.3" \
+VOICE_RELAY_SOURCE_URL="https://github.com/example/voice-relay/archive/refs/tags/v0.4.0-alpha.4.tar.gz" \
+VOICE_RELAY_RELEASE_LABEL="0.4.0-alpha.4" \
 ./package-alpha-dmg.sh
 ```
 

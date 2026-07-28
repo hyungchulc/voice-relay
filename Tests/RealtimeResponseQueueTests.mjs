@@ -284,11 +284,18 @@ assert.equal(
   "commentary transcript must never enter final-answer state"
 );
 assert.equal(
-  nativeEvents("assistantProgress").at(-1)?.text,
-  "관련 설정을 확인하고 있어.",
-  "spoken Codex commentary must remain visible"
+  nativeEvents("assistantProgress").filter(
+    event => event.kind === "codex_commentary"
+  ).length,
+  0,
+  "raw Codex commentary must not be replaced by a second generated transcript"
 );
 
+runtime.speakCodexCommentary({
+  generation: 1,
+  messageId: "commentary-2",
+  text: "관련 설정을 확인하고 있어. 로그를 대조했어.",
+});
 runtime.resolveCodex({
   generation: 1,
   callId: "route-call-1",
@@ -308,7 +315,38 @@ receive({
     output: [],
   },
 });
-assert.equal(responseCreates().length, 4, "final follows commentary");
+assert.equal(responseCreates().length, 4, "cumulative commentary follows");
+assert.equal(
+  responseCreates().at(-1).response.metadata.voice_relay_kind,
+  "codex_commentary"
+);
+assert.match(
+  responseCreates().at(-1).response.instructions,
+  /로그를 대조했어/,
+  "only the new suffix of cumulative commentary should be spoken"
+);
+assert.doesNotMatch(
+  responseCreates().at(-1).response.instructions,
+  /관련 설정을 확인하고 있어/,
+  "already spoken commentary must not be repeated"
+);
+
+receive({
+  type: "response.created",
+  response: {
+    id: "commentary-2",
+    metadata: { voice_relay_kind: "codex_commentary" },
+  },
+});
+receive({
+  type: "response.done",
+  response: {
+    id: "commentary-2",
+    metadata: { voice_relay_kind: "codex_commentary" },
+    output: [],
+  },
+});
+assert.equal(responseCreates().length, 5, "final follows all commentary");
 assert.equal(
   responseCreates().at(-1).response.metadata.voice_relay_kind,
   "codex_final"
@@ -681,7 +719,7 @@ assert.equal(
   "the replacement human turn must start once after cancellation resolves",
 );
 
-const messagesBeforeVariedHandoff = nativeMessages.length;
+const messagesBeforeResponseDoneEcho = nativeMessages.length;
 runtime.start({
   generation: 5,
   language: "ko-KR",
@@ -697,7 +735,7 @@ runtime.receiveRealtimeEvent({
   generation: 5,
   event: {
     type: "conversation.item.input_audio_transcription.completed",
-    transcript: "오늘 일정 확인해줘",
+    transcript: "안녕",
   },
 });
 runtime.receiveRealtimeEvent({
@@ -705,7 +743,7 @@ runtime.receiveRealtimeEvent({
   event: {
     type: "response.created",
     response: {
-      id: "route-handoff-5",
+      id: "route-response-done-echo-5",
       metadata: { voice_relay_kind: "route_classifier" },
     },
   },
@@ -715,12 +753,126 @@ runtime.receiveRealtimeEvent({
   event: {
     type: "response.function_call_arguments.done",
     name: "route_voice_turn",
+    call_id: "route-response-done-echo-call-5",
+    arguments: JSON.stringify({ kind: "direct_chat" }),
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 5,
+  event: {
+    type: "response.done",
+    response: {
+      id: "route-response-done-echo-5",
+      metadata: { voice_relay_kind: "route_classifier" },
+      output: [{ type: "function_call" }],
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 5,
+  event: {
+    type: "response.created",
+    response: { id: "direct-response-done-echo-5", metadata: {} },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 5,
+  event: {
+    type: "response.output_audio.delta",
+    response_id: "direct-response-done-echo-5",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 5,
+  event: {
+    type: "response.done",
+    response: {
+      id: "direct-response-done-echo-5",
+      output: [{
+        type: "message",
+        phase: "final_answer",
+        content: [{
+          type: "output_audio",
+          transcript: "안녕",
+        }],
+      }],
+    },
+  },
+});
+const responseDoneEchoStart = nativeMessages.length;
+runtime.receiveRealtimeEvent({
+  generation: 5,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    transcript: "안녕",
+  },
+});
+const responseDoneEchoMessages =
+  nativeMessages.slice(responseDoneEchoStart);
+assert.equal(
+  responseDoneEchoMessages
+    .filter(message => message.type === "playbackResume").length,
+  1,
+  "response.done text must suppress playback echo when transcript events are absent",
+);
+assert.equal(
+  responseDoneEchoMessages
+    .filter(message => message.type === "playbackInterrupt").length,
+  0,
+  "response.done playback echo must not interrupt its own response",
+);
+assert.equal(
+  responseDoneEchoMessages
+    .filter(message => message.type === "realtimeSend")
+    .map(message => JSON.parse(message.eventJSON))
+    .filter(event =>
+      event.type === "response.create"
+      && event.response?.metadata?.voice_relay_kind === "route_classifier"
+    ).length,
+  0,
+  "response.done playback echo must not create a duplicate routed turn",
+);
+
+const messagesBeforeVariedHandoff = nativeMessages.length;
+runtime.start({
+  generation: 6,
+  language: "ko-KR",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Relay",
+  wakePhrases: ["릴레이야"],
+  shouldGreet: false,
+});
+runtime.transportOpened({ generation: 6 });
+runtime.transportReady({ generation: 6 });
+runtime.receiveRealtimeEvent({
+  generation: 6,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    transcript: "오늘 일정 확인해줘",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 6,
+  event: {
+    type: "response.created",
+    response: {
+      id: "route-handoff-5",
+      metadata: { voice_relay_kind: "route_classifier" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 6,
+  event: {
+    type: "response.function_call_arguments.done",
+    name: "route_voice_turn",
     call_id: "route-handoff-call-5",
     arguments: JSON.stringify({ kind: "codex" }),
   },
 });
 runtime.receiveRealtimeEvent({
-  generation: 5,
+  generation: 6,
   event: {
     type: "response.done",
     response: {
@@ -742,6 +894,274 @@ assert.match(
   variedHandoffRequest?.response?.instructions || "",
   /진행 멘트/,
   "a later handoff prompt must exclude the recently spoken acknowledgement",
+);
+
+const wakeAcknowledgementStart = nativeMessages.length;
+runtime.start({
+  generation: 7,
+  language: "ko-KR",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Relay",
+  wakePhrases: ["릴레이야"],
+  shouldGreet: true,
+});
+runtime.transportOpened({ generation: 7 });
+runtime.transportReady({ generation: 7 });
+const wakeAcknowledgement = nativeMessages
+  .slice(wakeAcknowledgementStart)
+  .filter(message => message.type === "realtimeSend")
+  .map(message => JSON.parse(message.eventJSON))
+  .find(event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind
+      === "wake_acknowledgement"
+  );
+assert.ok(
+  wakeAcknowledgement,
+  "a wake-only activation must create one Realtime acknowledgement",
+);
+assert.match(
+  wakeAcknowledgement.response.instructions,
+  /fresh wording freely instead of using a fixed stock phrase/,
+  "wake acknowledgement wording must not be fixed",
+);
+
+const earlyBargeInStart = nativeMessages.length;
+runtime.start({
+  generation: 8,
+  language: "ko-KR",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Relay",
+  wakePhrases: ["릴레이야"],
+  shouldGreet: true,
+});
+runtime.transportOpened({ generation: 8 });
+runtime.transportReady({ generation: 8 });
+runtime.receiveRealtimeEvent({
+  generation: 8,
+  event: {
+    type: "response.created",
+    response: {
+      id: "wake-ack-before-audio",
+      metadata: { voice_relay_kind: "wake_acknowledgement" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 8,
+  event: { type: "input_audio_buffer.speech_started" },
+});
+runtime.receiveRealtimeEvent({
+  generation: 8,
+  event: { type: "input_audio_buffer.speech_started" },
+});
+const earlyBargeInEvents = nativeMessages
+  .slice(earlyBargeInStart)
+  .filter(message => message.type === "realtimeSend")
+  .map(message => JSON.parse(message.eventJSON));
+assert.equal(
+  earlyBargeInEvents.filter(event =>
+    event.type === "response.cancel"
+      && event.response_id === "wake-ack-before-audio"
+  ).length,
+  1,
+  "admitted speech must cancel a still-generating response exactly once before its first audio delta",
+);
+
+const replayedTurnStart = nativeMessages.length;
+runtime.start({
+  generation: 9,
+  language: "en-US",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Aria",
+  wakePhrases: ["Hey Aria"],
+  shouldGreet: false,
+});
+runtime.transportOpened({ generation: 9 });
+runtime.transportReady({ generation: 9 });
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "weather-user-item-1",
+    transcript: "Can you check the weather near my home now?",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "response.created",
+    response: {
+      id: "weather-route-1",
+      metadata: { voice_relay_kind: "route_classifier" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "response.function_call_arguments.done",
+    name: "route_voice_turn",
+    call_id: "weather-route-call-1",
+    arguments: JSON.stringify({ kind: "codex" }),
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "response.done",
+    response: {
+      id: "weather-route-1",
+      metadata: { voice_relay_kind: "route_classifier" },
+      output: [{ type: "function_call" }],
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "weather-user-item-before-playback",
+    transcript: "Can you check the weather near my home now?",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "response.created",
+    response: {
+      id: "weather-progress-speech-1",
+      metadata: { voice_relay_kind: "codex_progress" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "response.output_audio.delta",
+    response_id: "weather-progress-speech-1",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "response.output_audio_transcript.done",
+    response_id: "weather-progress-speech-1",
+    transcript: "I’ll check that.",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "response.done",
+    response: {
+      id: "weather-progress-speech-1",
+      status: "completed",
+      metadata: { voice_relay_kind: "codex_progress" },
+      output: [],
+    },
+  },
+});
+runtime.playbackDrained({
+  generation: 9,
+  responseId: "weather-progress-speech-1",
+});
+runtime.resolveCodex({
+  generation: 9,
+  callId: "weather-route-call-1",
+  output: "It is clear and 19 degrees.",
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "response.created",
+    response: {
+      id: "weather-final-speech-1",
+      metadata: { voice_relay_kind: "codex_final" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "response.output_audio.delta",
+    response_id: "weather-final-speech-1",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "weather-user-item-2",
+    transcript: "Can you check the weather near my home now?",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "weather-user-item-1",
+    transcript: "Can you check the weather near my home now?",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "response.output_audio_transcript.done",
+    response_id: "weather-final-speech-1",
+    transcript: "It is clear and 19 degrees.",
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "response.done",
+    response: {
+      id: "weather-final-speech-1",
+      status: "completed",
+      metadata: { voice_relay_kind: "codex_final" },
+      output: [],
+    },
+  },
+});
+runtime.playbackDrained({
+  generation: 9,
+  responseId: "weather-final-speech-1",
+});
+runtime.receiveRealtimeEvent({
+  generation: 9,
+  event: {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "weather-user-item-after-playback",
+    transcript: "Can you check the weather near my home now?",
+  },
+});
+const replayedTurnMessages = nativeMessages.slice(replayedTurnStart);
+assert.equal(
+  replayedTurnMessages.filter(message =>
+    message.type === "diagnostic"
+    && message.stage === "replayed_user_turn_suppressed"
+  ).length,
+  3,
+  "an accepted request retranscribed during work, playback, or the post-answer echo tail must be suppressed even under a new item id",
+);
+assert.equal(
+  replayedTurnMessages.filter(message =>
+    message.type === "diagnostic"
+    && message.stage === "duplicate_user_audio_item_suppressed"
+  ).length,
+  1,
+  "a completed Realtime audio item must be handled exactly once",
+);
+assert.equal(
+  replayedTurnMessages.filter(message =>
+    message.type === "codexRequest"
+  ).length,
+  1,
+  "looped or repeated transcription events must not create a second Codex request",
 );
 
 console.log("Realtime response queue tests passed");

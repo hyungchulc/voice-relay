@@ -40,6 +40,36 @@ struct PolicyTests {
     }
 
     static func main() {
+        var recoveryPolicy = AudioConfigurationRecoveryPolicy(
+            quietWindow: 0.45
+        )
+        let startupChange = recoveryPolicy.registerChange(
+            now: 10.0,
+            recoveryNotBefore: 12.0
+        )
+        expect(
+            startupChange.delay == 2.0,
+            "audio startup recovery must wait for the settling barrier"
+        )
+        let laterChange = recoveryPolicy.registerChange(
+            now: 11.8,
+            recoveryNotBefore: 12.0
+        )
+        expect(
+            laterChange.delay == 0.45,
+            "the latest audio change must restart the trailing-edge quiet window"
+        )
+        expect(
+            !recoveryPolicy.isCurrent(token: startupChange.token)
+                && recoveryPolicy.isCurrent(token: laterChange.token),
+            "only the newest audio configuration change may trigger recovery"
+        )
+        recoveryPolicy.invalidate()
+        expect(
+            !recoveryPolicy.isCurrent(token: laterChange.token),
+            "teardown must invalidate pending audio recovery work"
+        )
+
         let echoReference = (0..<4_800).map { index in
             Float(sin(Double(index) * 2 * .pi * 440 / 24_000)) * 0.20
         }
@@ -84,26 +114,170 @@ struct PolicyTests {
         let humanOverlay = zip(
             echoedInput,
             (0..<echoedInput.count).map { index in
-                Float(sin(Double(index) * 2 * .pi * 173 / 24_000)) * 0.16
+                Float(sin(Double(index) * 2 * .pi * 173 / 24_000)) * 0.08
             }
         ).map { $0 + $1 }
-        let admittedBargeIn = bargeInAdmission.filterCapture(
+        let pendingBargeIn = bargeInAdmission.filterCapture(
             humanOverlay,
             startTime: 20.08,
             playbackActive: true
         )
         expect(
-            !admittedBargeIn.samples.isEmpty
-                && admittedBargeIn.classification != .echoOnly,
-            "human speech over assistant playback must remain in capture"
+            !pendingBargeIn.samples.isEmpty
+                && pendingBargeIn.classification == .uncertainSpeech
+                && !bargeInAdmission.shouldForwardServerEvent(
+                    type: "input_audio_buffer.speech_started",
+                    playbackActive: true,
+                    now: 20.09
+                ),
+            "one residual chunk over playback must pause before authorizing barge-in"
+        )
+        let pausedBargeIn = bargeInAdmission.filterCapture(
+            humanOverlay,
+            startTime: 20.12,
+            playbackActive: true,
+            playbackProvisionallyPaused: true
+        )
+        expect(
+            pausedBargeIn.classification == .uncertainSpeech,
+            "barge-in confirmation must start after playback actually pauses"
+        )
+        let decayedBargeIn = bargeInAdmission.filterCapture(
+            humanOverlay,
+            startTime: 20.30,
+            playbackActive: true,
+            playbackProvisionallyPaused: true
+        )
+        expect(
+            decayedBargeIn.classification == .uncertainSpeech,
+            "speaker echo decay time must not count as confirmed human speech"
+        )
+        let admittedBargeIn = bargeInAdmission.filterCapture(
+            humanOverlay,
+            startTime: 20.62,
+            playbackActive: true,
+            playbackProvisionallyPaused: true
+        )
+        expect(
+            admittedBargeIn.classification == .residualSpeech,
+            "speech must be admitted only after it continues through the confirmation window"
+        )
+        expect(
+            !bargeInAdmission.shouldForwardServerEvent(
+                type: "conversation.item.input_audio_transcription.completed",
+                playbackActive: true,
+                now: 20.63
+            ),
+            "the server turn rejected before local confirmation must stay quarantined through completion"
         )
         expect(
             bargeInAdmission.shouldForwardServerEvent(
                 type: "input_audio_buffer.speech_started",
                 playbackActive: true,
-                now: 20.09
-            ),
-            "locally admitted residual speech must preserve barge-in"
+                now: 20.64
+            )
+                && bargeInAdmission.shouldForwardServerEvent(
+                    type: "conversation.item.input_audio_transcription.completed",
+                    playbackActive: true,
+                    now: 20.65
+                ),
+            "confirmed speech must be admitted as a fresh server turn"
+        )
+
+        var uncertainAdmission = RealtimeEchoAdmissionPolicy()
+        uncertainAdmission.appendPlaybackReference(
+            echoReference,
+            startTime: 25
+        )
+        uncertainAdmission.markPlaybackActive(at: 25)
+        let decorrelatedSpeech = (0..<960).map { index in
+            Float(sin(Double(index) * 2 * .pi * 173 / 24_000)) * 0.18
+        }
+        let uncertainFirst = uncertainAdmission.filterCapture(
+            decorrelatedSpeech,
+            startTime: 25.08,
+            playbackActive: true
+        )
+        expect(
+            uncertainFirst.classification == .uncertainSpeech
+                && !uncertainAdmission.shouldForwardServerEvent(
+                    type: "input_audio_buffer.speech_started",
+                    playbackActive: true,
+                    now: 25.09
+                ),
+            "one loud decorrelated playback-window chunk must not self-authorize barge-in"
+        )
+        var missingReferenceAdmission = RealtimeEchoAdmissionPolicy()
+        missingReferenceAdmission.markPlaybackActive(at: 26)
+        let missingReferenceNoise = missingReferenceAdmission.filterCapture(
+            [Float](repeating: 0.001, count: 960),
+            startTime: 26.04,
+            playbackActive: true
+        )
+        expect(
+            missingReferenceNoise.classification == .echoOnly
+                && missingReferenceNoise.samples.isEmpty,
+            "a playback window without a usable reference must fail closed for low-level audio"
+        )
+        let missingReferenceSpeech =
+            missingReferenceAdmission.filterCapture(
+                decorrelatedSpeech,
+                startTime: 26.08,
+                playbackActive: true
+            )
+        expect(
+            missingReferenceSpeech.classification == .uncertainSpeech,
+            "loud audio without a playback reference must still require sustained human confirmation"
+        )
+        let pausedSpeech = uncertainAdmission.filterCapture(
+            decorrelatedSpeech,
+            startTime: 25.12,
+            playbackActive: true,
+            playbackProvisionallyPaused: true
+        )
+        expect(
+            pausedSpeech.classification == .uncertainSpeech,
+            "pre-pause echo time must not count toward human speech confirmation"
+        )
+        let decayedSpeech = uncertainAdmission.filterCapture(
+            decorrelatedSpeech,
+            startTime: 25.30,
+            playbackActive: true,
+            playbackProvisionallyPaused: true
+        )
+        expect(
+            decayedSpeech.classification == .uncertainSpeech,
+            "post-pause echo decay must finish before human confirmation starts"
+        )
+        let confirmedSpeech = uncertainAdmission.filterCapture(
+            decorrelatedSpeech,
+            startTime: 25.62,
+            playbackActive: true,
+            playbackProvisionallyPaused: true
+        )
+        expect(
+            confirmedSpeech.classification == .residualSpeech
+                && uncertainAdmission.shouldForwardServerEvent(
+                    type: "input_audio_buffer.speech_started",
+                    playbackActive: true,
+                    now: 25.63
+                ),
+            "speech that continues after provisional playback pause must preserve human barge-in"
+        )
+        var playbackTailAdmission = RealtimeEchoAdmissionPolicy()
+        playbackTailAdmission.appendPlaybackReference(
+            echoReference,
+            startTime: 27
+        )
+        playbackTailAdmission.markPlaybackEnded(at: 27.2)
+        let playbackTailEcho = playbackTailAdmission.filterCapture(
+            Array(echoReference.prefix(960)),
+            startTime: 27.3,
+            playbackActive: false
+        )
+        expect(
+            playbackTailEcho.classification == .echoOnly,
+            "assistant audio that reaches the microphone after playback drains must stay inside the echo guard"
         )
         bargeInAdmission.reset()
         expect(
@@ -943,11 +1117,11 @@ struct PolicyTests {
             WakePhraseCapturePolicy.activationDelay(
                 for: wakeOnlyMatch,
                 isFinal: false
-            ) > WakePhraseCapturePolicy.activationDelay(
+            ) < WakePhraseCapturePolicy.activationDelay(
                 for: wakeCommandMatch,
                 isFinal: false
             ),
-            "a name-only partial must wait longer for a possible command tail"
+            "a name-only wake should acknowledge quickly while a command tail waits for a stable transcript"
         )
         expect(
             WakePhraseCapturePolicy.activationDelay(
@@ -1313,6 +1487,17 @@ struct PolicyTests {
             ) == .korean,
             "an explicit Korean UI override must win over the System language"
         )
+        let englishSystemCopy = AppCopy(
+            preference: AppDisplayLanguage.system.rawValue,
+            preferredLanguages: ["en-US", "ko-KR"]
+        )
+        expect(
+            englishSystemCopy.text(
+                "I couldn't complete that request. Please try again.",
+                "그 요청만 처리하지 못했어. 다시 말해줘"
+            ) == "I couldn't complete that request. Please try again.",
+            "turn failures must follow the current System display language"
+        )
         expect(
             ManualPairingCode.normalized("PB4F-9BR9") == "PB4F-9BR9"
                 && ManualPairingCode.normalized("pb4f9br9") == "PB4F-9BR9"
@@ -1474,6 +1659,7 @@ struct PolicyTests {
         explicitSettings.realtimeInstructions = "Use a short custom greeting."
         explicitSettings.productName = "  Orbit  "
         explicitSettings.assistantName = "  Nova  "
+        explicitSettings.userDisplayName = "  John  "
         explicitSettings.appDisplayLanguage = "ko"
         explicitSettings.appearanceMode = "dark"
         try! isolatedStore.save(explicitSettings)
@@ -1481,9 +1667,10 @@ struct PolicyTests {
         expect(
             savedVoiceSettings.productName == "Orbit"
                 && savedVoiceSettings.assistantName == "Nova"
+                && savedVoiceSettings.userDisplayName == "John"
                 && savedVoiceSettings.appDisplayLanguage == "ko"
                 && savedVoiceSettings.appearanceMode == "dark",
-            "product, assistant, UI language, and appearance settings must round-trip"
+            "product, user, assistant, UI language, and appearance settings must round-trip"
         )
         expect(
             savedVoiceSettings.wakePhrases == ["Computer", "A+B"],

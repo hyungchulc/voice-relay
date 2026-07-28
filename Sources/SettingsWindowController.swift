@@ -178,6 +178,7 @@ final class SettingsWindowController:
     private let threadIDControl = NSTextField()
     private let productNameControl = NSTextField()
     private let assistantNameControl = NSTextField()
+    private let userDisplayNameControl = NSTextField()
     private let appLanguageControl = NSPopUpButton()
     private let appearanceControl = NSPopUpButton()
     private let surfaceControl = NSPopUpButton()
@@ -377,6 +378,8 @@ final class SettingsWindowController:
 
         productNameControl.placeholderString = "Voice Relay"
         assistantNameControl.placeholderString = "Relay"
+        userDisplayNameControl.placeholderString =
+            localizedCopy.text("Me", "나")
         threadIDControl.placeholderString =
             "00000000-0000-0000-0000-000000000000"
         threadIDControl.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -486,6 +489,10 @@ final class SettingsWindowController:
                 "어시스턴트 이름과 이 Mac에 맞는 표시 방식을 설정합니다."
             ),
             views: [
+                settingsRow(
+                    localizedCopy.text("Your display name", "내 표시 이름"),
+                    userDisplayNameControl
+                ),
                 settingsRow(
                     localizedCopy.text("Assistant name", "어시스턴트 이름"),
                     assistantNameControl
@@ -1056,6 +1063,7 @@ final class SettingsWindowController:
         threadIDControl.isSelectable = true
         productNameControl.placeholderString = "Voice Relay"
         assistantNameControl.placeholderString = "Relay"
+        userDisplayNameControl.placeholderString = "나"
 
         let connectionCard = card(
             icon: "link",
@@ -1063,6 +1071,7 @@ final class SettingsWindowController:
             subtitle: "Codex/ChatGPT 앱과 Voice 상태",
             views: [
                 settingsRow("앱 이름", productNameControl),
+                settingsRow("내 표시 이름", userDisplayNameControl),
                 settingsRow("어시스턴트 이름", assistantNameControl),
                 note("배포 이름과 Voice가 자신을 소개할 이름을 각각 변경할 수 있습니다."),
                 divider(),
@@ -1252,6 +1261,7 @@ final class SettingsWindowController:
             "00000000-0000-0000-0000-000000000000"
         productNameControl.stringValue = settings.productName
         assistantNameControl.stringValue = settings.assistantName
+        userDisplayNameControl.stringValue = settings.userDisplayName
         selectAppLanguage(settings.appDisplayLanguage)
         selectAppearance(settings.appearanceMode)
         for item in surfaceControl.itemArray
@@ -1679,6 +1689,10 @@ final class SettingsWindowController:
         settings.assistantName = SettingsStore.normalizedDisplayName(
             assistantNameControl.stringValue,
             fallback: AppSettings.defaults.assistantName
+        )
+        settings.userDisplayName = SettingsStore.normalizedDisplayName(
+            userDisplayNameControl.stringValue,
+            fallback: AppSettings.defaults.userDisplayName
         )
         settings.appDisplayLanguage =
             appLanguageControl.selectedItem?.representedObject as? String

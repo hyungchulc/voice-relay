@@ -56,7 +56,7 @@ for arch in $ARCHS; do
   arch_binary="$BUILD_DIR/VoiceRelay-$arch"
   xcrun swiftc \
     -parse-as-library \
-    -target "$arch-apple-macos13.0" \
+    -target "$arch-apple-macos14.0" \
     "${SOURCES[@]}" \
     -o "$arch_binary" \
     -framework Cocoa \
@@ -80,7 +80,7 @@ fi
 HOST_ARCH="$(uname -m)"
 xcrun swiftc \
   -parse-as-library \
-  -target "$HOST_ARCH-apple-macos13.0" \
+  -target "$HOST_ARCH-apple-macos14.0" \
   "$ROOT/Sources/AppLocalization.swift" \
   "$ROOT/Sources/AuthorityPackComposer.swift" \
   "$ROOT/Sources/CodexAppRemoteClient.swift" \

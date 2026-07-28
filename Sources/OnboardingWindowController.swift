@@ -67,9 +67,11 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     private let pairingCodeControl = NSTextField()
     private let sessionIDControl = NSTextField()
     private let agentNameControl = NSTextField()
+    private let userNameControl = NSTextField()
     private let wakePhrasesControl = NSTextField()
     private let appLanguageControl = NSPopUpButton()
     private let agentNameLabel = NSTextField(labelWithString: "")
+    private let userNameLabel = NSTextField(labelWithString: "")
     private let wakePhrasesLabel = NSTextField(labelWithString: "")
     private let appLanguageLabel = NSTextField(labelWithString: "")
     private let identityControls = NSStackView()
@@ -237,6 +239,14 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         agentNameControl.alignment = .center
         agentNameLabel.font = .systemFont(ofSize: 12, weight: .medium)
         agentNameLabel.textColor = .secondaryLabelColor
+        userNameControl.placeholderString = localizedCopy.text(
+            "Me",
+            "나"
+        )
+        userNameControl.stringValue = settings.userDisplayName
+        userNameControl.alignment = .center
+        userNameLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        userNameLabel.textColor = .secondaryLabelColor
         wakePhrasesControl.placeholderString = "Relay, Hey Relay"
         wakePhrasesControl.stringValue = settings.wakePhrases.joined(separator: ", ")
         wakePhrasesControl.alignment = .center
@@ -254,6 +264,8 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         identityControls.spacing = 6
         identityControls.addArrangedSubview(appLanguageLabel)
         identityControls.addArrangedSubview(appLanguageControl)
+        identityControls.addArrangedSubview(userNameLabel)
+        identityControls.addArrangedSubview(userNameControl)
         identityControls.addArrangedSubview(agentNameLabel)
         identityControls.addArrangedSubview(agentNameControl)
         identityControls.addArrangedSubview(wakePhrasesLabel)
@@ -395,6 +407,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
             identityControls.widthAnchor.constraint(equalTo: hero.widthAnchor),
             actions.widthAnchor.constraint(equalTo: hero.widthAnchor),
             appLanguageControl.widthAnchor.constraint(equalTo: identityControls.widthAnchor),
+            userNameControl.widthAnchor.constraint(equalTo: identityControls.widthAnchor),
             agentNameControl.widthAnchor.constraint(equalTo: identityControls.widthAnchor),
             wakePhrasesControl.widthAnchor.constraint(equalTo: identityControls.widthAnchor),
             statusLabel.widthAnchor.constraint(equalTo: hero.widthAnchor),
@@ -649,6 +662,11 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
             "Assistant name",
             "어시스턴트 이름"
         )
+        userNameLabel.stringValue = localizedCopy.text(
+            "Your display name",
+            "내 표시 이름"
+        )
+        userNameControl.placeholderString = localizedCopy.text("Me", "나")
         wakePhrasesLabel.stringValue = localizedCopy.text(
             "Wake phrases",
             "웨이크워드"
@@ -1033,6 +1051,10 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
             return false
         }
         settings.assistantName = assistantName
+        settings.userDisplayName = SettingsStore.normalizedDisplayName(
+            userNameControl.stringValue,
+            fallback: ""
+        )
         settings.wakePhrases = wakePhrases
         agentNameControl.stringValue = assistantName
         wakePhrasesControl.stringValue = wakePhrases.joined(separator: ", ")

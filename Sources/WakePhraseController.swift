@@ -7,6 +7,7 @@ import Speech
 private struct WakeCaptureCandidate: Equatable {
     let match: WakePhraseMatch
     let isFinal: Bool
+    let laneIndex: Int
 }
 
 final class WakePhraseController {
@@ -369,7 +370,8 @@ final class WakePhraseController {
         ) {
             wakeCandidates[laneIndex] = WakeCaptureCandidate(
                 match: match,
-                isFinal: isFinal
+                isFinal: isFinal,
+                laneIndex: laneIndex
             )
         } else {
             wakeCandidates.removeValue(forKey: laneIndex)
@@ -399,10 +401,12 @@ final class WakePhraseController {
             }
             self.wantsMonitoring = false
             Self.logger.notice(
-                "Wake matched lane=\(laneIndex) phrase_count=\(self.phrases.count) final=\(candidate.isFinal) command_tail=\(!candidate.match.command.isEmpty)"
+                "Wake matched lane=\(candidate.laneIndex) phrase_count=\(self.phrases.count) final=\(candidate.isFinal) command_tail=\(!candidate.match.command.isEmpty) command_length=\(candidate.match.command.count)"
             )
-            self.stopRecognition()
-            self.onWake?(candidate.match)
+            self.stopRecognition { [weak self] in
+                guard let self, !self.wantsMonitoring else { return }
+                self.onWake?(candidate.match)
+            }
         }
         pendingWakeWorkItem = item
         DispatchQueue.main.asyncAfter(
@@ -415,7 +419,7 @@ final class WakePhraseController {
         return true
     }
 
-    private func stopRecognition() {
+    private func stopRecognition(completion: (() -> Void)? = nil) {
         restartWorkItem?.cancel()
         restartWorkItem = nil
         pendingWakeWorkItem?.cancel()
@@ -424,24 +428,36 @@ final class WakePhraseController {
         wakeCandidates.removeAll()
         modernStartTask?.cancel()
         modernStartTask = nil
-        if #available(macOS 26.0, *),
-           let modernSession = modernSession as? SpeechAnalyzerWakeSession {
-            modernSession.stop()
+        recognitionGeneration += 1
+        let completionGeneration = recognitionGeneration
+        let finish = { [weak self] in
+            guard let self,
+                  self.recognitionGeneration == completionGeneration else {
+                return
+            }
+            completion?()
         }
-        modernSession = nil
-        if audioEngine.isRunning {
-            audioEngine.stop()
-        }
-        audioEngine.inputNode.removeTap(onBus: 0)
         requests.forEach { $0.endAudio() }
         tasks.forEach { $0.cancel() }
         requests.removeAll()
         tasks.removeAll()
         completedLaneIndexes.removeAll()
-        recognitionGeneration += 1
         if isMonitoring {
             isMonitoring = false
             onState?(false)
+        }
+        if #available(macOS 26.0, *),
+           let modernWakeSession =
+            modernSession as? SpeechAnalyzerWakeSession {
+            modernSession = nil
+            modernWakeSession.stop(completion: finish)
+        } else {
+            modernSession = nil
+            if audioEngine.isRunning {
+                audioEngine.stop()
+            }
+            audioEngine.inputNode.removeTap(onBus: 0)
+            finish()
         }
     }
 
@@ -472,12 +488,15 @@ private final class SpeechAnalyzerWakeSession {
     private let onFailure: (Error) -> Void
     private let audioEngine = AVAudioEngine()
     private let stateLock = NSLock()
+    private let lifecycleLock = NSLock()
     private var analyzer: SpeechAnalyzer?
     private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
     private var analysisTask: Task<Void, Never>?
     private var resultTasks: [Task<Void, Never>] = []
     private var reservedLocales: [Locale] = []
     private var stopped = false
+    private var stopCompleted = false
+    private var stopCompletions: [() -> Void] = []
     private var failureReported = false
 
     init(
@@ -561,9 +580,7 @@ private final class SpeechAnalyzerWakeSession {
                     AsyncStream<AnalyzerInput>.makeStream(
                         bufferingPolicy: .bufferingNewest(64)
                     )
-                self.analyzer = analyzer
-                inputContinuation = continuation
-                resultTasks = transcribers.enumerated().map {
+                let analyzerResultTasks = transcribers.enumerated().map {
                     laneIndex, transcriber in
                     Task { [weak self] in
                         var segments: [ModernTranscriptSegment] = []
@@ -609,54 +626,74 @@ private final class SpeechAnalyzerWakeSession {
                     }
                 }
 
-                let inputNode = audioEngine.inputNode
-                inputNode.removeTap(onBus: 0)
-                inputNode.installTap(
-                    onBus: 0,
-                    bufferSize: 1024,
-                    format: nil
-                ) { [weak self] buffer, _ in
-                    guard let self else { return }
-                    let analyzerBuffer: AVAudioPCMBuffer
-                    let resolvedConverter: AVAudioConverter?
-                    if buffer.format.isEqual(analysisFormat) {
-                        resolvedConverter = nil
-                    } else if buffer.format.isEqual(naturalFormat) {
-                        resolvedConverter = converter
-                    } else {
-                        resolvedConverter = AVAudioConverter(
-                            from: buffer.format,
-                            to: analysisFormat
+                let didStart = try self.lifecycleLock.withLock {
+                    let ownsLifecycle = self.stateLock.withLock {
+                        guard !self.stopped else { return false }
+                        self.analyzer = analyzer
+                        self.inputContinuation = continuation
+                        self.resultTasks = analyzerResultTasks
+                        return true
+                    }
+                    guard ownsLifecycle else { return false }
+
+                    let inputNode = self.audioEngine.inputNode
+                    inputNode.removeTap(onBus: 0)
+                    inputNode.installTap(
+                        onBus: 0,
+                        bufferSize: 1024,
+                        format: nil
+                    ) { [weak self] buffer, _ in
+                        guard let self else { return }
+                        let analyzerBuffer: AVAudioPCMBuffer
+                        let resolvedConverter: AVAudioConverter?
+                        if buffer.format.isEqual(analysisFormat) {
+                            resolvedConverter = nil
+                        } else if buffer.format.isEqual(naturalFormat) {
+                            resolvedConverter = converter
+                        } else {
+                            resolvedConverter = AVAudioConverter(
+                                from: buffer.format,
+                                to: analysisFormat
+                            )
+                        }
+                        if let resolvedConverter {
+                            guard let converted = Self.convert(
+                                buffer,
+                                using: resolvedConverter,
+                                to: analysisFormat
+                            ) else {
+                                self.reportFailure(
+                                    WakeRecognitionError.audioConversionFailed
+                                )
+                                return
+                            }
+                            analyzerBuffer = converted
+                        } else {
+                            analyzerBuffer = buffer
+                        }
+                        self.inputContinuation?.yield(
+                            AnalyzerInput(buffer: analyzerBuffer)
                         )
                     }
-                    if let resolvedConverter {
-                        guard let converted = Self.convert(
-                            buffer,
-                            using: resolvedConverter,
-                            to: analysisFormat
-                        ) else {
-                            self.reportFailure(
-                                WakeRecognitionError.audioConversionFailed
+                    startupStage = .audioEngineStart
+                    self.audioEngine.prepare()
+                    try self.audioEngine.start()
+                    self.analysisTask = Task { [weak self] in
+                        do {
+                            try await analyzer.start(
+                                inputSequence: inputStream
                             )
-                            return
+                        } catch {
+                            self?.reportFailure(error)
                         }
-                        analyzerBuffer = converted
-                    } else {
-                        analyzerBuffer = buffer
                     }
-                    self.inputContinuation?.yield(
-                        AnalyzerInput(buffer: analyzerBuffer)
-                    )
+                    return true
                 }
-                startupStage = .audioEngineStart
-                audioEngine.prepare()
-                try audioEngine.start()
-                analysisTask = Task { [weak self] in
-                    do {
-                        try await analyzer.start(inputSequence: inputStream)
-                    } catch {
-                        self?.reportFailure(error)
-                    }
+                guard didStart else {
+                    continuation.finish()
+                    analyzerResultTasks.forEach { $0.cancel() }
+                    await analyzer.cancelAndFinishNow()
+                    return
                 }
                 completion(.success(()))
             } catch {
@@ -690,43 +727,62 @@ private final class SpeechAnalyzerWakeSession {
             && CMTimeCompare(rhs.start, lhsEnd) < 0
     }
 
-    func stop() {
+    func stop(completion: @escaping () -> Void = {}) {
         stateLock.lock()
+        if stopCompleted {
+            stateLock.unlock()
+            DispatchQueue.main.async(execute: completion)
+            return
+        }
+        stopCompletions.append(completion)
         if stopped {
             stateLock.unlock()
             return
         }
         stopped = true
-        stateLock.unlock()
-
-        inputContinuation?.finish()
-        inputContinuation = nil
-        analysisTask?.cancel()
-        analysisTask = nil
-        resultTasks.forEach { $0.cancel() }
-        resultTasks.removeAll()
-        if audioEngine.isRunning {
-            audioEngine.stop()
-        }
-        audioEngine.inputNode.removeTap(onBus: 0)
-        if let analyzer {
-            Task {
-                await analyzer.cancelAndFinishNow()
-            }
-        }
+        let analyzerToCancel = analyzer
         analyzer = nil
-        stateLock.lock()
         let localesToRelease = reservedLocales
         reservedLocales.removeAll()
         stateLock.unlock()
-        if !localesToRelease.isEmpty {
-            Task {
-                for locale in localesToRelease {
-                    _ = await AssetInventory.release(
-                        reservedLocale: locale
-                    )
-                }
+
+        lifecycleLock.withLock {
+            inputContinuation?.finish()
+            inputContinuation = nil
+            analysisTask?.cancel()
+            analysisTask = nil
+            resultTasks.forEach { $0.cancel() }
+            resultTasks.removeAll()
+            if audioEngine.isRunning {
+                audioEngine.stop()
             }
+            audioEngine.inputNode.removeTap(onBus: 0)
+        }
+        Task { [self] in
+            if let analyzerToCancel {
+                await analyzerToCancel.cancelAndFinishNow()
+            }
+            for locale in localesToRelease {
+                _ = await AssetInventory.release(
+                    reservedLocale: locale
+                )
+            }
+            finishStop()
+        }
+    }
+
+    private func finishStop() {
+        stateLock.lock()
+        guard !stopCompleted else {
+            stateLock.unlock()
+            return
+        }
+        stopCompleted = true
+        let completions = stopCompletions
+        stopCompletions.removeAll()
+        stateLock.unlock()
+        DispatchQueue.main.async {
+            completions.forEach { $0() }
         }
     }
 

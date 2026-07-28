@@ -42,8 +42,8 @@ identity-less artifact cannot be uploaded accidentally:
 
 ```bash
 VOICE_RELAY_SIGNING_IDENTITY="Apple Development: Example Person (TEAMID)" \
-VOICE_RELAY_SOURCE_URL="https://github.com/example/voice-relay/archive/refs/tags/v0.4.0-alpha.3.tar.gz" \
-VOICE_RELAY_RELEASE_LABEL="0.4.0-alpha.3" \
+VOICE_RELAY_SOURCE_URL="https://github.com/example/voice-relay/archive/refs/tags/v0.4.0-alpha.4.tar.gz" \
+VOICE_RELAY_RELEASE_LABEL="0.4.0-alpha.4" \
 ./package-alpha-dmg.sh
 ```
 

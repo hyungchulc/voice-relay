@@ -4,6 +4,7 @@ import Foundation
 struct AppSettings: Equatable {
     var productName: String
     var assistantName: String
+    var userDisplayName: String
     var appDisplayLanguage: String
     var appearanceMode: String
     var overlayAnchor: OverlayAnchor
@@ -61,6 +62,7 @@ struct AppSettings: Equatable {
         return AppSettings(
             productName: "Voice Relay",
             assistantName: "Relay",
+            userDisplayName: "",
             appDisplayLanguage: AppDisplayLanguage.system.rawValue,
             appearanceMode: AppAppearanceMode.system.rawValue,
             overlayAnchor: .automatic,
@@ -223,6 +225,7 @@ final class SettingsStore {
             "voiceRelay.codex.appConnection.completed"
         static let productName = "voiceRelay.identity.productName"
         static let assistantName = "voiceRelay.identity.assistantName"
+        static let userDisplayName = "voiceRelay.identity.userDisplayName"
         static let appDisplayLanguage = "voiceRelay.appearance.language"
         static let appearanceMode = "voiceRelay.appearance.mode"
         static let overlayAnchor = "voiceRelay.surface.anchor"
@@ -317,6 +320,11 @@ final class SettingsStore {
             assistantName: Self.normalizedDisplayName(
                 defaults.string(forKey: Key.assistantName) ?? fallback.assistantName,
                 fallback: fallback.assistantName
+            ),
+            userDisplayName: Self.normalizedDisplayName(
+                defaults.string(forKey: Key.userDisplayName)
+                    ?? fallback.userDisplayName,
+                fallback: fallback.userDisplayName
             ),
             appDisplayLanguage: AppDisplayLanguage.parse(
                 defaults.string(forKey: Key.appDisplayLanguage)
@@ -535,6 +543,13 @@ final class SettingsStore {
                 fallback: AppSettings.defaults.assistantName
             ),
             forKey: Key.assistantName
+        )
+        defaults.set(
+            Self.normalizedDisplayName(
+                settings.userDisplayName,
+                fallback: AppSettings.defaults.userDisplayName
+            ),
+            forKey: Key.userDisplayName
         )
         defaults.set(
             AppDisplayLanguage.parse(settings.appDisplayLanguage).rawValue,

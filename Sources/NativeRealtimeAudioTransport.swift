@@ -78,10 +78,20 @@ final class NativeRealtimeAudioTransport: NSObject {
     private var audioRecoveryStableWorkItem: DispatchWorkItem?
     private var audioRecoveryAttempts = 0
     private let maximumAudioRecoveryAttempts = 3
+    private var audioConfigurationRecoveryPolicy =
+        AudioConfigurationRecoveryPolicy()
+    private var audioConfigurationRecoveryNotBefore: TimeInterval = 0
+    private let audioConfigurationStartupGrace: TimeInterval = 2.0
+    private var audioRecoveryStableCapturedBaseline = 0
+    private var audioRecoveryStableRenderedBaseline = 0
     private var captureSlotsInUse = 0
     private let maximumCaptureSlots = 8
     private var pendingPCM = Data()
+    private var pendingBargeInPCM = Data()
     private let inputChunkFrames = 720
+    private let maximumBargeInPrerollBytes =
+        Int(RealtimeEchoAdmissionPolicy.sampleRate * 0.65)
+            * MemoryLayout<Int16>.size
 
     private var queuedPlaybackFrames = 0
     private let maximumQueuedPlaybackFrames = 24_000 * 120
@@ -90,6 +100,7 @@ final class NativeRealtimeAudioTransport: NSObject {
     private var completedAudioResponseIDs: Set<String> = []
     private var drainedAudioResponseIDs: Set<String> = []
     private var discardedAudioResponseIDs: Set<String> = []
+    private var truncatableResponseIDs: Set<String> = []
     private var backpressureReportedResponseIDs: Set<String> = []
     private var playbackToken = 0
     private var provisionalPauseToken = 0
@@ -97,8 +108,11 @@ final class NativeRealtimeAudioTransport: NSObject {
     private var activePlaybackResponseID = ""
     private var activePlaybackItemID = ""
     private var activePlaybackContentIndex = 0
+    private var activePlaybackCanTruncate = false
     private var activePlaybackStartSampleTime: AVAudioFramePosition?
     private var activePlaybackStartedAt: Date?
+    private var activePlaybackScheduledFrames = 0
+    private var controlEventSequence: UInt64 = 0
     private var mediaEpoch = 0
     private var audioAdmissionPolicy = RealtimeAudioAdmissionPolicy()
     private var echoAdmissionPolicy = RealtimeEchoAdmissionPolicy()
@@ -118,10 +132,12 @@ final class NativeRealtimeAudioTransport: NSObject {
         ephemeralCredential: String
     ) {
         stateQueue.async {
-            self.stopCurrent(emitClosed: false)
-            self.activeGeneration = generation
+            if self.activeGeneration != generation {
+                self.stopCurrent(emitClosed: false)
+                self.activeGeneration = generation
+                self.resetCounters()
+            }
             self.stopping = false
-            self.resetCounters()
 
             guard !ephemeralCredential.isEmpty else {
                 self.fail(
@@ -373,16 +389,30 @@ final class NativeRealtimeAudioTransport: NSObject {
         if type == "response.created",
            let response = event["response"] as? JSONDictionary {
             let metadata = response["metadata"] as? JSONDictionary
+            let responseID = response["id"] as? String ?? ""
+            let responseKind =
+                metadata?["voice_relay_kind"] as? String ?? ""
             audioAdmissionPolicy.register(
-                responseID: response["id"] as? String ?? "",
-                responseKind: metadata?["voice_relay_kind"] as? String ?? ""
+                responseID: responseID,
+                responseKind: responseKind
             )
+            let detachedSpeechKinds: Set<String> = [
+                "codex_progress",
+                "codex_commentary",
+                "codex_steer",
+                "codex_acknowledgement",
+                "semantic_stop",
+            ]
+            if !responseID.isEmpty,
+               !detachedSpeechKinds.contains(responseKind) {
+                truncatableResponseIDs.insert(responseID)
+            }
         }
 
         let shouldForwardInputEvent =
             echoAdmissionPolicy.shouldForwardServerEvent(
                 type: type,
-                playbackActive: scheduledPlaybackBuffers > 0,
+                playbackActive: false,
                 now: ProcessInfo.processInfo.systemUptime
             )
         var completedAudioResponseID: String?
@@ -431,16 +461,15 @@ final class NativeRealtimeAudioTransport: NSObject {
             completedAudioResponseID = responseID
         } else if type == "input_audio_buffer.speech_started" {
             if shouldForwardInputEvent {
-                provisionallyPausePlaybackForBargeIn()
+                interruptPlaybackForBargeIn()
             } else {
-                emitDiagnostic("playback_echo_turn_suppressed")
+                emitDiagnostic("unadmitted_playback_turn_suppressed")
             }
         }
         if type == "response.done",
            let response = event["response"] as? JSONDictionary {
-            audioAdmissionPolicy.finish(
-                responseID: response["id"] as? String ?? ""
-            )
+            let responseID = response["id"] as? String ?? ""
+            audioAdmissionPolicy.finish(responseID: responseID)
         }
 
         if shouldForwardInputEvent {
@@ -506,6 +535,12 @@ final class NativeRealtimeAudioTransport: NSObject {
             )
         }
         voiceProcessingEnabled = true
+        input.voiceProcessingOtherAudioDuckingConfiguration =
+            AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                enableAdvancedDucking: true,
+                duckingLevel: .min
+            )
+        emitDiagnostic("audio_ducking_minimum_enabled")
         let captureFormat = input.outputFormat(forBus: 0)
         guard captureFormat.sampleRate > 0,
               captureFormat.channelCount > 0 else {
@@ -537,6 +572,9 @@ final class NativeRealtimeAudioTransport: NSObject {
         }
         audioEngine = engine
         playerNode = player
+        audioConfigurationRecoveryNotBefore =
+            ProcessInfo.processInfo.systemUptime
+                + audioConfigurationStartupGrace
         observeAudioConfigurationChanges(
             for: engine,
             generation: generation
@@ -553,6 +591,7 @@ final class NativeRealtimeAudioTransport: NSObject {
         provisionalPauseToken &+= 1
         playbackProvisionallyPaused = false
         pendingPCM.removeAll(keepingCapacity: false)
+        pendingBargeInPCM.removeAll(keepingCapacity: false)
         echoAdmissionPolicy.reset()
         removeAudioConfigurationObserver()
         playerNode?.stop()
@@ -657,28 +696,41 @@ final class NativeRealtimeAudioTransport: NSObject {
         engine: AVAudioEngine,
         generation: Int
     ) {
-        guard audioRecoveryWorkItem == nil else { return }
+        audioRecoveryWorkItem?.cancel()
+        audioRecoveryWorkItem = nil
+        audioConfigurationRecoveryPolicy.invalidate()
         audioRecoveryStableWorkItem?.cancel()
         audioRecoveryStableWorkItem = nil
         emitDiagnostic("audio_configuration_changed")
+        if scheduledPlaybackBuffers > 0 {
+            emitDiagnostic("playback_cancelled_for_audio_recovery")
+            interruptPlaybackForBargeIn()
+        }
+        let plan = audioConfigurationRecoveryPolicy.registerChange(
+            now: ProcessInfo.processInfo.systemUptime,
+            recoveryNotBefore: audioConfigurationRecoveryNotBefore
+        )
         let workItem = DispatchWorkItem { [weak self, weak engine] in
             guard let self, let engine else { return }
-            self.stateQueue.async {
-                guard self.audioRecoveryWorkItem != nil,
-                      self.audioEngine === engine,
-                      self.activeGeneration == generation,
-                      !self.stopping else {
-                    return
-                }
-                self.audioRecoveryWorkItem = nil
-                self.settleOrRebuildAudio(
-                    engine: engine,
-                    generation: generation
-                )
+            guard self.audioConfigurationRecoveryPolicy.isCurrent(
+                token: plan.token
+            ),
+            self.audioEngine === engine,
+            self.activeGeneration == generation,
+            !self.stopping else {
+                return
             }
+            self.audioRecoveryWorkItem = nil
+            self.settleOrRebuildAudio(
+                engine: engine,
+                generation: generation
+            )
         }
         audioRecoveryWorkItem = workItem
-        stateQueue.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+        stateQueue.asyncAfter(
+            deadline: .now() + plan.delay,
+            execute: workItem
+        )
     }
 
     private func settleOrRebuildAudio(
@@ -702,18 +754,95 @@ final class NativeRealtimeAudioTransport: NSObject {
             )
             return
         }
-        rebuildDefaultVoiceProcessingEngine(generation: generation)
+        audioRecoveryAttempts += 1
+        do {
+            try restartVoiceProcessingEngineInPlace(
+                engine: engine,
+                generation: generation
+            )
+            emitDiagnostic("audio_recovered_in_place")
+        } catch {
+            Self.logger.error(
+                "Realtime audio in-place recovery failed generation=\(generation) error_domain=\((error as NSError).domain, privacy: .public) error_code=\((error as NSError).code)"
+            )
+            rebuildDefaultVoiceProcessingEngine(generation: generation)
+        }
+    }
+
+    private func restartVoiceProcessingEngineInPlace(
+        engine: AVAudioEngine,
+        generation: Int
+    ) throws {
+        let input = engine.inputNode
+        guard input.isVoiceProcessingEnabled,
+              engine.outputNode.isVoiceProcessingEnabled else {
+            throw NSError(
+                domain: "VoiceRelay.NativeRealtimeAudioTransport",
+                code: 6,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Voice Processing lost its input or output binding"
+                ]
+            )
+        }
+
+        mediaEpoch &+= 1
+        input.removeTap(onBus: 0)
+        if playbackReferenceTapInstalled {
+            engine.mainMixerNode.removeTap(onBus: 0)
+            playbackReferenceTapInstalled = false
+        }
+        input.voiceProcessingOtherAudioDuckingConfiguration =
+            AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                enableAdvancedDucking: true,
+                duckingLevel: .min
+            )
+        let captureFormat = input.outputFormat(forBus: 0)
+        guard captureFormat.sampleRate > 0,
+              captureFormat.channelCount > 0 else {
+            throw NSError(
+                domain: "VoiceRelay.NativeRealtimeAudioTransport",
+                code: 7,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "The recovered microphone format is unavailable"
+                ]
+            )
+        }
+        installCaptureTap(
+            on: input,
+            format: captureFormat,
+            generation: generation
+        )
+        try installPlaybackReferenceTap(
+            on: engine.mainMixerNode,
+            generation: generation
+        )
+        engine.prepare()
+        try engine.start()
+        if scheduledPlaybackBuffers > 0,
+           !playbackProvisionallyPaused,
+           let playerNode,
+           !playerNode.isPlaying {
+            playerNode.play()
+        }
+        audioConfigurationRecoveryNotBefore =
+            ProcessInfo.processInfo.systemUptime
+                + audioConfigurationStartupGrace
+        scheduleAudioRecoveryStableReset(
+            engine: engine,
+            generation: generation
+        )
     }
 
     private func rebuildDefaultVoiceProcessingEngine(generation: Int) {
-        guard audioRecoveryAttempts < maximumAudioRecoveryAttempts else {
+        guard audioRecoveryAttempts <= maximumAudioRecoveryAttempts else {
             fail(
                 "The system audio route changed and Voice Processing could not restart",
                 stage: "audio_recovery_exhausted"
             )
             return
         }
-        audioRecoveryAttempts += 1
         if audioEngine != nil {
             releaseAudioEngine()
         }
@@ -724,6 +853,13 @@ final class NativeRealtimeAudioTransport: NSObject {
             Self.logger.error(
                 "Realtime audio retry failed generation=\(generation) attempt=\(self.audioRecoveryAttempts) error_domain=\((error as NSError).domain, privacy: .public) error_code=\((error as NSError).code)"
             )
+            guard audioRecoveryAttempts < maximumAudioRecoveryAttempts else {
+                fail(
+                    "The system audio route changed and Voice Processing could not restart",
+                    stage: "audio_recovery_exhausted"
+                )
+                return
+            }
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 self.stateQueue.async {
@@ -734,6 +870,7 @@ final class NativeRealtimeAudioTransport: NSObject {
                         return
                     }
                     self.audioRecoveryWorkItem = nil
+                    self.audioRecoveryAttempts += 1
                     self.rebuildDefaultVoiceProcessingEngine(
                         generation: generation
                     )
@@ -749,13 +886,32 @@ final class NativeRealtimeAudioTransport: NSObject {
         generation: Int
     ) {
         audioRecoveryStableWorkItem?.cancel()
+        audioRecoveryStableCapturedBaseline = capturedChunks
+        audioRecoveryStableRenderedBaseline = renderedChunks
         let workItem = DispatchWorkItem { [weak self, weak engine] in
             guard let self, let engine else { return }
             self.stateQueue.async {
                 guard self.audioRecoveryStableWorkItem != nil,
                       self.audioEngine === engine,
                       self.activeGeneration == generation,
-                      engine.isRunning else {
+                      !self.stopping else {
+                    return
+                }
+                let mediaProgressed =
+                    self.capturedChunks
+                        > self.audioRecoveryStableCapturedBaseline
+                    || self.renderedChunks
+                        > self.audioRecoveryStableRenderedBaseline
+                guard engine.isRunning, mediaProgressed else {
+                    self.audioRecoveryStableWorkItem = nil
+                    self.emitDiagnostic("audio_recovery_unstable")
+                    if engine.isRunning {
+                        engine.stop()
+                    }
+                    self.settleOrRebuildAudio(
+                        engine: engine,
+                        generation: generation
+                    )
                     return
                 }
                 self.audioRecoveryStableWorkItem = nil
@@ -840,15 +996,32 @@ final class NativeRealtimeAudioTransport: NSObject {
                 let filtered = self.echoAdmissionPolicy.filterCapture(
                     samples,
                     startTime: startTime,
-                    playbackActive: self.scheduledPlaybackBuffers > 0
+                    playbackActive: false,
+                    playbackProvisionallyPaused:
+                        self.playbackProvisionallyPaused
                 )
                 if filtered.classification == .echoOnly {
+                    self.pendingBargeInPCM.removeAll(keepingCapacity: true)
                     self.suppressedEchoChunks += 1
                     self.emitDiagnosticIfUseful()
                     return
                 }
+                if filtered.classification == .uncertainSpeech {
+                    self.appendBargeInPreroll(
+                        Self.encodePCM16(filtered.samples)
+                    )
+                    self.provisionallyPausePlaybackForBargeIn()
+                    return
+                }
                 let pcm = Self.encodePCM16(filtered.samples)
                 guard !pcm.isEmpty else { return }
+                if filtered.classification == .residualSpeech,
+                   !self.pendingBargeInPCM.isEmpty {
+                    self.pendingPCM.append(self.pendingBargeInPCM)
+                    self.pendingBargeInPCM.removeAll(keepingCapacity: true)
+                } else if filtered.classification == .noPlaybackReference {
+                    self.pendingBargeInPCM.removeAll(keepingCapacity: true)
+                }
                 self.pendingPCM.append(pcm)
                 let bytesPerChunk =
                     self.inputChunkFrames * MemoryLayout<Int16>.size
@@ -908,11 +1081,26 @@ final class NativeRealtimeAudioTransport: NSObject {
                       !samples.isEmpty else {
                     return
                 }
+                if Self.audioRMS(samples) >= 0.001 {
+                    self.echoAdmissionPolicy.markPlaybackActive(
+                        at: startTime
+                    )
+                }
                 self.echoAdmissionPolicy.appendPlaybackReference(
                     samples,
                     startTime: startTime
                 )
             }
+        }
+    }
+
+    private func appendBargeInPreroll(_ pcm: Data) {
+        guard !pcm.isEmpty else { return }
+        pendingBargeInPCM.append(pcm)
+        if pendingBargeInPCM.count > maximumBargeInPrerollBytes {
+            pendingBargeInPCM.removeFirst(
+                pendingBargeInPCM.count - maximumBargeInPrerollBytes
+            )
         }
     }
 
@@ -971,6 +1159,14 @@ final class NativeRealtimeAudioTransport: NSObject {
         return data
     }
 
+    private static func audioRMS(_ samples: [Float]) -> Float {
+        guard !samples.isEmpty else { return 0 }
+        let energy = samples.reduce(0.0) {
+            $0 + Double($1 * $1)
+        }
+        return Float(sqrt(energy / Double(samples.count)))
+    }
+
     private static func monotonicSeconds(for time: AVAudioTime) -> TimeInterval {
         if time.isHostTimeValid {
             return AVAudioTime.seconds(forHostTime: time.hostTime)
@@ -1025,15 +1221,16 @@ final class NativeRealtimeAudioTransport: NSObject {
         if activePlaybackItemID != chunk.itemID {
             activePlaybackItemID = chunk.itemID
             activePlaybackContentIndex = chunk.contentIndex
+            activePlaybackCanTruncate =
+                truncatableResponseIDs.contains(chunk.responseID)
             activePlaybackStartSampleTime =
                 currentPlaybackSampleTime() ?? 0
             activePlaybackStartedAt = Date()
+            activePlaybackScheduledFrames = 0
         }
+        activePlaybackScheduledFrames += chunk.frameCount
         queuedPlaybackFrames += chunk.frameCount
         scheduledPlaybackBuffers += 1
-        echoAdmissionPolicy.markPlaybackActive(
-            at: ProcessInfo.processInfo.systemUptime
-        )
         if !responseID.isEmpty {
             playbackBuffersByResponseID[responseID, default: 0] += 1
         }
@@ -1085,6 +1282,7 @@ final class NativeRealtimeAudioTransport: NSObject {
         }
         completedAudioResponseIDs.remove(responseID)
         playbackBuffersByResponseID.removeValue(forKey: responseID)
+        truncatableResponseIDs.remove(responseID)
         emitOnMain {
             self.onPlaybackDrained?(generation, responseID)
         }
@@ -1140,7 +1338,7 @@ final class NativeRealtimeAudioTransport: NSObject {
         let token = provisionalPauseToken
         player.pause()
         emitDiagnostic("playback_provisionally_paused")
-        stateQueue.asyncAfter(deadline: .now() + 4) { [weak self] in
+        stateQueue.asyncAfter(deadline: .now() + 0.9) { [weak self] in
             guard let self,
                   self.provisionalPauseToken == token else {
                 return
@@ -1153,6 +1351,8 @@ final class NativeRealtimeAudioTransport: NSObject {
         guard playbackProvisionallyPaused else { return }
         provisionalPauseToken &+= 1
         playbackProvisionallyPaused = false
+        pendingBargeInPCM.removeAll(keepingCapacity: true)
+        echoAdmissionPolicy.cancelProvisionalSpeech()
         guard scheduledPlaybackBuffers > 0,
               let player = playerNode else {
             return
@@ -1177,6 +1377,8 @@ final class NativeRealtimeAudioTransport: NSObject {
         }
         let itemID = activePlaybackItemID
         let contentIndex = activePlaybackContentIndex
+        let canTruncate = activePlaybackCanTruncate
+        let scheduledFrames = activePlaybackScheduledFrames
         discardedAudioResponseIDs.formUnion(
             playbackBuffersByResponseID.keys
         )
@@ -1186,6 +1388,7 @@ final class NativeRealtimeAudioTransport: NSObject {
         playbackToken += 1
         provisionalPauseToken &+= 1
         playbackProvisionallyPaused = false
+        pendingBargeInPCM.removeAll(keepingCapacity: true)
         playerNode?.stop()
         queuedPlaybackFrames = 0
         scheduledPlaybackBuffers = 0
@@ -1195,20 +1398,34 @@ final class NativeRealtimeAudioTransport: NSObject {
         activePlaybackResponseID = ""
         activePlaybackItemID = ""
         activePlaybackContentIndex = 0
+        activePlaybackCanTruncate = false
         activePlaybackStartSampleTime = nil
         activePlaybackStartedAt = nil
-        echoAdmissionPolicy.reset()
+        activePlaybackScheduledFrames = 0
+        echoAdmissionPolicy.markPlaybackEnded(
+            at: ProcessInfo.processInfo.systemUptime
+        )
 
         guard let generation = activeGeneration else { return }
-        guard !itemID.isEmpty else {
+        guard canTruncate, !itemID.isEmpty, scheduledFrames > 0 else {
             emitDiagnostic("playback_cancelled")
             return
         }
-        let audioEndMS = max(0, Int(Double(renderedFrames) / 24.0))
+        let boundedRenderedFrames = min(
+            max(0, renderedFrames),
+            scheduledFrames
+        )
+        let audioEndMS = max(
+            0,
+            Int(Double(boundedRenderedFrames) / 24.0)
+        )
+        controlEventSequence &+= 1
         enqueueControlEvent([
+            "event_id":
+                "voice-relay-truncate-\(generation)-\(controlEventSequence)",
             "type": "conversation.item.truncate",
             "item_id": itemID,
-            "content_index": contentIndex,
+            "content_index": max(0, contentIndex),
             "audio_end_ms": audioEndMS,
         ])
         guard activeGeneration == generation else { return }
@@ -1237,6 +1454,7 @@ final class NativeRealtimeAudioTransport: NSObject {
         openTimeout = nil
         audioRecoveryWorkItem?.cancel()
         audioRecoveryWorkItem = nil
+        audioConfigurationRecoveryPolicy.invalidate()
         audioRecoveryStableWorkItem?.cancel()
         audioRecoveryStableWorkItem = nil
         audioRecoveryAttempts = 0
@@ -1250,15 +1468,19 @@ final class NativeRealtimeAudioTransport: NSObject {
         completedAudioResponseIDs.removeAll()
         drainedAudioResponseIDs.removeAll()
         discardedAudioResponseIDs.removeAll()
+        truncatableResponseIDs.removeAll()
         backpressureReportedResponseIDs.removeAll()
         activePlaybackResponseID = ""
         activePlaybackItemID = ""
         activePlaybackContentIndex = 0
+        activePlaybackCanTruncate = false
         activePlaybackStartSampleTime = nil
         activePlaybackStartedAt = nil
+        activePlaybackScheduledFrames = 0
         audioAdmissionPolicy.reset()
         echoAdmissionPolicy.reset()
         pendingPCM.removeAll(keepingCapacity: false)
+        pendingBargeInPCM.removeAll(keepingCapacity: false)
 
         outboundQueue.removeAll(keepingCapacity: false)
         sendInFlight = false
