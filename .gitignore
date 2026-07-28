@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+build/
+experimental-build/
+release/
+releases/
+*.dSYM/
+*.xcarchive/
+*.pkg
+*.zip
+*.log

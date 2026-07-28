@@ -1,0 +1,12 @@
+{
+  "schema": "voice-relay-authority-pack-v1",
+  "files": [
+    "AGENTS.md",
+    "SOUL.md",
+    "USER.md",
+    "SOURCE_RULES.md",
+    "TOOLS.md",
+    "IDENTITY.md",
+    "WORKFLOW_AUTO.md"
+  ]
+}
