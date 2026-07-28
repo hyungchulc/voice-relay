@@ -143,10 +143,10 @@ require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'name: "route_voice_turn"' \
   "Realtime must use the bounded local-or-Codex routing tool"
-require_text \
+reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'Do not reuse or closely paraphrase these recent acknowledgements' \
-  "Realtime handoff prompts must reject recently spoken stock phrasing"
+  "Realtime handoff prompts must not receive prior generated transcripts"
 if /usr/bin/sed -n \
   '/static let defaultRealtimeInstructions = """/,/^    """/p' \
   "$ROOT/Sources/SettingsStore.swift" \
@@ -714,11 +714,19 @@ require_text \
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'handoffProgressInstructions' \
-  "Codex handoff progress must be contextual rather than a fixed spoken line"
+  "Codex handoff progress must use the request-free acknowledgement selector"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'recentHandoffAcknowledgements' \
-  "Codex handoff progress must vary across successive voice sessions"
+  'handoffAcknowledgementCursor' \
+  "Codex handoff acknowledgements must rotate when a response is enqueued"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Speak exactly this acknowledgement, with no additions or omissions' \
+  "Codex handoff audio must be limited to the locally selected acknowledgement"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Use only this text to identify the user'\''s language' \
+  "Codex handoff audio must never receive the original user request"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'type: "playbackInterrupt"' \
@@ -764,9 +772,9 @@ reject_text \
   'stage: "playback_queue"' \
   "a full playback queue must never terminate the Realtime session"
 require_text \
-  "$ROOT/Sources/DirectRealtimeController.swift" \
-  'Do not answer any part of the request.' \
-  "Codex handoff progress must never pre-answer a substantive request"
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'guard hadPendingOrActiveWork else { return }' \
+  "repeated wake pauses must not churn generations after capture is already stopped"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'Any factual, current-state, personal-context, device-state, external-information, calculation, or verification request must use codex.' \

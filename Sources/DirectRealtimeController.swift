@@ -888,7 +888,7 @@ private extension DirectRealtimeController {
       const send = payload => native?.postMessage(payload);
       let session = null;
       let activeStartGeneration = 0;
-      const recentHandoffAcknowledgements = [];
+      const handoffAcknowledgementCursor = { ko: 0, en: 0 };
 
       function state(phase, generation) {
         if (
@@ -1327,25 +1327,42 @@ private extension DirectRealtimeController {
         return true;
       }
 
+      function handoffAcknowledgementLanguage(text) {
+        const value = String(text || "");
+        if (/[\u3131-\u318e\uac00-\ud7a3]/u.test(value)) return "ko";
+        if (/[A-Za-z]/u.test(value)) return "en";
+        const configured = String(
+          session?.startPayload?.language || ""
+        ).toLocaleLowerCase();
+        return configured.startsWith("ko") ? "ko" : "en";
+      }
+
+      function reserveHandoffAcknowledgement(text) {
+        const language = handoffAcknowledgementLanguage(text);
+        const variants = language === "ko"
+          ? [
+              "알겠어, 바로 살펴볼게.",
+              "좋아, 맡겨줘.",
+              "응, 처리하고 알려줄게.",
+              "알겠어, 이어서 알려줄게."
+            ]
+          : [
+              "Got it, I’m on it.",
+              "Sure, I’ll look into it.",
+              "Okay, I’ll report back shortly.",
+              "Understood, leave it with me."
+            ];
+        const index = handoffAcknowledgementCursor[language] % variants.length;
+        handoffAcknowledgementCursor[language] = index + 1;
+        return variants[index];
+      }
+
       function handoffProgressInstructions(text) {
-        const request = String(text || "").trim();
-        const recent = recentHandoffAcknowledgements.slice(-3);
-        return [
-          "Give one brief, natural, non-question handoff acknowledgement in the user's language.",
-          "State only that the request is being passed on or checked.",
-          "Use fresh wording and a different sentence shape each time instead of a stock phrase.",
-          recent.length > 0
-            ? `Do not reuse or closely paraphrase these recent acknowledgements: ${JSON.stringify(recent)}`
-            : "Choose the wording freely.",
-          "Use at most eight words.",
-          "Never ask a question or request information from the user.",
-          "Do not reference the request's subject or repeat words from it.",
-          "Assume all configured private context is already attached.",
-          "Do not answer any part of the request.",
-          "Do not claim or imply a fact, result, location, user state, knowledge, uncertainty, inability, or missing information.",
-          "Do not mention Codex, tools, routing, or private reasoning.",
-          `Use only this text to identify the user's language: ${JSON.stringify(request)}`
-        ].join(" ");
+        const acknowledgement = reserveHandoffAcknowledgement(text);
+        return (
+          "Speak exactly this acknowledgement, with no additions or omissions: "
+          + JSON.stringify(acknowledgement)
+        );
       }
 
       function isTransientCodexSpeechKind(kind) {
@@ -2235,15 +2252,6 @@ private extension DirectRealtimeController {
               ).trim();
               if (text && !session.stopAcknowledgementResponseIds.has(responseId)) {
                 session.transientAssistantTranscripts.set(responseId, text);
-                if (speechKind === "codex_progress") {
-                  recentHandoffAcknowledgements.push(text);
-                  if (recentHandoffAcknowledgements.length > 3) {
-                    recentHandoffAcknowledgements.splice(
-                      0,
-                      recentHandoffAcknowledgements.length - 3
-                    );
-                  }
-                }
                 if (speechKind !== "codex_commentary") {
                   send({
                     type: "assistantProgress",

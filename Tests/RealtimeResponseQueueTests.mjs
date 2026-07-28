@@ -169,35 +169,27 @@ assert.equal(
   responseCreates().at(-1).response.metadata.voice_relay_kind,
   "codex_progress"
 );
+const progressInstructions =
+  responseCreates().at(-1).response.instructions;
 assert.doesNotMatch(
-  responseCreates().at(-1).response.instructions,
+  progressInstructions,
   /확인해볼게|잠시만|One moment, I'll check/,
   "progress instructions must not pin a stock spoken phrase"
 );
 assert.match(
-  responseCreates().at(-1).response.instructions,
-  /Do not answer any part of the request/,
-  "handoff speech must remain action-only and cannot pre-answer the request",
+  progressInstructions,
+  /Speak exactly this acknowledgement, with no additions or omissions/,
+  "handoff speech must request one exact locally selected acknowledgement",
+);
+assert.doesNotMatch(
+  progressInstructions,
+  /내일 날씨 확인해줘/,
+  "handoff speech must never receive the original user request",
 );
 assert.match(
-  responseCreates().at(-1).response.instructions,
-  /knowledge, uncertainty, inability, or missing information/,
-  "handoff speech must not claim that the requested context is unknown",
-);
-assert.match(
-  responseCreates().at(-1).response.instructions,
-  /Never ask a question or request information/,
-  "handoff speech must never ask the user for location or other context",
-);
-assert.match(
-  responseCreates().at(-1).response.instructions,
-  /Assume all configured private context is already attached/,
-  "handoff speech must treat private context injection as complete",
-);
-assert.match(
-  responseCreates().at(-1).response.instructions,
-  /different sentence shape each time/,
-  "Realtime handoff speech must explicitly reject a repeated sentence shape",
+  progressInstructions,
+  /알겠어, 바로 살펴볼게/,
+  "the first Korean handoff must use the local rotating whitelist",
 );
 
 receive({
@@ -890,10 +882,15 @@ const variedHandoffRequest = nativeMessages
     event.type === "response.create"
     && event.response?.metadata?.voice_relay_kind === "codex_progress"
   );
-assert.match(
+assert.doesNotMatch(
   variedHandoffRequest?.response?.instructions || "",
   /진행 멘트/,
-  "a later handoff prompt must exclude the recently spoken acknowledgement",
+  "a later handoff prompt must not receive a prior generated transcript",
+);
+assert.match(
+  variedHandoffRequest?.response?.instructions || "",
+  /좋아, 맡겨줘/,
+  "a later handoff must advance to the next local acknowledgement",
 );
 
 const wakeAcknowledgementStart = nativeMessages.length;

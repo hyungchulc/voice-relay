@@ -104,9 +104,23 @@ final class WakePhraseController {
     }
 
     func pause(reason: String = "requested") {
+        let hadPendingOrActiveWork =
+            wantsMonitoring
+            || isMonitoring
+            || restartWorkItem != nil
+            || pendingWakeWorkItem != nil
+            || pendingWakeCandidate != nil
+            || !wakeCandidates.isEmpty
+            || modernStartTask != nil
+            || modernSession != nil
+            || captureStarted
+            || audioEngine.isRunning
+            || !requests.isEmpty
+            || !tasks.isEmpty
         wantsMonitoring = false
         preferLegacyUntilPause = false
         modernTransientRetryCount = 0
+        guard hadPendingOrActiveWork else { return }
         stopRecognition(reason: reason)
     }
 

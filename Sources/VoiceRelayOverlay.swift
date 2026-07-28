@@ -2794,10 +2794,15 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             let snapshot = self.mediaPlaybackDetector.snapshot()
             if self.externalAudioConfirmation.observe(snapshot) {
                 self.mediaDetectedGeneration = generation
-                NSLog(
-                    "Voice Relay external audio detected generation=%d processes=%@",
-                    generation,
-                    snapshot.processLabels.sorted().joined(separator: ",")
+                VoiceRelayDiagnostics.flow(
+                    "external_audio_detected",
+                    generation: generation,
+                    fields: [
+                        "process_count": String(snapshot.processLabels.count),
+                        "processes":
+                            snapshot.processLabels.sorted()
+                                .joined(separator: ","),
+                    ]
                 )
                 self.stopForDetectedMediaIfReady(generation: generation)
                 return
