@@ -121,6 +121,21 @@ if [[ "$(/usr/bin/head -n 1 "$FAKE_GH_CAPTURE")" != "Actual release body" ]]; th
   echo "FAIL: a duplicate leading Markdown heading must be removed before publication" >&2
   exit 1
 fi
+if ! /usr/bin/awk '
+  /^[[:space:]]*$/ {
+    previous_nonempty = 0
+    next
+  }
+  previous_nonempty && $0 !~ /^- / {
+    exit 1
+  }
+  {
+    previous_nonempty = 1
+  }
+' "$ROOT/RELEASE_NOTES.md"; then
+  echo "FAIL: public release-note paragraphs and bullets must not contain manual soft wraps" >&2
+  exit 1
+fi
 if \
   VOICE_RELAY_RELEASE_DRY_RUN=1 \
   VOICE_RELAY_RELEASE_NOTES_FILE="$NOTES_FILE" \
