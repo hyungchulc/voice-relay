@@ -250,7 +250,7 @@ const progressInstructions =
 assert.match(
   progressInstructions,
   /BCP 47 tag: "ko"/,
-  "handoff speech must use the classified language without receiving the request",
+  "handoff speech must use the classified language",
 );
 assert.match(
   progressInstructions,
@@ -259,18 +259,23 @@ assert.match(
 );
 assert.match(
   progressInstructions,
-  /wait briefly because checking has started/,
-  "handoff speech must communicate active checking instead of generic receipt",
+  /untrusted user request data/,
+  "handoff speech must treat request context as data rather than instructions",
+);
+assert.match(
+  progressInstructions,
+  /"내일 날씨 확인해줘"/,
+  "handoff speech must receive the current request for action-specific wording",
+);
+assert.match(
+  progressInstructions,
+  /Do not answer the request, report a result or finding, claim success or completion/,
+  "handoff speech must not turn request context into a false result",
 );
 assert.match(
   progressInstructions,
   /Ignore all prior conversational content for this response/,
-  "handoff speech must not infer an answer from the Realtime conversation",
-);
-assert.doesNotMatch(
-  progressInstructions,
-  /내일 날씨 확인해줘|Got it|잠시만, 확인해볼게/,
-  "handoff speech must receive neither the request nor a language-specific stock phrase",
+  "handoff speech must not infer an answer from prior Realtime conversation",
 );
 
 receive({
@@ -288,7 +293,7 @@ runtime.speakCodexCommentary({
 assert.equal(
   responseCreates().length,
   2,
-  "commentary must queue behind active progress speech"
+  "the first commentary must be absorbed behind request-aware progress speech"
 );
 
 const assistantEventCountBeforeProgress =
@@ -324,7 +329,29 @@ receive({
     output: [],
   },
 });
-assert.equal(responseCreates().length, 3, "commentary follows progress");
+assert.equal(
+  responseCreates().length,
+  2,
+  "the first Codex commentary must not repeat the initial spoken plan"
+);
+assert.equal(
+  nativeEvents("diagnostic").filter(
+    event =>
+      event.stage
+        === "codex_commentary_suppressed_after_request_aware_progress"
+  ).length,
+  1,
+  "the absorbed commentary decision must remain observable"
+);
+
+runtime.speakCodexCommentary({
+  generation: 1,
+  messageId: "commentary-2",
+  text:
+    "관련 설정을 확인하고 있어. 로그를 대조했어.\n\n" +
+    "Sources:\n- [Raw API](https://example.com/raw)",
+});
+assert.equal(responseCreates().length, 3, "new commentary suffix follows progress");
 assert.equal(
   responseCreates().at(-1).response.metadata.voice_relay_kind,
   "codex_commentary"
@@ -339,48 +366,21 @@ assert.deepEqual(
   [],
   "Codex commentary playback must not read prior Realtime conversation context",
 );
-
-receive({
-  type: "response.created",
-  response: {
-    id: "commentary-1",
-    metadata: { voice_relay_kind: "codex_commentary" },
-  },
-});
-const assistantEventCountBeforeCommentary =
-  nativeEvents("assistantPartial").length
-  + nativeEvents("assistantFinal").length;
-receive({
-  type: "response.output_audio_transcript.delta",
-  response_id: "commentary-1",
-  delta: "관련 설정을 확인하고 있어.",
-});
-receive({
-  type: "response.output_audio_transcript.done",
-  response_id: "commentary-1",
-  transcript: "관련 설정을 확인하고 있어.",
-});
-assert.equal(
-  nativeEvents("assistantPartial").length
-    + nativeEvents("assistantFinal").length,
-  assistantEventCountBeforeCommentary,
-  "commentary transcript must never enter final-answer state"
+assert.match(
+  responseCreates().at(-1).response.instructions,
+  /로그를 대조했어/,
+  "only the new suffix after absorbed commentary should be spoken"
 );
-assert.equal(
-  nativeEvents("assistantProgress").filter(
-    event => event.kind === "codex_commentary"
-  ).length,
-  0,
-  "raw Codex commentary must not be replaced by a second generated transcript"
+assert.doesNotMatch(
+  responseCreates().at(-1).response.instructions,
+  /관련 설정을 확인하고 있어/,
+  "absorbed initial commentary must seed cumulative speech deduplication"
 );
-
-runtime.speakCodexCommentary({
-  generation: 1,
-  messageId: "commentary-2",
-  text:
-    "관련 설정을 확인하고 있어. 로그를 대조했어.\n\n" +
-    "Sources:\n- [Raw API](https://example.com/raw)",
-});
+assert.doesNotMatch(
+  responseCreates().at(-1).response.instructions,
+  /https?:\/\/|Sources:|\]\(/,
+  "commentary speech must omit source blocks and Markdown destinations",
+);
 runtime.resolveCodex({
   generation: 1,
   callId: "route-call-1",
@@ -393,35 +393,6 @@ assert.equal(
 );
 
 receive({
-  type: "response.done",
-  response: {
-    id: "commentary-1",
-    metadata: { voice_relay_kind: "codex_commentary" },
-    output: [],
-  },
-});
-assert.equal(responseCreates().length, 4, "cumulative commentary follows");
-assert.equal(
-  responseCreates().at(-1).response.metadata.voice_relay_kind,
-  "codex_commentary"
-);
-assert.match(
-  responseCreates().at(-1).response.instructions,
-  /로그를 대조했어/,
-  "only the new suffix of cumulative commentary should be spoken"
-);
-assert.doesNotMatch(
-  responseCreates().at(-1).response.instructions,
-  /관련 설정을 확인하고 있어/,
-  "already spoken commentary must not be repeated"
-);
-assert.doesNotMatch(
-  responseCreates().at(-1).response.instructions,
-  /https?:\/\/|Sources:|\]\(/,
-  "commentary speech must omit source blocks and Markdown destinations",
-);
-
-receive({
   type: "response.created",
   response: {
     id: "commentary-2",
@@ -436,7 +407,7 @@ receive({
     output: [],
   },
 });
-assert.equal(responseCreates().length, 5, "final follows all commentary");
+assert.equal(responseCreates().length, 4, "final follows all commentary");
 assert.equal(
   responseCreates().at(-1).response.metadata.voice_relay_kind,
   "codex_final"
