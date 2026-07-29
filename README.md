@@ -381,12 +381,12 @@ tags and never sets the GitHub `Latest` marker:
 ```bash
 VOICE_RELAY_RELEASE_NOTES_FILE="./release-notes.md" \
 ./publish-github-release.sh \
-  v0.4.0-alpha.11 \
-  releases/Voice-Relay-0.4.0-alpha.11-development-signed.dmg \
-  releases/Voice-Relay-0.4.0-alpha.11-development-signed.dmg.sha256 \
-  releases/Voice-Relay-0.4.0-alpha.11-update.zip \
-  releases/Voice-Relay-0.4.0-alpha.11-update.zip.sha256 \
-  releases/Voice-Relay-0.4.0-alpha.11-appcast.xml
+  v0.4.0-alpha.12 \
+  releases/Voice-Relay-0.4.0-alpha.12-development-signed.dmg \
+  releases/Voice-Relay-0.4.0-alpha.12-development-signed.dmg.sha256 \
+  releases/Voice-Relay-0.4.0-alpha.12-update.zip \
+  releases/Voice-Relay-0.4.0-alpha.12-update.zip.sha256 \
+  releases/Voice-Relay-0.4.0-alpha.12-appcast.xml
 ```
 
 The release helper uploads the prerelease assets and then publishes the signed

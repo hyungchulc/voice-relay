@@ -113,8 +113,8 @@ require_text \
   "route diagnostics and dispatch must use a bounded route enum"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'required: ["kind", "social_origin"]' \
-  "route decisions must classify social speech origin without an allow-by-default fallback"
+  'required: ["kind", "social_origin", "spoken_language"]' \
+  "route decisions must classify social origin and the actually spoken language"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'socialOrigin !== "user_reply"' \
@@ -766,11 +766,15 @@ require_text \
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'handoffProgressInstructions' \
-  "Codex handoff progress must use the request-free acknowledgement selector"
-require_text \
+  "Codex handoff progress must use the request-free progress generator"
+reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'handoffAcknowledgementCursor' \
-  "Codex handoff acknowledgements must rotate when a response is enqueued"
+  "Codex handoff progress must not restore a language-specific phrase table"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'normalizeSpokenLanguageTag' \
+  "Codex handoff progress must validate a language tag without retaining the request"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   '...(command.emptyInputContext ? { input: [] } : {})' \
@@ -781,8 +785,12 @@ require_text \
   "handoff and exact commentary speech must request an empty inference context"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Convey only that the user should wait briefly because checking has started.' \
+  "Codex handoff audio must communicate active checking instead of generic receipt"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
   'Speak exactly this acknowledgement, with no additions, omissions, or paraphrase' \
-  "Codex handoff audio must be limited to the locally selected acknowledgement"
+  "Codex handoff audio must not restore fixed language-specific stock phrases"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'Use only this text to identify the user'\''s language' \

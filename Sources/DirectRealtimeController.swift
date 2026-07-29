@@ -888,7 +888,6 @@ private extension DirectRealtimeController {
       const send = payload => native?.postMessage(payload);
       let session = null;
       let activeStartGeneration = 0;
-      const handoffAcknowledgementCursor = { ko: 0, en: 0 };
 
       function state(phase, generation) {
         if (
@@ -1327,44 +1326,30 @@ private extension DirectRealtimeController {
         return true;
       }
 
-      function handoffAcknowledgementLanguage(text) {
-        const value = String(text || "");
-        if (/[\u3131-\u318e\uac00-\ud7a3]/u.test(value)) return "ko";
-        if (/[A-Za-z]/u.test(value)) return "en";
+      function normalizeSpokenLanguageTag(value) {
+        const candidate = String(value || "").trim();
+        if (/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/u.test(candidate)) {
+          return candidate;
+        }
         const configured = String(
           session?.startPayload?.language || ""
-        ).toLocaleLowerCase();
-        return configured.startsWith("ko") ? "ko" : "en";
+        ).trim();
+        if (/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/u.test(configured)) {
+          return configured;
+        }
+        return "und";
       }
 
-      function reserveHandoffAcknowledgement(text) {
-        const language = handoffAcknowledgementLanguage(text);
-        const variants = language === "ko"
-          ? [
-              "알겠어, 바로 살펴볼게.",
-              "좋아, 맡겨줘.",
-              "응, 처리하고 알려줄게.",
-              "알겠어, 이어서 알려줄게."
-            ]
-          : [
-              "Got it, I’m on it.",
-              "Sure, I’ll look into it.",
-              "Okay, I’ll report back shortly.",
-              "Understood, leave it with me."
-            ];
-        const index = handoffAcknowledgementCursor[language] % variants.length;
-        handoffAcknowledgementCursor[language] = index + 1;
-        return variants[index];
-      }
-
-      function handoffProgressInstructions(text) {
-        const acknowledgement = reserveHandoffAcknowledgement(text);
+      function handoffProgressInstructions(spokenLanguage) {
+        const language = normalizeSpokenLanguageTag(spokenLanguage);
         return [
           "This response is only a brief UI progress cue for work that has already been delegated.",
-          "Do not answer the user's request, discuss the request, judge capabilities, mention limitations, ask a follow-up, or use facts from the conversation.",
+          `Speak naturally in the language identified by this BCP 47 tag: ${JSON.stringify(language)}.`,
+          "Convey only that the user should wait briefly because checking has started. Choose fresh, idiomatic wording in that language instead of a fixed stock phrase.",
+          "Do not merely acknowledge receipt. Do not answer the user's request, discuss the request, judge capabilities, mention limitations, ask a follow-up, or use facts from the conversation.",
+          "Do not mention Codex, routing, tools, or capabilities.",
           "The delegated task is still running elsewhere. Ignore all prior conversational content for this response.",
-          "Speak exactly this acknowledgement, with no additions, omissions, or paraphrase:",
-          JSON.stringify(acknowledgement)
+          "Produce one short spoken sentence and nothing else."
         ].join(" ");
       }
 
@@ -1551,9 +1536,14 @@ private extension DirectRealtimeController {
                   "independent",
                   "not_applicable"
                 ]
+              },
+              spoken_language: {
+                type: "string",
+                description:
+                  "BCP 47 language tag matching the language actually spoken in this completed utterance."
               }
             },
-            required: ["kind", "social_origin"],
+            required: ["kind", "social_origin", "spoken_language"],
             additionalProperties: false
           }
         };
@@ -1596,7 +1586,7 @@ private extension DirectRealtimeController {
             parallel_tool_calls: false,
             metadata: { voice_relay_kind: "route_classifier" },
             instructions:
-              "Call route_voice_turn immediately. Decide semantically from the complete utterance. Direct chat is only pure social speech with no factual or contextual content. Every current, factual, personal-context, device-state, external-information, calculation, verification, lookup, analysis, tool, file, app, memory, or source-dependent request must use codex. Set social_origin to user_reply only when the utterance is a social response to the immediately preceding assistant turn, such as a conversational receipt, approval, thanks, repeat request, or farewell, and it adds no work. Set assistant_like_playback when the utterance speaks from the assistant's role or appears to continue or reproduce assistant output. Use independent for other social speech and not_applicable for every non-social route. Mixed social and factual speech must use codex with not_applicable. When in doubt, use codex. Do not answer or produce audio before the tool call."
+              "Call route_voice_turn immediately. Decide semantically from the complete utterance. Set spoken_language to the BCP 47 tag matching the language actually spoken in this utterance. Direct chat is only pure social speech with no factual or contextual content. Every current, factual, personal-context, device-state, external-information, calculation, verification, lookup, analysis, tool, file, app, memory, or source-dependent request must use codex. Set social_origin to user_reply only when the utterance is a social response to the immediately preceding assistant turn, such as a conversational receipt, approval, thanks, repeat request, or farewell, and it adds no work. Set assistant_like_playback when the utterance speaks from the assistant's role or appears to continue or reproduce assistant output. Use independent for other social speech and not_applicable for every non-social route. Mixed social and factual speech must use codex with not_applicable. When in doubt, use codex. Do not answer or produce audio before the tool call."
           }
         });
       }
@@ -2065,6 +2055,9 @@ private extension DirectRealtimeController {
             }
             session.pendingCalls.add(callId);
             const kind = normalizeRouteKind(args.kind);
+            const spokenLanguage = normalizeSpokenLanguageTag(
+              args.spoken_language
+            );
             const socialOrigin = kind === "direct_chat"
               ? normalizeSocialOrigin(args.social_origin)
               : "not_applicable";
@@ -2075,6 +2068,7 @@ private extension DirectRealtimeController {
               reason: activeTurn?.playbackContended
                 ? "playback_contended"
                 : "normal",
+              spokenLanguage,
               socialOrigin,
               text,
               turnID: String(activeTurn?.id || "")
@@ -2220,7 +2214,7 @@ private extension DirectRealtimeController {
             session.codexInFlight = true;
             enqueueCodexSpeech(
               "codex_progress",
-              handoffProgressInstructions(text),
+              handoffProgressInstructions(spokenLanguage),
               { emptyInputContext: true }
             );
             send({

@@ -121,8 +121,14 @@ assert.equal(
 );
 assert.deepEqual(
   Array.from(responseCreates().at(-1).response.tools[0].parameters.required),
-  ["kind", "social_origin"],
-  "the route tool must require a fail-closed social-origin classification",
+  ["kind", "social_origin", "spoken_language"],
+  "the route tool must require social-origin and spoken-language classification",
+);
+assert.equal(
+  responseCreates().at(-1).response.tools[0]
+    .parameters.properties.spoken_language.type,
+  "string",
+  "the route tool must carry a language tag without a phrase table",
 );
 assert.deepEqual(
   Array.from(
@@ -151,7 +157,11 @@ receive({
   type: "response.function_call_arguments.done",
   name: "route_voice_turn",
   call_id: "route-call-1",
-  arguments: JSON.stringify({ kind: "codex" }),
+  arguments: JSON.stringify({
+    kind: "codex",
+    social_origin: "not_applicable",
+    spoken_language: "ko",
+  }),
 });
 assert.equal(
   responseCreates().length,
@@ -199,20 +209,15 @@ assert.deepEqual(
 );
 const progressInstructions =
   responseCreates().at(-1).response.instructions;
-assert.doesNotMatch(
+assert.match(
   progressInstructions,
-  /확인해볼게|잠시만|One moment, I'll check/,
-  "progress instructions must not pin a stock spoken phrase"
+  /BCP 47 tag: "ko"/,
+  "handoff speech must use the classified language without receiving the request",
 );
 assert.match(
   progressInstructions,
-  /Speak exactly this acknowledgement, with no additions, omissions, or paraphrase/,
-  "handoff speech must request one exact locally selected acknowledgement",
-);
-assert.match(
-  progressInstructions,
-  /Do not answer the user's request/,
-  "handoff speech must remain a progress cue instead of answering delegated work",
+  /wait briefly because checking has started/,
+  "handoff speech must communicate active checking instead of generic receipt",
 );
 assert.match(
   progressInstructions,
@@ -221,13 +226,8 @@ assert.match(
 );
 assert.doesNotMatch(
   progressInstructions,
-  /내일 날씨 확인해줘/,
-  "handoff speech must never receive the original user request",
-);
-assert.match(
-  progressInstructions,
-  /알겠어, 바로 살펴볼게/,
-  "the first Korean handoff must use the local rotating whitelist",
+  /내일 날씨 확인해줘|Got it|잠시만, 확인해볼게/,
+  "handoff speech must receive neither the request nor a language-specific stock phrase",
 );
 
 receive({
@@ -918,7 +918,11 @@ runtime.receiveRealtimeEvent({
     type: "response.function_call_arguments.done",
     name: "route_voice_turn",
     call_id: "route-handoff-call-5",
-    arguments: JSON.stringify({ kind: "codex" }),
+    arguments: JSON.stringify({
+      kind: "codex",
+      social_origin: "not_applicable",
+      spoken_language: "es-MX",
+    }),
   },
 });
 runtime.receiveRealtimeEvent({
@@ -947,8 +951,8 @@ assert.doesNotMatch(
 );
 assert.match(
   variedHandoffRequest?.response?.instructions || "",
-  /좋아, 맡겨줘/,
-  "a later handoff must advance to the next local acknowledgement",
+  /BCP 47 tag: "es-MX"/,
+  "handoff progress must support languages outside a hard-coded language pair",
 );
 
 const wakeAcknowledgementStart = nativeMessages.length;
