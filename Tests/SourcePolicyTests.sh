@@ -777,12 +777,16 @@ require_text \
   "Codex handoff progress must validate a language tag without retaining the request"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  '...(command.emptyInputContext ? { input: [] } : {})' \
-  "context-free Codex speech must explicitly remove prior Realtime input"
+  '? { conversation: "none", input: [] }' \
+  "every detached Codex speech response must remove prior Realtime input"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'emptyInputContext' \
+  "detached speech must not depend on a caller-specific context opt-in"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  '{ emptyInputContext: true }' \
-  "handoff and exact commentary speech must request an empty inference context"
+  'function codexSpeechText(text)' \
+  "Codex playback must use one deterministic speech-only projection"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'Convey only that the user should wait briefly because checking has started.' \
@@ -2138,8 +2142,32 @@ NODE
       || stopAcknowledgementRequest.response?.output_modalities?.[0] !== "audio") {
     throw new Error("semantic stop did not keep its acknowledgement on Realtime audio");
   }
+  if (stopAcknowledgementRequest.response?.conversation !== "none"
+      || JSON.stringify(stopAcknowledgementRequest.response?.input) !== "[]") {
+    throw new Error("semantic stop acknowledgement inherited prior conversation context");
+  }
   if (posted.some(event => event.type === "codexSteer")) {
     throw new Error("semantic stop leaked into Codex steering");
+  }
+  const postStopIntentIndex = posted.findIndex(
+    event => event.type === "stopIntent"
+  );
+  voice.receiveRealtimeEvent({
+    generation: 31,
+    event: {
+      type: "response.done",
+      response: {
+        id: "late-active-control-31",
+        metadata: { voice_relay_kind: "active_codex_control" },
+        output: [{ type: "function_call" }]
+      }
+    }
+  });
+  if (posted.slice(postStopIntentIndex + 1).some(event =>
+      event.type === "state"
+      && ["starting", "listening", "thinking", "speaking"].includes(event.phase)
+  )) {
+    throw new Error("a late classifier response escaped the requested stop state");
   }
   voice.receiveRealtimeEvent({
     generation: 31,
@@ -2157,6 +2185,11 @@ NODE
   });
   if (!posted.some(event => event.type === "stopAcknowledgementDrained")) {
     throw new Error("semantic stop closed before Realtime acknowledgement playback drained");
+  }
+  if (posted.filter(
+      event => event.type === "stopAcknowledgementDrained"
+  ).length !== 1) {
+    throw new Error("semantic stop acknowledgement drained more than once");
   }
   voice.stop({ generation: 31 });
 
@@ -2178,6 +2211,61 @@ NODE
   });
   if (!posted.some(event => event.type === "codexSteer")) {
     throw new Error("semantic follow-up did not preserve Codex steering");
+  }
+  const steerAcknowledgementRequest = posted
+    .filter(event => event.type === "realtimeSend")
+    .map(event => JSON.parse(event.eventJSON))
+    .find(event =>
+      event.type === "response.create"
+      && event.response?.metadata?.voice_relay_kind === "codex_steer"
+    );
+  if (!steerAcknowledgementRequest
+      || steerAcknowledgementRequest.response?.conversation !== "none"
+      || JSON.stringify(steerAcknowledgementRequest.response?.input) !== "[]"
+      || steerAcknowledgementRequest.response?.tool_choice !== "none") {
+    throw new Error("steer acknowledgement inherited prior Realtime context");
+  }
+  if (!String(steerAcknowledgementRequest.response?.instructions || "")
+      .includes("Ignore all prior conversational content.")) {
+    throw new Error("steer acknowledgement lost its self-contained prompt boundary");
+  }
+  voice.receiveRealtimeEvent({
+    generation: 32,
+    event: {
+      type: "response.created",
+      response: {
+        id: "steer-ack-32",
+        metadata: { voice_relay_kind: "codex_steer" }
+      }
+    }
+  });
+  voice.receiveRealtimeEvent({
+    generation: 32,
+    event: {
+      type: "response.done",
+      response: {
+        id: "steer-ack-32",
+        metadata: { voice_relay_kind: "codex_steer" },
+        output: []
+      }
+    }
+  });
+  voice.resolveCodexSteer({
+    generation: 32,
+    error: "remote steer failed"
+  });
+  const steerFailureRequest = posted
+    .filter(event => event.type === "realtimeSend")
+    .map(event => JSON.parse(event.eventJSON))
+    .filter(event =>
+      event.type === "response.create"
+      && event.response?.metadata?.voice_relay_kind === "codex_steer"
+    )
+    .at(-1);
+  if (!steerFailureRequest
+      || steerFailureRequest.response?.conversation !== "none"
+      || JSON.stringify(steerFailureRequest.response?.input) !== "[]") {
+    throw new Error("steer failure acknowledgement inherited prior Realtime context");
   }
   if (posted.some(event => event.type === "stopIntent")) {
     throw new Error("a negated stop phrase incorrectly stopped the session");

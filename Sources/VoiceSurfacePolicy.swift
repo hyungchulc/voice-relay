@@ -742,6 +742,7 @@ struct VoiceSurfaceReducer {
         phase incomingPhase: VoiceSurfacePhase
     ) -> Bool {
         guard incomingGeneration == generation,
+              phase != .stopping,
               incomingPhase != phase else {
             return false
         }

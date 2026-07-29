@@ -334,7 +334,9 @@ assert.equal(
 runtime.speakCodexCommentary({
   generation: 1,
   messageId: "commentary-2",
-  text: "관련 설정을 확인하고 있어. 로그를 대조했어.",
+  text:
+    "관련 설정을 확인하고 있어. 로그를 대조했어.\n\n" +
+    "Sources:\n- [Raw API](https://example.com/raw)",
 });
 runtime.resolveCodex({
   generation: 1,
@@ -369,6 +371,11 @@ assert.doesNotMatch(
   responseCreates().at(-1).response.instructions,
   /관련 설정을 확인하고 있어/,
   "already spoken commentary must not be repeated"
+);
+assert.doesNotMatch(
+  responseCreates().at(-1).response.instructions,
+  /https?:\/\/|Sources:|\]\(/,
+  "commentary speech must omit source blocks and Markdown destinations",
 );
 
 receive({
@@ -1590,6 +1597,58 @@ assert.doesNotMatch(
   failureSpeech?.response?.instructions || "",
   /Additional Context Provider|APP_REMOTE_FAILED|weather|reliably/,
   "Codex failure speech must not fabricate a provider or capability explanation",
+);
+
+const speechProjectionStart = nativeMessages.length;
+runtime.start({
+  generation: 12,
+  language: "ko-KR",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Relay",
+  wakePhrases: ["릴레이야"],
+  shouldGreet: false,
+});
+runtime.transportOpened({ generation: 12 });
+runtime.transportReady({ generation: 12 });
+runtime.resolveCodex({
+  generation: 12,
+  callId: "source-rich-codex-call",
+  output:
+    "오늘은 맑아. [예보 상세](https://weather.example/forecast)를 확인했어. " +
+    "추가 원문은 https://weather.example/raw 이야.\n\n" +
+    "출처\n- [Weather API](https://weather.example/api)\n" +
+    "- https://weather.example/source",
+});
+const speechProjectionEvents = nativeMessages
+  .slice(speechProjectionStart)
+  .filter(message => message.type === "realtimeSend")
+  .map(message => JSON.parse(message.eventJSON));
+const sourceRichOutput = speechProjectionEvents.find(event =>
+  event.type === "conversation.item.create"
+  && event.item?.type === "function_call_output"
+  && event.item?.call_id === "source-rich-codex-call"
+);
+const sourceRichAnswer =
+  JSON.parse(sourceRichOutput?.item?.output || "{}").answer || "";
+assert.match(
+  sourceRichAnswer,
+  /오늘은 맑아\. 예보 상세를 확인했어\./,
+  "speech projection must preserve factual prose and human link labels",
+);
+assert.doesNotMatch(
+  sourceRichAnswer,
+  /https?:\/\/|www\.|\]\(|출처|Weather API/,
+  "speech projection must omit URLs, Markdown destinations, and source-only blocks",
+);
+const sourceRichSpeech = speechProjectionEvents.find(event =>
+  event.type === "response.create"
+  && event.response?.metadata?.voice_relay_kind === "codex_final"
+);
+assert.equal(
+  Object.hasOwn(sourceRichSpeech?.response || {}, "input"),
+  false,
+  "final speech must still consume only the immediately preceding sanitized function result",
 );
 
 console.log("Realtime response queue tests passed");

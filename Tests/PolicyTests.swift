@@ -1349,6 +1349,21 @@ struct PolicyTests {
             !voiceState.phase.animatesNotchIndicator,
             "stopping must not animate another processing-dot cycle"
         )
+        for latePhase in [
+            VoiceSurfacePhase.starting,
+            .listening,
+            .thinking,
+            .speaking,
+            .failed,
+        ] {
+            expect(
+                !voiceState.apply(
+                    generation: generation,
+                    phase: latePhase
+                ) && voiceState.phase == .stopping,
+                "late \(latePhase.rawValue) must not escape the stopping state"
+            )
+        }
         voiceState.finishStop()
         expect(voiceState.phase == .dormantWake, "terminal stop should resume wake state")
 

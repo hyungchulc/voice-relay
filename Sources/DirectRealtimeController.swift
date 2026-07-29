@@ -893,6 +893,13 @@ private extension DirectRealtimeController {
         if (
           session
           && session.generation === generation
+          && session.lifecycle === "stop_requested"
+        ) {
+          return;
+        }
+        if (
+          session
+          && session.generation === generation
           && session.lastReportedPhase === phase
         ) {
           return;
@@ -1374,7 +1381,7 @@ private extension DirectRealtimeController {
 
       function codexCommentarySpeechDelta(text) {
         if (!session) return "";
-        const value = String(text || "").trim();
+        const value = codexSpeechText(text);
         if (!value) return "";
         for (const previous of session.spokenCodexCommentaryTexts
           .slice()
@@ -1396,6 +1403,53 @@ private extension DirectRealtimeController {
           session.spokenCodexCommentaryTexts.shift();
         }
         return value;
+      }
+
+      function codexSpeechText(text) {
+        const sourceHeading =
+          /^(?:#{1,6}\s*)?(?:sources?|references?|citations?|출처|참고(?:자료|문헌)?)\s*:?\s*$/iu;
+        const sourceLikeLine =
+          /(?:https?:\/\/|www\.|\[[^\]]+\]\((?:https?:\/\/|www\.)[^)]+\))/iu;
+        const standaloneLink =
+          /^\s*(?:[-*•]\s*)?\[[^\]]+\]\((?:https?:\/\/|www\.)[^)]+\)\s*[.!]?\s*$/iu;
+        const output = [];
+        let skippingSourceBlock = false;
+
+        for (const rawLine of String(text || "")
+          .replace(/\r\n?/g, "\n")
+          .split("\n")) {
+          const trimmed = rawLine.trim();
+          if (sourceHeading.test(trimmed)) {
+            skippingSourceBlock = true;
+            continue;
+          }
+          if (skippingSourceBlock) {
+            if (!trimmed || sourceLikeLine.test(trimmed)
+                || /^\s*(?:[-*•]|\d+[.)])\s+/u.test(trimmed)) {
+              continue;
+            }
+            skippingSourceBlock = false;
+          }
+          if (standaloneLink.test(rawLine)) {
+            continue;
+          }
+
+          const spokenLine = rawLine
+            .replace(/!\[[^\]]*\]\([^)]+\)/gu, "")
+            .replace(
+              /\[([^\]]+)\]\((?:https?:\/\/|www\.)[^)]+\)/giu,
+              "$1"
+            )
+            .replace(/\b(?:https?:\/\/|www\.)\S+/giu, "")
+            .replace(/\[\d+(?:[,\s-]+\d+)*\]/gu, "")
+            .replace(/^\s{0,3}#{1,6}\s*/u, "")
+            .replace(/^\s*[-*•]\s+/u, "")
+            .replace(/[*_`~]/gu, "")
+            .trim();
+          if (spokenLine) output.push(spokenLine);
+        }
+
+        return output.join("\n").replace(/\n{3,}/g, "\n\n").trim();
       }
 
       function startNextCodexSpeech() {
@@ -1423,8 +1477,9 @@ private extension DirectRealtimeController {
           type: "response.create",
           event_id: command.eventId,
           response: {
-            ...(command.detached ? { conversation: "none" } : {}),
-            ...(command.emptyInputContext ? { input: [] } : {}),
+            ...(command.detached
+              ? { conversation: "none", input: [] }
+              : {}),
             output_modalities: ["audio"],
             tool_choice: "none",
             metadata: {
@@ -1450,7 +1505,6 @@ private extension DirectRealtimeController {
           instructions: String(instructions || "").trim(),
           marksAwaitingFinal: Boolean(options.marksAwaitingFinal),
           detached: options.detached !== false,
-          emptyInputContext: Boolean(options.emptyInputContext),
           sequence: ++session.codexSpeechSequence,
           eventId: nextClientEventId("codex-speech")
         };
@@ -1734,7 +1788,12 @@ private extension DirectRealtimeController {
       function speakActiveCodexControlAcknowledgement(instructions) {
         enqueueCodexSpeech(
           "codex_steer",
-          String(instructions || "").trim()
+          [
+            "This response is only a brief UI cue for active Codex control.",
+            "Ignore all prior conversational content.",
+            "Do not answer any request, mention capabilities or limitations, or continue any prior topic.",
+            String(instructions || "").trim()
+          ].join(" ")
         );
       }
 
@@ -1809,6 +1868,7 @@ private extension DirectRealtimeController {
           type: "response.create",
           response: {
             conversation: "none",
+            input: [],
             output_modalities: ["audio"],
             tool_choice: "none",
             metadata: { voice_relay_kind: "semantic_stop" },
@@ -2214,8 +2274,7 @@ private extension DirectRealtimeController {
             session.codexInFlight = true;
             enqueueCodexSpeech(
               "codex_progress",
-              handoffProgressInstructions(spokenLanguage),
-              { emptyInputContext: true }
+              handoffProgressInstructions(spokenLanguage)
             );
             send({
               type: "codexRequest",
@@ -2740,9 +2799,10 @@ private extension DirectRealtimeController {
           turnID: String(session.activeUserTurn?.id || "")
         });
         const didFail = Boolean(payload.error);
+        const speechOutput = codexSpeechText(payload.output || "");
         const output = JSON.stringify(didFail
           ? { status: "error" }
-          : { status: "ok", answer: String(payload.output || "") });
+          : { status: "ok", answer: speechOutput });
         dataSend({
           type: "conversation.item.create",
           item: {
@@ -2790,8 +2850,7 @@ private extension DirectRealtimeController {
         });
         enqueueCodexSpeech(
           "codex_commentary",
-          `Say exactly this and nothing else: ${JSON.stringify(speechText)}`,
-          { emptyInputContext: true }
+          `Say exactly this and nothing else: ${JSON.stringify(speechText)}`
         );
       }
 
