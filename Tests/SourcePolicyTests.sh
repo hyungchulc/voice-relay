@@ -113,8 +113,16 @@ require_text \
   "route diagnostics and dispatch must use a bounded route enum"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'required: ["kind", "social_origin", "spoken_language"]' \
-  "route decisions must classify social origin and the actually spoken language"
+  '"spoken_register"' \
+  "route decisions must classify a language-neutral speaking register"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Korean' \
+  "Realtime delivery policy must not add a Korean-specific production branch"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '한국어' \
+  "Realtime delivery policy must not add a Korean-specific production branch"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'socialOrigin !== "user_reply"' \
@@ -203,16 +211,16 @@ require_text \
   "Realtime must only read the final Codex result"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  'beginExternalAudioUserTurn(generation: generation)' \
+  'beginRealtimeUserTurn(generation: generation)' \
   "each accepted user turn must clear prior playback eligibility"
-require_text \
+reject_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'interruptsCodex: false' \
-  "external audio yield must not cancel active Codex work"
-require_text \
+  "no external-media branch may stop Voice Relay"
+reject_text \
   "$ROOT/Sources/VoiceSurfacePolicy.swift" \
-  'backendWorkActive: Bool' \
-  "media yield policy must preserve active backend work"
+  'ExternalMediaVoiceYieldPolicy' \
+  "external playback must not have a voice-session yield policy"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'strictLocalDateTimeRequest' \
@@ -248,11 +256,11 @@ require_text \
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'try input.setVoiceProcessingEnabled(true)' \
-  "Realtime audio must keep Voice Processing enabled on the system default route"
+  "Realtime audio must use the device output as an acoustic echo-cancellation reference"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
-  'engine.outputNode.isVoiceProcessingEnabled' \
-  "Voice Processing must bind both microphone and playback reference"
+  '"system_output_reference_plus_software_guard"' \
+  "Realtime audio must pair system echo cancellation with the rendered assistant reference"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'installPlaybackReferenceTap(' \
@@ -272,7 +280,7 @@ require_text \
 reject_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'setVoiceProcessingEnabled(false)' \
-  "audio recovery must never disable Voice Processing"
+  "Realtime teardown must retire the graph instead of toggling Voice Processing in place"
 reject_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'requestsVoiceProcessing' \
@@ -845,8 +853,12 @@ reject_text \
   "a full playback queue must never terminate the Realtime session"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
-  'guard hadPendingOrActiveWork else { return }' \
+  'guard hadPendingOrActiveWork else {' \
   "repeated wake pauses must not churn generations after capture is already stopped"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'cleanupCompletion?()' \
+  "an already-idle wake session must release the Realtime handoff immediately"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'Any factual, current-state, personal-context, device-state, external-information, calculation, or verification request must use codex.' \
@@ -891,6 +903,18 @@ require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'shouldGreet: Bool = true' \
   "a warm conversation must be able to resume without another greeting"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'presence_return_greeting' \
+  "a confirmed presence return must create a distinct spoken greeting"
+require_text \
+  "$ROOT/Sources/PresenceMonitor.swift" \
+  'candidateClaimed = false' \
+  "a deferred return greeting must remain eligible for a later safe retry"
+reject_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  '"다시 왔네"' \
+  "presence greeting wording must come from Realtime rather than a fixed toast"
 require_text \
   "$ROOT/Sources/SettingsStore.swift" \
   'resolvedSpeechLocaleIdentifier' \
@@ -2016,7 +2040,12 @@ NODE
         type: "response.function_call_arguments.done",
         name: "route_voice_turn",
         call_id: `route-${generation}`,
-        arguments: JSON.stringify({ kind: "codex" })
+        arguments: JSON.stringify({
+          kind: "codex",
+          social_origin: "not_applicable",
+          spoken_language: "ko-KR",
+          spoken_register: "casual"
+        })
       }
     });
     if (!posted.some(event => event.type === "codexRequest")) {
@@ -2120,12 +2149,33 @@ NODE
   if (!stopClassifierRequest) {
     throw new Error("active speech did not start semantic control routing");
   }
+  const activeControlRequired =
+    stopClassifierRequest.response?.tools?.[0]?.parameters?.required || [];
+  if (JSON.stringify(activeControlRequired)
+      !== JSON.stringify([
+        "action",
+        "spoken_language",
+        "spoken_register"
+      ])) {
+    throw new Error("active control routing did not require language and register");
+  }
+  const activeControlInput =
+    stopClassifierRequest.response?.input?.[0]?.content?.[0]?.text;
+  if (activeControlInput !== "아니 이제 그만해"
+      || JSON.stringify(stopClassifierRequest.response?.input || [])
+        .includes("이 내용을 자세히 설명해줘")) {
+    throw new Error("active control routing inherited the primary Codex request");
+  }
   voice.receiveRealtimeEvent({
     generation: 31,
     event: {
       type: "response.function_call_arguments.done",
       name: "route_active_codex_turn",
-      arguments: JSON.stringify({ action: "stop_session" })
+      arguments: JSON.stringify({
+        action: "stop_session",
+        spoken_language: "ko-KR",
+        spoken_register: "casual"
+      })
     }
   });
   if (!posted.some(event => event.type === "stopIntent")) {
@@ -2142,9 +2192,29 @@ NODE
       || stopAcknowledgementRequest.response?.output_modalities?.[0] !== "audio") {
     throw new Error("semantic stop did not keep its acknowledgement on Realtime audio");
   }
+  const stopIntentIndex = posted.findIndex(
+    event => event.type === "stopIntent"
+  );
+  const stopAcknowledgementIndex = posted.findIndex(event =>
+    event.type === "realtimeSend"
+    && JSON.parse(event.eventJSON).type === "response.create"
+    && JSON.parse(event.eventJSON).response?.metadata?.voice_relay_kind
+      === "semantic_stop"
+  );
+  if (stopIntentIndex < 0
+      || stopAcknowledgementIndex < 0
+      || stopIntentIndex >= stopAcknowledgementIndex) {
+    throw new Error("semantic stop acknowledgement started before native stop intent");
+  }
   if (stopAcknowledgementRequest.response?.conversation !== "none"
       || JSON.stringify(stopAcknowledgementRequest.response?.input) !== "[]") {
     throw new Error("semantic stop acknowledgement inherited prior conversation context");
+  }
+  if (!String(stopAcknowledgementRequest.response?.instructions || "")
+      .includes('BCP 47 tag: "ko-KR"')
+      || !String(stopAcknowledgementRequest.response?.instructions || "")
+        .includes('speaking register: "casual"')) {
+    throw new Error("semantic stop acknowledgement lost the classified language or register");
   }
   if (posted.some(event => event.type === "codexSteer")) {
     throw new Error("semantic stop leaked into Codex steering");
@@ -2347,6 +2417,14 @@ require_text \
   "confirmed barge-in must preserve speech captured during local echo confirmation"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'shouldRetainPendingSpeechCandidate' \
+  "barge-in preroll must survive only the bounded residual-speech gap"
+reject_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'self.provisionallyPausePlaybackForBargeIn()' \
+  "uncertain acoustic input must not pause assistant playback before admission"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'detachedSpeechKinds' \
   "detached Codex speech must never truncate a server conversation item"
 require_text \
@@ -2359,8 +2437,8 @@ require_text \
   "audio recovery must use a trailing-edge generation policy"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
-  'restartVoiceProcessingEngineInPlace' \
-  "audio changes must try the existing voice-processing graph first"
+  'restartFullDuplexEngineInPlace' \
+  "audio changes must try the existing media-safe full-duplex graph first"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'audio_recovered_in_place' \
@@ -2380,15 +2458,23 @@ require_text \
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'voiceProcessingOtherAudioDuckingConfiguration' \
-  "Voice Processing must explicitly minimize ducking of unrelated Mac audio"
-require_text \
+  "system echo cancellation must declare its nonvoice-audio policy"
+reject_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'enableAdvancedDucking: true' \
-  "advanced ducking must react to local and remote speech activity"
+  "advanced activity-driven ducking must stay disabled"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'enableAdvancedDucking: false' \
+  "voice processing must avoid advanced speech-driven ducking"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'duckingLevel: .min' \
-  "unrelated Mac audio must use Apple's minimum supported ducking level"
+  "voice processing must use the least intrusive available nonvoice-audio level"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '"echo_cancellation": "system_output_reference_plus_software_guard"' \
+  "the runtime must cancel the full system output before classifying near-end speech"
 require_text \
   "$ROOT/Resources/Info.plist" \
   '<string>14.0</string>' \
@@ -2539,19 +2625,155 @@ require_text \
   "wake recognition must reject duplicate starts while a modern session opens"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
-  'modernWakeSession.stop(completion: finish)' \
-  "Realtime handoff must wait for the modern wake session to finish teardown"
+  'cleanupCompletions.append(cleanupCompletion)' \
+  "modern wake recovery must be able to wait for full analyzer and asset cleanup"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'modelRetention: .whileInUse' \
+  "modern wake sessions must release analyzer models during full cleanup"
+reject_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'modelRetention: .processLifetime' \
+  "modern wake recovery must not pin a failed analyzer model for process lifetime"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'restartAfterFullCleanup(' \
+  "all analyzer recovery paths must share the generation-bound cleanup barrier"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'WakeAnalyzerSessionPolicy.maximumContinuousDuration' \
+  "modern wake sessions must rotate before an unbounded analyzer lifetime"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  '.AVAudioEngineConfigurationChange' \
+  "modern wake recognition must recover from live audio-device reconfiguration"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'result?.transcriptions.map(\.formattedString)' \
+  "legacy wake matching must inspect complete confidence-ordered alternatives"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'wakePhrase.onWakeCandidate' \
+  "a deduplicated wake candidate must prefetch the short-lived Realtime credential"
+reject_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'try self.startAudio(reason: "transport_start_overlap")' \
+  "Realtime audio must not begin before session readiness or race a manual stop"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'try startAudio(reason: "session_updated")' \
+  "Realtime audio must begin only after the server session is ready"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'markStopRequested(generation: generation)' \
+  "manual stop must synchronously invalidate an in-flight audio start"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'AudioStartCancellationState()' \
+  "audio-start cancellation must use the tested generation state machine"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'guard !isStartCancelled(generation: generation)' \
+  "audio graph setup must check cancellation at its irreversible boundaries"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'retireAudioEngine(' \
+  "non-reusable Realtime audio engines must retire before another graph starts"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'RealtimePlaybackActivityPolicy.isActive(' \
+  "barge-in admission must use the live assistant playback state"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'completion: { [weak self] in' \
+  "audio recovery and non-reusable teardown must wait for engine retirement"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'reason": "native_transport_closed"' \
+  "UI completion must follow the native transport cleanup boundary"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'send({ type: "terminal", generation });' \
+  "the JavaScript runtime must not complete UI teardown before native audio closes"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '        "terminal",' \
+  "WebKit messages must not claim native transport completion"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'self.onClosed?(previousGeneration)' \
+  "native capture ownership must be the sole ordinary stop completion owner"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '"microphone_capture_preserved"' \
+  "ordinary stop must preserve the Voice Processing graph for local wake analysis"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'let wakeAudioConsumer = self.wakeAudioConsumer' \
+  "the preserved capture graph must route microphone buffers to local wake analysis"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'self.acceptsCaptureRouting(' \
+  "delayed PCM must be rejected after every local or network ownership handoff"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'self.scheduleWakeAudioRecovery(engine: engine)' \
+  "the persistent graph must recover route changes while wake owns capture"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'self.failWakeAudioSource(' \
+  "failed persistent recovery must notify wake to use its bounded fallback"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'self.wakeDeliveredChunks > capturedBaseline' \
+  "wake route recovery must verify actual PCM progress"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'captureTimingHealth.record(' \
+  "missing capture timestamps must reach a bounded fail-closed path"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  '"persistent_realtime_capture"' \
+  "wake recognition must identify the reused Realtime capture source"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'audioHandoffReady: false' \
+  "the visual stop fallback must not acquire wake audio before transport handoff"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'audioHandoffReady: true' \
+  "native transport completion must explicitly authorize wake audio handoff"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'collapseEmptyVoiceSurfaceAfterStop(' \
+  "manual stop must collapse an empty voice surface instead of leaving a box"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'cleanupCompletion: { [weak self] in' \
+  "wake-to-Realtime handoff must wait for full analyzer cleanup"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'retireWakeAudioOwner(' \
+  "a session-owned wake engine must retire before the first Realtime graph starts"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'private var legacyAudioEngine: AVAudioEngine?' \
+  "legacy wake audio must be session-owned so it can be fully released during handoff"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'self.voiceState.phase == .starting' \
+  "manual Realtime startup must wait for wake cleanup and reject a stop during handoff"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
   'await analyzerToCancel.cancelAndFinishNow()' \
-  "SpeechAnalyzer cancellation must finish before Realtime receives the wake"
+  "SpeechAnalyzer cancellation must finish before a failed analyzer is recreated"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
   'private let lifecycleLock = NSLock()' \
   "wake startup and teardown must share one lifecycle exclusion boundary"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
-  'self.onWake?(candidate.match)' \
+  'self.onWake?(' \
   "the wake callback must run only from the generation-bound teardown completion"
 reject_text \
   "$ROOT/Sources/VoiceSurfacePolicy.swift" \
@@ -2592,11 +2814,11 @@ require_text \
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'wake_capture_admission' \
-  "every wake capture opening must leave a media-aware admission decision"
+  "every wake capture opening must leave an observable admission decision"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
   'captureAdmission("legacy_speech_start")' \
-  "legacy fallback must recheck media admission before opening the microphone"
+  "legacy fallback must recheck capture admission before opening the microphone"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
   'captureAdmission("speech_analyzer_start")' \
@@ -2623,12 +2845,24 @@ reject_text \
   "modern wake recognition must not prepend full-session transcription history"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  'prefill: match.command,' \
-  "the stabilized wake command tail must reach Realtime"
+  'prefill: realtimePrefill,' \
+  "the complete stabilized Apple Speech utterance must reach Realtime"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'candidate.realtimePrefill' \
+  "wake cleanup must preserve the complete recognized utterance"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'acknowledgeWake: match.command.isEmpty' \
   "a wake-only activation must request an immediate Realtime acknowledgement"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'stabilizeExpandedConversationForVoiceRestart()' \
+  "manual restart must atomically cancel collapse and restore one expanded layout state"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'conversation_surface_restart_stabilized' \
+  "manual restart stabilization must leave a privacy-safe live diagnostic"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'transport.prepareAudio(generation: generation)' \
@@ -2656,7 +2890,7 @@ require_text \
 require_text \
   "$ROOT/Sources/SystemMediaPlaybackDetector.swift" \
   'kAudioProcessPropertyIsRunningOutput' \
-  "media yielding must use actual external output activity"
+  "media diagnostics must use actual external output activity"
 require_text \
   "$ROOT/Sources/SystemMediaPlaybackDetector.swift" \
   'readPID(objectID) == currentPID' \
@@ -2664,27 +2898,35 @@ require_text \
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'onPlaybackDrained?(generation, responseID)' \
-  "media-triggered shutdown must wait until final audio is actually rendered"
+  "assistant output lifecycle must wait until final audio is actually rendered"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'if let completedAudioResponseID {' \
   "the final Realtime event must register before playback-drained delivery"
-require_text \
+reject_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'mediaDetectedGeneration == generation' \
-  "ordinary voice sessions must stay open when no external media is confirmed"
+  "external media must not become a voice-session stop condition"
+reject_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'external_audio_yield' \
+  "external media must not terminate Voice Relay"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'WakeMonitoringResumePolicy.shouldStart' \
-  "wake monitoring must use the media-aware restart gate"
+  "wake monitoring must use the voice-and-output restart gate"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'WakeMonitoringResumePolicy.activationDelay' \
-  "wake monitoring must wait for CoreAudio device handoff before reopening the microphone"
+  "wake monitoring must use the bounded audio handoff delay"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'wakeCaptureDecision(reason: reason)' \
-  "wake monitoring must stay paused until media-aware capture admission succeeds"
+  "wake monitoring must record media state without allowing it to block capture"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'externalAudioPlaying _: Bool' \
+  "external audio must be an ignored compatibility input to wake restart policy"
 require_text \
   "$ROOT/Sources/LaunchAtLoginManager.swift" \
   'SMAppService.mainApp' \

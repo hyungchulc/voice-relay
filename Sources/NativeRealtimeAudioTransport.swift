@@ -3,7 +3,11 @@ import CoreAudio
 import Foundation
 import OSLog
 
-final class NativeRealtimeAudioTransport: NSObject {
+private enum AudioLifecycleError: Error {
+    case startCancelled
+}
+
+final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     typealias JSONDictionary = [String: Any]
 
     private static let logger = Logger(
@@ -56,6 +60,10 @@ final class NativeRealtimeAudioTransport: NSObject {
         qos: .userInitiated
     )
     private let captureLock = NSLock()
+    private let lifecycleSignalLock = NSLock()
+    private var audioStartCancellation = AudioStartCancellationState()
+    private var captureRoutingEpoch = AudioCaptureRoutingEpoch()
+    private var captureTimingHealth = AudioCaptureTimingHealth()
 
     private var urlSession: URLSession?
     private var webSocketTask: URLSessionWebSocketTask?
@@ -71,8 +79,16 @@ final class NativeRealtimeAudioTransport: NSObject {
     private let maximumOutboundMessages = 96
 
     private var audioEngine: AVAudioEngine?
+    private var retiredAudioEngines: [AVAudioEngine] = []
     private var playerNode: AVAudioPlayerNode?
+    private var wakeAudioConsumer: ((AVAudioPCMBuffer) -> Void)?
+    private var wakeAudioFailureHandler: (() -> Void)?
+    private var wakeAudioHealthWorkItem: DispatchWorkItem?
+    private var wakeAudioHealthToken: UInt64 = 0
+    private var wakeDeliveredChunks = 0
+    private let wakeAudioHealthInterval: TimeInterval = 1.0
     private var voiceProcessingEnabled = false
+    private var captureTapInstalled = false
     private var playbackReferenceTapInstalled = false
     private var audioConfigurationObserver: NSObjectProtocol?
     private var audioRecoveryWorkItem: DispatchWorkItem?
@@ -133,7 +149,14 @@ final class NativeRealtimeAudioTransport: NSObject {
         model: String,
         ephemeralCredential: String
     ) {
+        markStartRequested(generation: generation)
         stateQueue.async {
+            guard !self.isStartCancelled(generation: generation) else {
+                self.emitOnMain {
+                    self.onClosed?(generation)
+                }
+                return
+            }
             VoiceRelayDiagnostics.flow(
                 "realtime_transport_start_requested",
                 generation: generation,
@@ -149,15 +172,19 @@ final class NativeRealtimeAudioTransport: NSObject {
                     self.activeGeneration != nil
                     || self.webSocketTask != nil
                     || self.urlSession != nil
-                    || self.audioEngine != nil
                     || self.socketOpen
                     || self.sessionUpdated
                 if hasPriorTransport {
                     self.stopCurrent(
                         emitClosed: false,
-                        reason: "generation_replaced"
+                        reason: "generation_replaced",
+                        preserveCaptureForWake: true
                     )
                 }
+                self.advanceCaptureRoutingEpoch()
+                self.cancelWakeAudioHealthCheck()
+                self.wakeAudioConsumer = nil
+                self.wakeAudioFailureHandler = nil
                 self.activeGeneration = generation
                 self.resetCounters()
             }
@@ -240,13 +267,21 @@ final class NativeRealtimeAudioTransport: NSObject {
 
     func stop(
         generation: Int,
-        reason: String = "host_stop"
+        reason: String = "host_stop",
+        preserveCaptureForWake: Bool = true
     ) {
+        markStopRequested(generation: generation)
         stateQueue.async {
-            guard self.activeGeneration == generation else { return }
+            guard self.activeGeneration == generation else {
+                self.emitOnMain {
+                    self.onClosed?(generation)
+                }
+                return
+            }
             self.stopCurrent(
                 emitClosed: true,
-                reason: reason
+                reason: reason,
+                preserveCaptureForWake: preserveCaptureForWake
             )
         }
     }
@@ -275,8 +310,82 @@ final class NativeRealtimeAudioTransport: NSObject {
         stateQueue.sync {
             self.stopCurrent(
                 emitClosed: false,
-                reason: "transport_shutdown"
+                reason: "transport_shutdown",
+                preserveCaptureForWake: false
             )
+        }
+    }
+
+    var wakeAudioFormat: AVAudioFormat? {
+        stateQueue.sync {
+            guard activeGeneration == nil,
+                  audioEngine != nil,
+                  voiceProcessingEnabled else {
+                return nil
+            }
+            return AVAudioFormat(
+                standardFormatWithSampleRate: 24_000,
+                channels: 1
+            )
+        }
+    }
+
+    @discardableResult
+    func beginWakeAudioDelivery(
+        _ handler: @escaping (AVAudioPCMBuffer) -> Void,
+        onFailure: @escaping () -> Void
+    ) -> Bool {
+        stateQueue.sync {
+            audioRecoveryWorkItem?.cancel()
+            audioRecoveryWorkItem = nil
+            audioConfigurationRecoveryPolicy.invalidate()
+            audioRecoveryStableWorkItem?.cancel()
+            audioRecoveryStableWorkItem = nil
+            guard activeGeneration == nil,
+                  let audioEngine,
+                  voiceProcessingEnabled else {
+                return false
+            }
+            advanceCaptureRoutingEpoch()
+            wakeAudioConsumer = handler
+            wakeAudioFailureHandler = onFailure
+            if !audioEngine.isRunning {
+                do {
+                    try restartFullDuplexEngineInPlace(
+                        engine: audioEngine,
+                        generation: nil
+                    )
+                } catch {
+                    wakeAudioConsumer = nil
+                    wakeAudioFailureHandler = nil
+                    releaseAudioEngine(
+                        generation: nil,
+                        reason: "wake_audio_bind_recovery_failed"
+                    )
+                    return false
+                }
+            }
+            observeAudioConfigurationChanges(for: audioEngine)
+            scheduleWakeAudioHealthCheck(
+                engine: audioEngine,
+                capturedBaseline: wakeDeliveredChunks,
+                reason: "initial_binding"
+            )
+            return true
+        }
+    }
+
+    func endWakeAudioDelivery() {
+        stateQueue.sync {
+            audioRecoveryWorkItem?.cancel()
+            audioRecoveryWorkItem = nil
+            audioConfigurationRecoveryPolicy.invalidate()
+            audioRecoveryStableWorkItem?.cancel()
+            audioRecoveryStableWorkItem = nil
+            advanceCaptureRoutingEpoch()
+            cancelWakeAudioHealthCheck()
+            wakeAudioConsumer = nil
+            wakeAudioFailureHandler = nil
         }
     }
 
@@ -409,7 +518,10 @@ final class NativeRealtimeAudioTransport: NSObject {
             sessionUpdated = true
             emitDiagnostic("session_updated")
             do {
-                try startAudio()
+                try startAudio(reason: "session_updated")
+            } catch AudioLifecycleError.startCancelled {
+                emitDiagnostic("audio_start_cancelled")
+                return
             } catch {
                 fail(
                     "The audio engine could not start · \(error.localizedDescription)",
@@ -445,7 +557,11 @@ final class NativeRealtimeAudioTransport: NSObject {
         let shouldForwardInputEvent =
             echoAdmissionPolicy.shouldForwardServerEvent(
                 type: type,
-                playbackActive: false,
+                playbackActive: RealtimePlaybackActivityPolicy.isActive(
+                    scheduledPlaybackBuffers: scheduledPlaybackBuffers,
+                    playbackProvisionallyPaused:
+                        playbackProvisionallyPaused
+                ),
                 now: ProcessInfo.processInfo.systemUptime
             )
         var completedAudioResponseID: String?
@@ -517,9 +633,57 @@ final class NativeRealtimeAudioTransport: NSObject {
         }
     }
 
-    private func startAudio() throws {
-        guard audioEngine == nil else { return }
+    private func startAudio(reason: String) throws {
         guard let generation = activeGeneration else { return }
+        guard !isStartCancelled(generation: generation) else {
+            throw AudioLifecycleError.startCancelled
+        }
+        if let audioEngine,
+           voiceProcessingEnabled {
+            guard audioEngine.inputNode.isVoiceProcessingEnabled,
+                  audioEngine.outputNode.isVoiceProcessingEnabled,
+                  captureTapInstalled,
+                  playbackReferenceTapInstalled else {
+                releaseAudioEngine(
+                    generation: generation,
+                    reason: "persistent_capture_invalid_before_reuse"
+                )
+                throw NSError(
+                    domain: "VoiceRelay.NativeRealtimeAudioTransport",
+                    code: 8,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "The persistent audio graph is no longer reusable"
+                    ]
+                )
+            }
+            wakeAudioConsumer = nil
+            wakeAudioFailureHandler = nil
+            let captureWasRunning = audioEngine.isRunning
+            if !captureWasRunning {
+                try restartFullDuplexEngineInPlace(
+                    engine: audioEngine,
+                    generation: generation
+                )
+            }
+            audioConfigurationRecoveryNotBefore =
+                ProcessInfo.processInfo.systemUptime
+                    + audioConfigurationStartupGrace
+            observeAudioConfigurationChanges(for: audioEngine)
+            emitDiagnostic("audio_reused")
+            VoiceRelayDiagnostics.flow(
+                "microphone_started",
+                generation: generation,
+                fields: [
+                    "backend": "realtime_native_audio",
+                    "reason": captureWasRunning
+                        ? "persistent_capture_reused"
+                        : "persistent_capture_restarted",
+                    "voice_processing": "true",
+                ]
+            )
+            return
+        }
         VoiceRelayDiagnostics.flow(
             "microphone_open_requested",
             generation: generation,
@@ -527,15 +691,18 @@ final class NativeRealtimeAudioTransport: NSObject {
                 "backend": "realtime_native_audio",
                 "input_selection": "macos_system_default",
                 "output_selection": "macos_system_default",
-                "reason": "realtime_session_updated",
+                "reason": reason,
             ]
         )
-        try installDefaultVoiceProcessingEngine(generation: generation)
+        try installDefaultFullDuplexEngine(generation: generation)
     }
 
-    private func installDefaultVoiceProcessingEngine(
+    private func installDefaultFullDuplexEngine(
         generation: Int
     ) throws {
+        guard !isStartCancelled(generation: generation) else {
+            throw AudioLifecycleError.startCancelled
+        }
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
         engine.attach(player)
@@ -571,43 +738,36 @@ final class NativeRealtimeAudioTransport: NSObject {
 
         let input = engine.inputNode
         try input.setVoiceProcessingEnabled(true)
-        guard input.isVoiceProcessingEnabled else {
+        guard input.isVoiceProcessingEnabled,
+              engine.outputNode.isVoiceProcessingEnabled else {
             throw NSError(
                 domain: "VoiceRelay.NativeRealtimeAudioTransport",
                 code: 2,
                 userInfo: [
                     NSLocalizedDescriptionKey:
-                        "Voice Processing did not become active"
+                        "System echo cancellation did not bind both audio directions"
                 ]
             )
         }
-        guard engine.outputNode.isVoiceProcessingEnabled else {
-            throw NSError(
-                domain: "VoiceRelay.NativeRealtimeAudioTransport",
-                code: 3,
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "Voice Processing did not bind the output reference"
-                ]
+        input.isVoiceProcessingAGCEnabled = false
+        input.voiceProcessingOtherAudioDuckingConfiguration =
+            AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                enableAdvancedDucking: false,
+                duckingLevel: .min
             )
-        }
         voiceProcessingEnabled = true
         VoiceRelayDiagnostics.flow(
             "voice_processing_activated",
             generation: generation,
             fields: [
-                "echo_cancellation": "system_voice_processing",
+                "advanced_ducking": "false",
+                "echo_cancellation": "system_output_reference_plus_software_guard",
                 "input": String(input.isVoiceProcessingEnabled),
-                "output_reference":
-                    String(engine.outputNode.isVoiceProcessingEnabled),
+                "other_audio_policy": "minimum_without_activity_ducking",
+                "output_reference": "software_mixer_tap",
             ]
         )
-        input.voiceProcessingOtherAudioDuckingConfiguration =
-            AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
-                enableAdvancedDucking: true,
-                duckingLevel: .min
-            )
-        emitDiagnostic("audio_ducking_minimum_enabled")
+        emitDiagnostic("system_voice_processing_enabled")
         let captureFormat = input.outputFormat(forBus: 0)
         guard captureFormat.sampleRate > 0,
               captureFormat.channelCount > 0 else {
@@ -639,33 +799,44 @@ final class NativeRealtimeAudioTransport: NSObject {
         )
         installCaptureTap(
             on: input,
-            format: captureFormat,
-            generation: generation
+            format: captureFormat
         )
         try installPlaybackReferenceTap(
-            on: engine.mainMixerNode,
-            generation: generation
+            on: engine.mainMixerNode
         )
+        guard !isStartCancelled(generation: generation) else {
+            input.removeTap(onBus: 0)
+            captureTapInstalled = false
+            engine.mainMixerNode.removeTap(onBus: 0)
+            playbackReferenceTapInstalled = false
+            throw AudioLifecycleError.startCancelled
+        }
         engine.prepare()
         do {
             try engine.start()
         } catch {
             input.removeTap(onBus: 0)
+            captureTapInstalled = false
             engine.mainMixerNode.removeTap(onBus: 0)
             playbackReferenceTapInstalled = false
             engine.stop()
             voiceProcessingEnabled = false
             throw error
         }
+        guard !isStartCancelled(generation: generation) else {
+            input.removeTap(onBus: 0)
+            captureTapInstalled = false
+            engine.mainMixerNode.removeTap(onBus: 0)
+            playbackReferenceTapInstalled = false
+            engine.stop()
+            throw AudioLifecycleError.startCancelled
+        }
         audioEngine = engine
         playerNode = player
         audioConfigurationRecoveryNotBefore =
             ProcessInfo.processInfo.systemUptime
                 + audioConfigurationStartupGrace
-        observeAudioConfigurationChanges(
-            for: engine,
-            generation: generation
-        )
+        observeAudioConfigurationChanges(for: engine)
         scheduleAudioRecoveryStableReset(
             engine: engine,
             generation: generation
@@ -684,7 +855,8 @@ final class NativeRealtimeAudioTransport: NSObject {
 
     private func releaseAudioEngine(
         generation: Int?,
-        reason: String
+        reason: String,
+        completion: (() -> Void)? = nil
     ) {
         let hadActiveCapture =
             audioEngine != nil
@@ -711,6 +883,8 @@ final class NativeRealtimeAudioTransport: NSObject {
             )
         }
         mediaEpoch &+= 1
+        advanceCaptureRoutingEpoch()
+        cancelWakeAudioHealthCheck()
         provisionalPauseToken &+= 1
         playbackProvisionallyPaused = false
         pendingPCM.removeAll(keepingCapacity: false)
@@ -718,12 +892,15 @@ final class NativeRealtimeAudioTransport: NSObject {
         echoAdmissionPolicy.reset()
         removeAudioConfigurationObserver()
         playerNode?.stop()
-        if let engine = audioEngine {
+        let engineToRetire = audioEngine
+        if let engine = engineToRetire {
             engine.inputNode.removeTap(onBus: 0)
+            captureTapInstalled = false
             if playbackReferenceTapInstalled {
                 engine.mainMixerNode.removeTap(onBus: 0)
             }
             engine.stop()
+            engine.reset()
         }
         playbackReferenceTapInstalled = false
         playerNode = nil
@@ -740,12 +917,40 @@ final class NativeRealtimeAudioTransport: NSObject {
                 ]
             )
         }
+        if let engineToRetire {
+            retireAudioEngine(
+                engineToRetire,
+                completion: completion
+            )
+        } else if let completion {
+            stateQueue.async(execute: completion)
+        }
+    }
+
+    private func retireAudioEngine(
+        _ engine: AVAudioEngine,
+        completion: (() -> Void)? = nil
+    ) {
+        retiredAudioEngines.append(engine)
+        stateQueue.asyncAfter(deadline: .now() + 0.08) { [weak self, weak engine] in
+            guard let self else {
+                completion?()
+                return
+            }
+            if let engine {
+                self.retiredAudioEngines.removeAll { $0 === engine }
+            } else {
+                self.retiredAudioEngines.removeAll()
+            }
+            self.stateQueue.asyncAfter(deadline: .now() + 0.18) {
+                completion?()
+            }
+        }
     }
 
     private func installCaptureTap(
         on input: AVAudioInputNode,
-        format: AVAudioFormat,
-        generation: Int
+        format: AVAudioFormat
     ) {
         let epoch = mediaEpoch
         let bufferFrames = AVAudioFrameCount(
@@ -756,19 +961,22 @@ final class NativeRealtimeAudioTransport: NSObject {
             bufferSize: bufferFrames,
             format: format
         ) { [weak self] buffer, time in
-            self?.capture(
+            guard let self else { return }
+            let routingToken = self.currentCaptureRoutingToken()
+            self.capture(
                 buffer,
                 format: format,
                 time: time,
-                generation: generation,
-                epoch: epoch
+                epoch: epoch,
+                routingToken: routingToken,
+                bufferHostTime: time.isHostTimeValid ? time.hostTime : nil
             )
         }
+        captureTapInstalled = true
     }
 
     private func installPlaybackReferenceTap(
-        on mixer: AVAudioMixerNode,
-        generation: Int
+        on mixer: AVAudioMixerNode
     ) throws {
         let format = mixer.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
@@ -777,7 +985,7 @@ final class NativeRealtimeAudioTransport: NSObject {
                 code: 5,
                 userInfo: [
                     NSLocalizedDescriptionKey:
-                        "The Voice Processing output reference is unavailable"
+                        "The playback reference is unavailable"
                 ]
             )
         }
@@ -790,20 +998,22 @@ final class NativeRealtimeAudioTransport: NSObject {
             bufferSize: bufferFrames,
             format: format
         ) { [weak self] buffer, time in
-            self?.capturePlaybackReference(
+            guard let self else { return }
+            let routingToken = self.currentCaptureRoutingToken()
+            self.capturePlaybackReference(
                 buffer,
                 format: format,
                 time: time,
-                generation: generation,
-                epoch: epoch
+                epoch: epoch,
+                routingToken: routingToken,
+                bufferHostTime: time.isHostTimeValid ? time.hostTime : nil
             )
         }
         playbackReferenceTapInstalled = true
     }
 
     private func observeAudioConfigurationChanges(
-        for engine: AVAudioEngine,
-        generation: Int
+        for engine: AVAudioEngine
     ) {
         removeAudioConfigurationObserver()
         audioConfigurationObserver = NotificationCenter.default.addObserver(
@@ -813,17 +1023,180 @@ final class NativeRealtimeAudioTransport: NSObject {
         ) { [weak self, weak engine] _ in
             guard let self, let engine else { return }
             self.stateQueue.async {
-                guard self.audioEngine === engine,
-                      self.activeGeneration == generation,
-                      !self.stopping else {
+                guard self.audioEngine === engine else {
                     return
                 }
-                self.scheduleAudioRecovery(
+                let owner = PersistentAudioCaptureOwnerPolicy.resolve(
+                    activeGeneration: self.activeGeneration,
+                    realtimeStopping: self.stopping,
+                    wakeConsumerBound: self.wakeAudioConsumer != nil
+                )
+                switch owner {
+                case let .realtime(generation):
+                    self.scheduleAudioRecovery(
+                        engine: engine,
+                        generation: generation
+                    )
+                case .wake:
+                    self.scheduleWakeAudioRecovery(engine: engine)
+                case .none:
+                    break
+                }
+            }
+        }
+    }
+
+    private func scheduleWakeAudioRecovery(engine: AVAudioEngine) {
+        audioRecoveryWorkItem?.cancel()
+        audioRecoveryWorkItem = nil
+        audioConfigurationRecoveryPolicy.invalidate()
+        audioRecoveryStableWorkItem?.cancel()
+        audioRecoveryStableWorkItem = nil
+        cancelWakeAudioHealthCheck()
+        VoiceRelayDiagnostics.flow(
+            "wake_audio_route_change_detected",
+            generation: nil,
+            fields: [
+                "reason": "av_audio_engine_configuration_change",
+            ]
+        )
+        let plan = audioConfigurationRecoveryPolicy.registerChange(
+            now: ProcessInfo.processInfo.systemUptime,
+            recoveryNotBefore: audioConfigurationRecoveryNotBefore
+        )
+        let capturedBaseline = wakeDeliveredChunks
+        let workItem = DispatchWorkItem { [weak self, weak engine] in
+            guard let self, let engine else { return }
+            guard self.audioConfigurationRecoveryPolicy.isCurrent(
+                token: plan.token
+            ),
+            self.audioEngine === engine,
+            self.activeGeneration == nil,
+            self.wakeAudioConsumer != nil else {
+                return
+            }
+            self.audioRecoveryWorkItem = nil
+            if engine.isRunning,
+               engine.inputNode.isVoiceProcessingEnabled,
+               engine.outputNode.isVoiceProcessingEnabled,
+               self.wakeDeliveredChunks > capturedBaseline {
+                VoiceRelayDiagnostics.flow(
+                    "wake_audio_route_change_settled",
+                    generation: nil,
+                    fields: ["recovery": "not_needed"]
+                )
+                self.scheduleWakeAudioHealthCheck(
                     engine: engine,
-                    generation: generation
+                    capturedBaseline: self.wakeDeliveredChunks,
+                    reason: "route_settled"
+                )
+                return
+            }
+            do {
+                try self.restartFullDuplexEngineInPlace(
+                    engine: engine,
+                    generation: nil
+                )
+                VoiceRelayDiagnostics.flow(
+                    "wake_audio_recovery_completed",
+                    generation: nil,
+                    fields: ["strategy": "in_place"]
+                )
+                self.scheduleWakeAudioHealthCheck(
+                    engine: engine,
+                    capturedBaseline: self.wakeDeliveredChunks,
+                    reason: "route_recovery"
+                )
+            } catch {
+                self.failWakeAudioSource(
+                    engine: engine,
+                    reason: "route_recovery_failed"
                 )
             }
         }
+        audioRecoveryWorkItem = workItem
+        stateQueue.asyncAfter(
+            deadline: .now() + plan.delay,
+            execute: workItem
+        )
+    }
+
+    private func scheduleWakeAudioHealthCheck(
+        engine: AVAudioEngine,
+        capturedBaseline: Int,
+        reason: String
+    ) {
+        cancelWakeAudioHealthCheck()
+        let healthToken = wakeAudioHealthToken
+        let workItem = DispatchWorkItem { [weak self, weak engine] in
+            guard let self, let engine else { return }
+            self.stateQueue.async {
+                guard self.wakeAudioHealthWorkItem != nil,
+                      self.wakeAudioHealthToken == healthToken,
+                      self.audioEngine === engine,
+                      self.activeGeneration == nil,
+                      self.wakeAudioConsumer != nil else {
+                    return
+                }
+                self.wakeAudioHealthWorkItem = nil
+                guard engine.isRunning,
+                      engine.inputNode.isVoiceProcessingEnabled,
+                      engine.outputNode.isVoiceProcessingEnabled,
+                      self.wakeDeliveredChunks > capturedBaseline else {
+                    self.failWakeAudioSource(
+                        engine: engine,
+                        reason: "\(reason)_capture_stalled"
+                    )
+                    return
+                }
+                VoiceRelayDiagnostics.flow(
+                    "wake_audio_source_healthy",
+                    generation: nil,
+                    fields: ["reason": reason]
+                )
+            }
+        }
+        wakeAudioHealthWorkItem = workItem
+        stateQueue.asyncAfter(
+            deadline: .now() + wakeAudioHealthInterval,
+            execute: workItem
+        )
+    }
+
+    private func cancelWakeAudioHealthCheck() {
+        wakeAudioHealthWorkItem?.cancel()
+        wakeAudioHealthWorkItem = nil
+        wakeAudioHealthToken &+= 1
+    }
+
+    private func failWakeAudioSource(
+        engine: AVAudioEngine,
+        reason: String
+    ) {
+        guard audioEngine === engine,
+              activeGeneration == nil,
+              wakeAudioConsumer != nil else {
+            return
+        }
+        let failureHandler = wakeAudioFailureHandler
+        advanceCaptureRoutingEpoch()
+        cancelWakeAudioHealthCheck()
+        wakeAudioConsumer = nil
+        wakeAudioFailureHandler = nil
+        VoiceRelayDiagnostics.flow(
+            "wake_audio_source_failed",
+            generation: nil,
+            fields: ["reason": reason]
+        )
+        releaseAudioEngine(
+            generation: nil,
+            reason: "wake_audio_source_\(reason)",
+            completion: {
+                if let failureHandler {
+                    self.emitOnMain(failureHandler)
+                }
+            }
+        )
     }
 
     private func scheduleAudioRecovery(
@@ -880,7 +1253,8 @@ final class NativeRealtimeAudioTransport: NSObject {
         generation: Int
     ) {
         if engine.isRunning,
-           engine.inputNode.isVoiceProcessingEnabled {
+           engine.inputNode.isVoiceProcessingEnabled,
+           engine.outputNode.isVoiceProcessingEnabled {
             emitDiagnostic("audio_configuration_settled")
             VoiceRelayDiagnostics.flow(
                 "audio_route_change_settled",
@@ -899,7 +1273,7 @@ final class NativeRealtimeAudioTransport: NSObject {
 
         guard audioRecoveryAttempts < maximumAudioRecoveryAttempts else {
             fail(
-                "The system audio route changed and Voice Processing could not restart",
+                "The system audio route changed and audio capture could not restart",
                 stage: "audio_recovery_exhausted"
             )
             return
@@ -914,7 +1288,7 @@ final class NativeRealtimeAudioTransport: NSObject {
             ]
         )
         do {
-            try restartVoiceProcessingEngineInPlace(
+            try restartFullDuplexEngineInPlace(
                 engine: engine,
                 generation: generation
             )
@@ -931,15 +1305,19 @@ final class NativeRealtimeAudioTransport: NSObject {
             Self.logger.error(
                 "Realtime audio in-place recovery failed generation=\(generation) error_domain=\((error as NSError).domain, privacy: .public) error_code=\((error as NSError).code)"
             )
-            rebuildDefaultVoiceProcessingEngine(generation: generation)
+            rebuildDefaultFullDuplexEngine(generation: generation)
         }
     }
 
-    private func restartVoiceProcessingEngineInPlace(
+    private func restartFullDuplexEngineInPlace(
         engine: AVAudioEngine,
-        generation: Int
+        generation: Int?
     ) throws {
         let input = engine.inputNode
+        if let generation,
+           isStartCancelled(generation: generation) {
+            throw AudioLifecycleError.startCancelled
+        }
         guard input.isVoiceProcessingEnabled,
               engine.outputNode.isVoiceProcessingEnabled else {
             throw NSError(
@@ -947,20 +1325,24 @@ final class NativeRealtimeAudioTransport: NSObject {
                 code: 6,
                 userInfo: [
                     NSLocalizedDescriptionKey:
-                        "Voice Processing lost its input or output binding"
+                        "System echo cancellation lost its output reference"
                 ]
             )
         }
 
         mediaEpoch &+= 1
+        advanceCaptureRoutingEpoch()
+        cancelWakeAudioHealthCheck()
         input.removeTap(onBus: 0)
+        captureTapInstalled = false
         if playbackReferenceTapInstalled {
             engine.mainMixerNode.removeTap(onBus: 0)
             playbackReferenceTapInstalled = false
         }
+        input.isVoiceProcessingAGCEnabled = false
         input.voiceProcessingOtherAudioDuckingConfiguration =
             AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
-                enableAdvancedDucking: true,
+                enableAdvancedDucking: false,
                 duckingLevel: .min
             )
         let captureFormat = input.outputFormat(forBus: 0)
@@ -977,15 +1359,22 @@ final class NativeRealtimeAudioTransport: NSObject {
         }
         installCaptureTap(
             on: input,
-            format: captureFormat,
-            generation: generation
+            format: captureFormat
         )
         try installPlaybackReferenceTap(
-            on: engine.mainMixerNode,
-            generation: generation
+            on: engine.mainMixerNode
         )
         engine.prepare()
         try engine.start()
+        if let generation,
+           isStartCancelled(generation: generation) {
+            input.removeTap(onBus: 0)
+            captureTapInstalled = false
+            engine.mainMixerNode.removeTap(onBus: 0)
+            playbackReferenceTapInstalled = false
+            engine.stop()
+            throw AudioLifecycleError.startCancelled
+        }
         if scheduledPlaybackBuffers > 0,
            !playbackProvisionallyPaused,
            let playerNode,
@@ -995,16 +1384,18 @@ final class NativeRealtimeAudioTransport: NSObject {
         audioConfigurationRecoveryNotBefore =
             ProcessInfo.processInfo.systemUptime
                 + audioConfigurationStartupGrace
-        scheduleAudioRecoveryStableReset(
-            engine: engine,
-            generation: generation
-        )
+        if let generation {
+            scheduleAudioRecoveryStableReset(
+                engine: engine,
+                generation: generation
+            )
+        }
     }
 
-    private func rebuildDefaultVoiceProcessingEngine(generation: Int) {
+    private func rebuildDefaultFullDuplexEngine(generation: Int) {
         guard audioRecoveryAttempts <= maximumAudioRecoveryAttempts else {
             fail(
-                "The system audio route changed and Voice Processing could not restart",
+                "The system audio route changed and audio capture could not restart",
                 stage: "audio_recovery_exhausted"
             )
             return
@@ -1012,11 +1403,32 @@ final class NativeRealtimeAudioTransport: NSObject {
         if audioEngine != nil {
             releaseAudioEngine(
                 generation: generation,
-                reason: "audio_route_rebuild"
+                reason: "audio_route_rebuild",
+                completion: { [weak self] in
+                    guard let self,
+                          self.activeGeneration == generation,
+                          !self.stopping,
+                          !self.isStartCancelled(generation: generation) else {
+                        return
+                    }
+                    self.startRebuiltFullDuplexEngine(
+                        generation: generation
+                    )
+                }
             )
+            return
+        }
+        startRebuiltFullDuplexEngine(generation: generation)
+    }
+
+    private func startRebuiltFullDuplexEngine(generation: Int) {
+        guard activeGeneration == generation,
+              !stopping,
+              !isStartCancelled(generation: generation) else {
+            return
         }
         do {
-            try installDefaultVoiceProcessingEngine(generation: generation)
+            try installDefaultFullDuplexEngine(generation: generation)
             emitDiagnostic("audio_recovered")
             VoiceRelayDiagnostics.flow(
                 "audio_recovery_completed",
@@ -1032,7 +1444,7 @@ final class NativeRealtimeAudioTransport: NSObject {
             )
             guard audioRecoveryAttempts < maximumAudioRecoveryAttempts else {
                 fail(
-                    "The system audio route changed and Voice Processing could not restart",
+                    "The system audio route changed and audio capture could not restart",
                     stage: "audio_recovery_exhausted"
                 )
                 return
@@ -1048,7 +1460,7 @@ final class NativeRealtimeAudioTransport: NSObject {
                     }
                     self.audioRecoveryWorkItem = nil
                     self.audioRecoveryAttempts += 1
-                    self.rebuildDefaultVoiceProcessingEngine(
+                    self.rebuildDefaultFullDuplexEngine(
                         generation: generation
                     )
                 }
@@ -1072,6 +1484,13 @@ final class NativeRealtimeAudioTransport: NSObject {
                       self.audioEngine === engine,
                       self.activeGeneration == generation,
                       !self.stopping else {
+                    return
+                }
+                guard self.sessionUpdated else {
+                    self.scheduleAudioRecoveryStableReset(
+                        engine: engine,
+                        generation: generation
+                    )
                     return
                 }
                 let mediaProgressed =
@@ -1113,13 +1532,17 @@ final class NativeRealtimeAudioTransport: NSObject {
         _ buffer: AVAudioPCMBuffer,
         format: AVAudioFormat,
         time: AVAudioTime,
-        generation: Int,
-        epoch: Int
+        epoch: Int,
+        routingToken: AudioCaptureRoutingToken,
+        bufferHostTime: UInt64?
     ) {
         guard reserveCaptureSlot() else {
             stateQueue.async {
-                guard self.activeGeneration == generation,
-                      self.mediaEpoch == epoch else {
+                guard self.mediaEpoch == epoch,
+                      self.acceptsCaptureRouting(
+                          routingToken,
+                          bufferHostTime: bufferHostTime
+                      ) else {
                     return
                 }
                 self.droppedCaptureChunks += 1
@@ -1160,10 +1583,33 @@ final class NativeRealtimeAudioTransport: NSObject {
             )
             self.stateQueue.async {
                 defer { self.releaseCaptureSlot() }
+                guard self.mediaEpoch == epoch,
+                      self.isCurrentCaptureRoutingToken(routingToken) else {
+                    return
+                }
+                guard let bufferHostTime else {
+                    if self.captureTimingHealth.record(
+                        timestampAvailable: false
+                    ) {
+                        self.handleUnavailableCaptureTiming()
+                    }
+                    return
+                }
+                _ = self.captureTimingHealth.record(timestampAvailable: true)
+                guard self.acceptsCaptureRouting(
+                    routingToken,
+                    bufferHostTime: bufferHostTime
+                ), !samples.isEmpty else {
+                    return
+                }
+                if let wakeAudioConsumer = self.wakeAudioConsumer,
+                   let wakeBuffer = Self.wakeAudioBuffer(from: samples) {
+                    self.wakeDeliveredChunks += 1
+                    wakeAudioConsumer(wakeBuffer)
+                }
                 guard self.sessionUpdated,
-                      self.activeGeneration == generation,
-                      self.mediaEpoch == epoch,
-                      !samples.isEmpty else {
+                      let generation = self.activeGeneration,
+                      !self.stopping else {
                     return
                 }
                 self.emitOnMain {
@@ -1173,7 +1619,13 @@ final class NativeRealtimeAudioTransport: NSObject {
                 let filtered = self.echoAdmissionPolicy.filterCapture(
                     samples,
                     startTime: startTime,
-                    playbackActive: false,
+                    playbackActive:
+                        RealtimePlaybackActivityPolicy.isActive(
+                            scheduledPlaybackBuffers:
+                                self.scheduledPlaybackBuffers,
+                            playbackProvisionallyPaused:
+                                self.playbackProvisionallyPaused
+                        ),
                     playbackProvisionallyPaused:
                         self.playbackProvisionallyPaused
                 )
@@ -1183,7 +1635,12 @@ final class NativeRealtimeAudioTransport: NSObject {
                     generation: generation
                 )
                 if filtered.classification == .echoOnly {
-                    self.pendingBargeInPCM.removeAll(keepingCapacity: true)
+                    if !self.echoAdmissionPolicy
+                        .shouldRetainPendingSpeechCandidate(
+                            at: startTime
+                        ) {
+                        self.pendingBargeInPCM.removeAll(keepingCapacity: true)
+                    }
                     self.suppressedEchoChunks += 1
                     self.emitDiagnosticIfUseful()
                     return
@@ -1192,7 +1649,6 @@ final class NativeRealtimeAudioTransport: NSObject {
                     self.appendBargeInPreroll(
                         Self.encodePCM16(filtered.samples)
                     )
-                    self.provisionallyPausePlaybackForBargeIn()
                     return
                 }
                 let pcm = Self.encodePCM16(filtered.samples)
@@ -1230,8 +1686,9 @@ final class NativeRealtimeAudioTransport: NSObject {
         _ buffer: AVAudioPCMBuffer,
         format: AVAudioFormat,
         time: AVAudioTime,
-        generation: Int,
-        epoch: Int
+        epoch: Int,
+        routingToken: AudioCaptureRoutingToken,
+        bufferHostTime: UInt64?
     ) {
         guard let channels = buffer.floatChannelData else { return }
         let frameCount = Int(buffer.frameLength)
@@ -1258,8 +1715,12 @@ final class NativeRealtimeAudioTransport: NSObject {
                 sourceRate: sourceRate
             )
             self.stateQueue.async {
-                guard self.activeGeneration == generation,
+                guard self.activeGeneration != nil,
                       self.mediaEpoch == epoch,
+                      self.acceptsCaptureRouting(
+                          routingToken,
+                          bufferHostTime: bufferHostTime
+                      ),
                       !samples.isEmpty else {
                     return
                 }
@@ -1539,6 +2000,26 @@ final class NativeRealtimeAudioTransport: NSObject {
         return buffer
     }
 
+    private static func wakeAudioBuffer(
+        from samples: [Float]
+    ) -> AVAudioPCMBuffer? {
+        guard !samples.isEmpty,
+              let format = AVAudioFormat(
+                standardFormatWithSampleRate: 24_000,
+                channels: 1
+              ),
+              let buffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: AVAudioFrameCount(samples.count)
+              ),
+              let destination = buffer.floatChannelData?[0] else {
+            return nil
+        }
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        destination.update(from: samples, count: samples.count)
+        return buffer
+    }
+
     private func provisionallyPausePlaybackForBargeIn() {
         guard scheduledPlaybackBuffers > 0,
               !playbackProvisionallyPaused,
@@ -1685,9 +2166,14 @@ final class NativeRealtimeAudioTransport: NSObject {
 
     private func stopCurrent(
         emitClosed: Bool,
-        reason: String
+        reason: String,
+        preserveCaptureForWake: Bool = false
     ) {
         let previousGeneration = activeGeneration
+        if let previousGeneration {
+            markStopRequested(generation: previousGeneration)
+        }
+        advanceCaptureRoutingEpoch()
         let hadActiveTransport =
             previousGeneration != nil
             || webSocketTask != nil
@@ -1710,7 +2196,13 @@ final class NativeRealtimeAudioTransport: NSObject {
                 self.onInputLevel?(previousGeneration, 0)
             }
         }
-        mediaEpoch &+= 1
+        let keepsCaptureRunning =
+            preserveCaptureForWake
+            && audioEngine?.isRunning == true
+            && voiceProcessingEnabled
+        if !keepsCaptureRunning {
+            mediaEpoch &+= 1
+        }
         stopping = true
         openTimeout?.cancel()
         openTimeout = nil
@@ -1723,10 +2215,39 @@ final class NativeRealtimeAudioTransport: NSObject {
         playbackToken += 1
         provisionalPauseToken &+= 1
         playbackProvisionallyPaused = false
-        releaseAudioEngine(
-            generation: previousGeneration,
-            reason: reason
-        )
+        let closeAfterAudioTransition = { [weak self] in
+            guard let self,
+                  emitClosed,
+                  let previousGeneration else {
+                return
+            }
+            self.emitOnMain {
+                self.onClosed?(previousGeneration)
+            }
+        }
+        if keepsCaptureRunning {
+            playerNode?.stop()
+            wakeAudioConsumer = nil
+            wakeAudioFailureHandler = nil
+            VoiceRelayDiagnostics.flow(
+                "microphone_capture_preserved",
+                generation: previousGeneration,
+                fields: [
+                    "backend": "realtime_native_audio",
+                    "next": "local_wake_analysis",
+                    "reason": reason,
+                ]
+            )
+            closeAfterAudioTransition()
+        } else {
+            wakeAudioConsumer = nil
+            wakeAudioFailureHandler = nil
+            releaseAudioEngine(
+                generation: previousGeneration,
+                reason: reason,
+                completion: closeAfterAudioTransition
+            )
+        }
         queuedPlaybackFrames = 0
         scheduledPlaybackBuffers = 0
         playbackBuffersByResponseID.removeAll()
@@ -1766,10 +2287,77 @@ final class NativeRealtimeAudioTransport: NSObject {
                 fields: ["reason": reason]
             )
         }
-        if emitClosed, let previousGeneration {
-            emitOnMain {
-                self.onClosed?(previousGeneration)
-            }
+    }
+
+    private func markStartRequested(generation: Int) {
+        lifecycleSignalLock.withLock {
+            audioStartCancellation.requestStart(generation: generation)
+        }
+    }
+
+    private func markStopRequested(generation: Int) {
+        lifecycleSignalLock.withLock {
+            audioStartCancellation.requestStop(generation: generation)
+        }
+    }
+
+    private func isStartCancelled(generation: Int) -> Bool {
+        lifecycleSignalLock.withLock {
+            audioStartCancellation.isCancelled(generation: generation)
+        }
+    }
+
+    private func currentCaptureRoutingToken() -> AudioCaptureRoutingToken {
+        lifecycleSignalLock.withLock {
+            captureRoutingEpoch.token
+        }
+    }
+
+    private func acceptsCaptureRouting(
+        _ token: AudioCaptureRoutingToken,
+        bufferHostTime: UInt64?
+    ) -> Bool {
+        lifecycleSignalLock.withLock {
+            captureRoutingEpoch.accepts(
+                token,
+                bufferHostTime: bufferHostTime
+            )
+        }
+    }
+
+    private func isCurrentCaptureRoutingToken(
+        _ token: AudioCaptureRoutingToken
+    ) -> Bool {
+        lifecycleSignalLock.withLock {
+            captureRoutingEpoch.isCurrent(token)
+        }
+    }
+
+    private func handleUnavailableCaptureTiming() {
+        if activeGeneration != nil, !stopping {
+            fail(
+                "The microphone did not provide safe capture timing",
+                stage: "capture_timing_unavailable"
+            )
+            return
+        }
+        if activeGeneration == nil,
+           wakeAudioConsumer != nil,
+           let audioEngine {
+            failWakeAudioSource(
+                engine: audioEngine,
+                reason: "capture_timing_unavailable"
+            )
+        }
+    }
+
+    @discardableResult
+    private func advanceCaptureRoutingEpoch() -> AudioCaptureRoutingToken {
+        captureTimingHealth.reset()
+        return lifecycleSignalLock.withLock {
+            captureRoutingEpoch.advance(
+                atHostTime: AudioGetCurrentHostTime()
+            )
         }
     }
 
@@ -1783,7 +2371,8 @@ final class NativeRealtimeAudioTransport: NSObject {
         emitDiagnostic("failed_\(stage)")
         stopCurrent(
             emitClosed: false,
-            reason: "failure_\(stage)"
+            reason: "failure_\(stage)",
+            preserveCaptureForWake: false
         )
         emitOnMain {
             self.onError?(generation, message)

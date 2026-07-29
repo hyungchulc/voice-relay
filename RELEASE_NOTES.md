@@ -1,10 +1,12 @@
-This alpha validates the signed in-app update path and simplifies GitHub release metadata.
+This alpha makes Voice Relay's wake, Realtime, and media handoff substantially more reliable.
 
-- Steer acknowledgements now run with an empty Realtime input context, so they cannot continue an earlier request after a successful Codex steer.
-- Codex commentary and final speech omit source-only blocks, Markdown destinations, bare URLs, and citation markers while preserving the answer text.
-- Spoken stop now remains in a monotonic stopping state until acknowledgement playback drains, so late Realtime events cannot leave the microphone or expanded surface active.
-- Alpha, beta, and release-candidate builds are published as ordinary GitHub releases.
-- The release publisher leaves GitHub's `Latest` selection automatic instead of forcing or suppressing the marker.
-- Sparkle feed publication requires the matching ordinary GitHub release and signed update archive.
-- The internal preview channel, signed update feed, and explicit `v1.0.0` approval gate remain unchanged.
-- Build 24 provides the next signed update target for installed alpha.12 builds.
+- Voice Relay now keeps one microphone capture graph alive when a Realtime session returns to local wake listening, preventing repeated Safari and media playback pauses after spoken stop.
+- Spoken stop and short barge-ins interrupt promptly while the app preserves the capture path needed for the next wake phrase.
+- Wake listening remains available while other media is playing, with stricter isolation between speaker output and human speech.
+- The complete recognized request is handed to Realtime instead of only its final segment.
+- Conversation turns remain in chronological order when a stop command arrives during assistant activity.
+- Manual microphone resume restores the expanded conversation surface without leaving an empty black panel.
+- Realtime follows the user's input language and keeps the configured conversational register without hard-coded language branches.
+- Build 25 is the signed update target for installed Voice Relay alpha builds.
+
+macOS voice processing may still apply a brief system-level duck while the microphone path is active, but the repeated Safari pause and resume cycle is removed.

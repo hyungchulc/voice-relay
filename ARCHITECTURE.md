@@ -68,25 +68,26 @@ active Realtime plane
   -> native PCM16 playback and transcript
 ```
 
-The two audio planes are mutually exclusive. A wake match is delivered only
-after the active SpeechAnalyzer has finished cancellation, released its
-reserved assets, removed its tap, and stopped its engine. Realtime audio starts
-only after the server session is ready. It uses the current macOS default input
-and output without selecting, pinning, or changing an audio device.
+The wake and Realtime analyzers are mutually exclusive, while their native
+capture graph may be reused. The first Realtime handoff fully retires a
+session-owned wake engine before creating the Voice Processing graph. On a
+normal stop, network microphone transmission and playback end immediately,
+but the same local capture graph remains on-device and transfers its PCM
+consumer to SpeechAnalyzer. The next Realtime turn reuses that graph. This
+single-owner transfer avoids tearing down and recreating CoreAudio's Voice
+Processing aggregate while another app is playing media.
 
-Every wake-capture entry path uses one media-aware admission gate. CoreAudio
-query failures remain unknown rather than becoming false idle, previously
-confirmed external playback stays latched across Realtime teardown, and wake
-capture resumes only after time-separated idle samples. A failed modern
-SpeechAnalyzer also stays behind a process-lifetime circuit breaker while the
-classic on-device recognizer remains available.
+Every wake-capture entry path records external output activity for diagnostics,
+but media never blocks wake recognition. A failed modern SpeechAnalyzer stays
+behind a process-lifetime circuit breaker while the classic on-device
+recognizer remains available, and both recognizers can consume the preserved
+local PCM source. The visual stop fallback cannot acquire audio before native
+transport ownership is released.
 
-Realtime keeps Apple Voice Processing active only for the bounded conversation
-lease. On macOS 14 or newer it enables advanced other-audio ducking at Apple's
-minimum level. The public API minimizes attenuation but cannot guarantee zero
-ducking while AEC is active. Keeping Realtime always connected would extend
-that attenuation, network microphone streaming, and idle failure exposure, so
-idle monitoring remains local.
+Apple Voice Processing remains local between completed voice turns after the
+first Realtime session. Advanced activity-driven ducking is disabled and the
+other-audio level is Apple's minimum setting. Keeping the capture graph does
+not keep the Realtime socket or network microphone transmission open.
 
 Swift requests a short-lived Realtime credential with the signed-in local Codex
 OAuth session, keeps both OAuth and ephemeral values only in memory, and
@@ -117,8 +118,8 @@ Completed onboarding starts Realtime as soon as the overlay is presented unless
 microphone access is explicitly denied or restricted. The first greeting marker
 persists separately from transient conversation UI. Accepted user or assistant
 speech refreshes a configurable inactivity deadline. The default five-minute
-deadline closes the socket and audio engine and restores the local wake-phrase
-listener.
+deadline closes the socket, stops assistant playback, and transfers the local
+capture stream back to the wake-phrase listener.
 
 ## Public-state boundary
 
@@ -187,7 +188,10 @@ coordinates.
 
 The notch surface has no editable command field, paste route, or hidden keyboard-input implementation.
 
-Stale voice generations are rejected by generation ID and a native media epoch. Stopping or starting a newer generation closes the older socket, capture tap, and playback queue.
+Stale voice generations are rejected by generation ID and a native media
+epoch. Stopping or starting a newer generation closes the older socket and
+playback queue. Normal stops preserve the single capture tap for local wake
+analysis, while shutdown, failure recovery, and application rebuild retire it.
 Recoverable startup errors are transient UI state, never conversation history or
 the last answer, and collapse back to the compact surface after a bounded delay.
 

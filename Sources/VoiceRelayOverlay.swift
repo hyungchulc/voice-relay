@@ -817,19 +817,9 @@ private final class VoiceStatusIndicatorView: NSView {
     }
 }
 
-private enum ConversationSpeaker: Equatable {
-    case user
-    case assistant
-}
-
 private enum NotchHoverRegion: Hashable {
     case compact
     case conversation
-}
-
-private struct ConversationEntry {
-    let speaker: ConversationSpeaker
-    var text: String
 }
 
 private struct SurfaceAnimationTarget {
@@ -879,6 +869,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         localeIdentifiers: [config.speechLocale] + config.additionalSpeechLocales,
         phrases: config.wakePhrases,
         preferModernSpeechAnalyzer: config.preferModernSpeechAnalyzer,
+        externalAudioSource: realtimeController.wakeAudioSource,
         captureAdmission: { [weak self] reason in
             self?.wakeCaptureDecision(reason: reason) == .start
         }
@@ -928,22 +919,50 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private var panelAnimationGeneration = 0
     private var voiceState = VoiceSurfaceReducer()
     private var lastNotchActivityLayoutState: Bool?
-    private var conversationHistory: [ConversationEntry] = []
+    private var conversationTranscript = ConversationTranscriptState()
     private var streamedAnswer = ""
-    private var realtimeUserDraft = ""
-    private var realtimeDraft = ""
+    private var conversationHistory: [ConversationEntry] {
+        conversationTranscript.history
+    }
+    private var realtimeUserDraft: String {
+        get {
+            guard conversationTranscript.draft?.speaker == .user else {
+                return ""
+            }
+            return conversationTranscript.draft?.text ?? ""
+        }
+        set {
+            conversationTranscript.updateDraft(
+                speaker: .user,
+                text: newValue,
+                limit: config.recentTurnLimit
+            )
+        }
+    }
+    private var realtimeDraft: String {
+        get {
+            guard conversationTranscript.draft?.speaker == .assistant else {
+                return ""
+            }
+            return conversationTranscript.draft?.text ?? ""
+        }
+        set {
+            conversationTranscript.updateDraft(
+                speaker: .assistant,
+                text: newValue,
+                limit: config.recentTurnLimit
+            )
+        }
+    }
     private var cancelledCodexGenerations: Set<Int> = []
     private var activeCodexGeneration: Int?
     private var voiceIdleWorkItem: DispatchWorkItem?
-    private var mediaDetectionWorkItem: DispatchWorkItem?
     private var wakeResumeWorkItem: DispatchWorkItem?
     private var voiceStopFallbackWorkItem: DispatchWorkItem?
     private var localEscapeMonitor: Any?
     private var globalEscapeMonitor: Any?
     private var assistantOutputLifecycle = AssistantOutputLifecycle()
-    private var externalAudioConfirmation = ExternalAudioOutputConfirmation()
     private var wakeCaptureAdmission = WakeCaptureAdmission()
-    private var mediaDetectedGeneration: Int?
     private var assistantFinalGeneration: Int?
     private var finalPlaybackDrainedGeneration: Int?
     private var userActivityGeneration: Int?
@@ -1021,7 +1040,6 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         hoverCollapseWorkItem?.cancel()
         errorCollapseWorkItem?.cancel()
         voiceIdleWorkItem?.cancel()
-        mediaDetectionWorkItem?.cancel()
         wakeResumeWorkItem?.cancel()
         voiceStopFallbackWorkItem?.cancel()
         realtimeStopAcknowledgementFallbackWorkItem?.cancel()
@@ -1133,7 +1151,6 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         hoverCollapseWorkItem?.cancel()
         errorCollapseWorkItem?.cancel()
         voiceIdleWorkItem?.cancel()
-        mediaDetectionWorkItem?.cancel()
         wakeResumeWorkItem?.cancel()
         wakeResumeWorkItem = nil
         voiceStopFallbackWorkItem?.cancel()
@@ -1153,7 +1170,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             voiceState.requestStop()
             realtimeController.stop(
                 generation: voiceState.generation,
-                reason: "surface_rebuild"
+                reason: "surface_rebuild",
+                preserveCaptureForWake: false
             )
         }
         realtimeController.shutdown()
@@ -1190,7 +1208,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             voiceState.requestStop()
             realtimeController.stop(
                 generation: voiceState.generation,
-                reason: "panel_hidden"
+                reason: "panel_hidden",
+                preserveCaptureForWake: config.wakePhraseEnabled
             )
         }
         lastAnswer = ""
@@ -2345,8 +2364,6 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         errorCollapseWorkItem = nil
         voiceIdleWorkItem?.cancel()
         voiceIdleWorkItem = nil
-        mediaDetectionWorkItem?.cancel()
-        mediaDetectionWorkItem = nil
         cancelAnswerLayout()
         assistantOutputLifecycle.cancelAll(
             generation: voiceState.generation
@@ -2430,18 +2447,27 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                   !self.isWaitingForReply else {
                 return false
             }
-            self.show()
-            self.showToast(
-                "다시 왔네",
-                color: self.currentColors().statusText,
-                autoHideAfter: 4
+            guard self.wakeCaptureDecision(
+                reason: "presence_return"
+            ) == .start else {
+                return false
+            }
+            return self.startRealtimeVoice(
+                acknowledgeWake: true,
+                activationReason: "presence_return"
             )
-            return true
         }
     }
 
     private func wireWakePhrase() {
-        wakePhrase.onWake = { [weak self] match in
+        wakePhrase.onWakeCandidate = { [weak self] in
+            guard let self else { return }
+            self.codexClient.prefetchRealtimeCredential(
+                model: self.config.realtimeModel,
+                voice: self.config.realtimeVoice
+            )
+        }
+        wakePhrase.onWake = { [weak self] match, realtimePrefill in
             VoiceRelayDiagnostics.flow(
                 "wake_to_realtime_handoff",
                 fields: [
@@ -2449,10 +2475,13 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                         ? "wake_only"
                         : "wake_with_command",
                 ],
-                transcriptFields: ["command": match.command]
+                transcriptFields: [
+                    "command": match.command,
+                    "text": realtimePrefill,
+                ]
             )
             self?.startRealtimeVoice(
-                prefill: match.command,
+                prefill: realtimePrefill,
                 acknowledgeWake: match.command.isEmpty
             )
         }
@@ -2511,7 +2540,6 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             }
             if phase == .listening {
                 scheduleVoiceIdleTimeout()
-                scheduleExternalAudioCheck(generation: generation)
                 if !assistantOutputLifecycle.isActive {
                     scheduleConversationCollapse(
                         delay: isReplyPreviewVisible
@@ -2524,7 +2552,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             guard let text = event["text"] as? String else { return }
             realtimeUserDraft = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !realtimeUserDraft.isEmpty else { return }
-            beginExternalAudioUserTurn(generation: generation)
+            beginRealtimeUserTurn(generation: generation)
             if resolvedAnchor == .notch {
                 isReplyPreviewVisible = true
                 showConversationHistory(
@@ -2533,11 +2561,15 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             }
         case "userTranscript":
             guard let text = event["text"] as? String else { return }
+            let turnID = (event["turnId"] as? String) ?? ""
             SettingsStore.shared.completedFirstVoiceGreeting = true
             scheduleVoiceIdleTimeout()
-            beginExternalAudioUserTurn(generation: generation)
-            realtimeUserDraft = ""
-            appendConversation(.user, text: text)
+            beginRealtimeUserTurn(generation: generation)
+            appendConversation(
+                .user,
+                text: text,
+                deliveryID: turnID
+            )
             if resolvedAnchor == .notch {
                 isReplyPreviewVisible = true
                 showConversationHistory(
@@ -2591,9 +2623,12 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             SettingsStore.shared.completedFirstVoiceGreeting = true
             assistantFinalGeneration = generation
             scheduleVoiceIdleTimeout()
-            realtimeDraft = ""
             lastAnswer = trimmed
-            appendConversation(.assistant, text: trimmed)
+            appendConversation(
+                .assistant,
+                text: trimmed,
+                deliveryID: responseID
+            )
             isReplyPreviewVisible = true
             showConversationHistory(animated: true)
             if assistantOutputLifecycle.registerNativeFinal(
@@ -2622,14 +2657,16 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             scheduleConversationCollapse(
                 delay: max(config.collapseDelay, 1.1)
             )
-            stopForDetectedMediaIfReady(generation: generation)
         case "stopIntent":
             beginRealtimeSpokenStop(generation: generation)
         case "stopAcknowledgementDrained":
             finishRealtimeSpokenStop(generation: generation)
         case "terminal":
             guard !isShowingTransientError else { return }
-            completeVoiceStop(generation: generation)
+            completeVoiceStop(
+                generation: generation,
+                audioHandoffReady: true
+            )
         case "turnError":
             realtimeDraft = ""
             isWaitingForReply = false
@@ -2660,8 +2697,6 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             isWaitingForReply = false
             voiceIdleWorkItem?.cancel()
-            mediaDetectionWorkItem?.cancel()
-            mediaDetectionWorkItem = nil
             assistantOutputLifecycle.cancelAll(generation: generation)
             if activeCodexGeneration == generation {
                 cancelActiveCodexRequest(
@@ -2679,17 +2714,20 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             )
             realtimeController.stop(
                 generation: generation,
-                reason: "realtime_error"
+                reason: "realtime_error",
+                preserveCaptureForWake: false
             )
         default:
             break
         }
     }
 
+    @discardableResult
     private func startRealtimeVoice(
         prefill: String? = nil,
-        acknowledgeWake: Bool = false
-    ) {
+        acknowledgeWake: Bool = false,
+        activationReason: String? = nil
+    ) -> Bool {
         guard !voiceState.phase.isSessionActive,
               Date() >= nextVoiceStartAllowedAt else {
             VoiceRelayDiagnostics.flow(
@@ -2703,34 +2741,45 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 ],
                 transcriptFields: ["prefill": prefill ?? ""]
             )
-            return
+            return false
         }
+        let resolvedActivationReason = activationReason
+            ?? (acknowledgeWake
+                ? "wake_only"
+                : (prefill?.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ).isEmpty == false
+                    ? "wake_with_command"
+                    : "manual"))
         nextVoiceStartAllowedAt = Date().addingTimeInterval(0.8)
         hoverStartWorkItem?.cancel()
+        hoverCollapseWorkItem?.cancel()
+        hoverCollapseWorkItem = nil
         errorCollapseWorkItem?.cancel()
         errorCollapseWorkItem = nil
         isShowingTransientError = false
-        isHoverPreviewVisible = false
-        isReplyPreviewVisible = false
         realtimeDraft = ""
-        resetExternalAudioMonitoring()
+        resetRealtimeTurnState()
+        let preserveExpandedConversation =
+            stabilizeExpandedConversationForVoiceRestart()
+        if !preserveExpandedConversation {
+            isHoverPreviewVisible = false
+            isReplyPreviewVisible = false
+        }
         wakeResumeWorkItem?.cancel()
         wakeResumeWorkItem = nil
         hideToast(animated: false)
         realtimeStopAcknowledgementFallbackWorkItem?.cancel()
         realtimeStopAcknowledgementFallbackWorkItem = nil
-        setAnswerVisible(false, animated: config.animateSurface)
-        wakePhrase.pause(reason: "realtime_handoff")
+        if !preserveExpandedConversation {
+            setAnswerVisible(false, animated: config.animateSurface)
+        }
         let generation = voiceState.begin()
         VoiceRelayDiagnostics.flow(
             "realtime_surface_starting",
             generation: generation,
             fields: [
-                "reason": prefill?.trimmingCharacters(
-                    in: .whitespacesAndNewlines
-                ).isEmpty == false
-                    ? "wake_with_command"
-                    : (acknowledgeWake ? "wake_only" : "manual"),
+                "reason": resolvedActivationReason,
                 "wake_microphone": "paused",
             ],
             transcriptFields: ["prefill": prefill ?? ""]
@@ -2739,10 +2788,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         userActivityGeneration = nil
         assistantFinalGeneration = nil
         finalPlaybackDrainedGeneration = nil
-        mediaDetectedGeneration = nil
-        externalAudioConfirmation.reset()
         scheduleVoiceIdleTimeout()
-        scheduleExternalAudioCheck(generation: generation)
         prepareCodexGeneration(generation)
         if !panel.isVisible {
             show()
@@ -2750,16 +2796,36 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         updateVoiceSurface()
 
         let exactPrefill = prefill?.trimmingCharacters(in: .whitespacesAndNewlines)
-        realtimeController.start(
-            generation: generation,
-            prefill: exactPrefill?.isEmpty == false ? exactPrefill : nil,
-            shouldGreet: acknowledgeWake
-                || (conversationHistory.isEmpty
-                    && !SettingsStore.shared.completedFirstVoiceGreeting),
-            reason: exactPrefill?.isEmpty == false
-                ? "wake_with_command"
-                : (acknowledgeWake ? "wake_only" : "manual")
+        let shouldGreet = acknowledgeWake
+            || (conversationHistory.isEmpty
+                && !SettingsStore.shared.completedFirstVoiceGreeting)
+        wakePhrase.pause(
+            reason: "realtime_handoff",
+            cleanupCompletion: { [weak self] in
+                guard let self,
+                      self.voiceState.generation == generation,
+                      self.voiceState.phase == .starting else {
+                    return
+                }
+                VoiceRelayDiagnostics.flow(
+                    "wake_cleanup_barrier_released",
+                    generation: generation,
+                    fields: [
+                        "next": "realtime_start",
+                        "reason": resolvedActivationReason,
+                    ]
+                )
+                self.realtimeController.start(
+                    generation: generation,
+                    prefill: exactPrefill?.isEmpty == false
+                        ? exactPrefill
+                        : nil,
+                    shouldGreet: shouldGreet,
+                    reason: resolvedActivationReason
+                )
+            }
         )
+        return true
     }
 
     private func wakeCaptureDecision(
@@ -2862,96 +2928,22 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
-    private func scheduleExternalAudioCheck(
-        generation: Int,
-        delay: TimeInterval = 0.25
-    ) {
-        guard voiceState.generation == generation,
-              voiceState.phase.isSessionActive,
-              mediaDetectedGeneration != generation,
-              mediaDetectionWorkItem == nil else {
-            return
-        }
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.mediaDetectionWorkItem = nil
-            guard self.voiceState.generation == generation,
-                  self.voiceState.phase.isSessionActive,
-                  self.mediaDetectedGeneration != generation else {
-                return
-            }
-            let snapshot = self.mediaPlaybackDetector.snapshot()
-            _ = self.wakeCaptureAdmission.observe(snapshot)
-            if self.externalAudioConfirmation.observe(snapshot) {
-                self.mediaDetectedGeneration = generation
-                VoiceRelayDiagnostics.flow(
-                    "external_audio_detected",
-                    generation: generation,
-                    fields: [
-                        "process_count": String(snapshot.processLabels.count),
-                        "processes":
-                            snapshot.processLabels.sorted()
-                                .joined(separator: ","),
-                    ]
-                )
-                self.stopForDetectedMediaIfReady(generation: generation)
-                return
-            }
-            self.scheduleExternalAudioCheck(generation: generation)
-        }
-        mediaDetectionWorkItem = workItem
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + delay,
-            execute: workItem
-        )
-    }
-
-    private func stopForDetectedMediaIfReady(generation: Int) {
-        guard voiceState.generation == generation,
-              voiceState.phase.isSessionActive,
-              mediaDetectedGeneration == generation else {
-            return
-        }
-        guard ExternalMediaVoiceYieldPolicy.shouldStop(
-            mediaConfirmed: mediaDetectedGeneration == generation,
-            finalPlaybackDrained: finalPlaybackDrainedGeneration == generation,
-            userActivityObserved: userActivityGeneration == generation,
-            assistantFinalObserved: assistantFinalGeneration == generation,
-            backendWorkActive: activeCodexGeneration == generation,
-            phase: voiceState.phase
-        ) else {
-            return
-        }
-        requestVoiceSessionStop(
-            generation: generation,
-            reason: "external_audio_yield",
-            interruptsCodex: false
-        )
-    }
-
-    private func beginExternalAudioUserTurn(generation: Int) {
+    private func beginRealtimeUserTurn(generation: Int) {
         let beginsNewTurn = ExternalMediaTurnBoundaryPolicy.beginsNewUserTurn(
             userActivityObserved: userActivityGeneration == generation,
             assistantFinalObserved: assistantFinalGeneration == generation,
             finalPlaybackDrained: finalPlaybackDrainedGeneration == generation,
-            mediaConfirmed: mediaDetectedGeneration == generation,
+            mediaConfirmed: false,
             assistantOutputActive: assistantOutputLifecycle.isActive
         )
         userActivityGeneration = generation
         guard beginsNewTurn else { return }
         assistantOutputLifecycle.cancelAll(generation: generation)
-        externalAudioConfirmation.reset()
-        mediaDetectedGeneration = nil
         assistantFinalGeneration = nil
         finalPlaybackDrainedGeneration = nil
-        scheduleExternalAudioCheck(generation: generation)
     }
 
-    private func resetExternalAudioMonitoring() {
-        mediaDetectionWorkItem?.cancel()
-        mediaDetectionWorkItem = nil
-        externalAudioConfirmation.reset()
-        mediaDetectedGeneration = nil
+    private func resetRealtimeTurnState() {
         assistantFinalGeneration = nil
         finalPlaybackDrainedGeneration = nil
         userActivityGeneration = nil
@@ -2968,8 +2960,6 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         }
         voiceIdleWorkItem?.cancel()
         voiceIdleWorkItem = nil
-        mediaDetectionWorkItem?.cancel()
-        mediaDetectionWorkItem = nil
         assistantOutputLifecycle.cancelAll(generation: generation)
         if interruptsCodex, activeCodexGeneration == generation {
             cancelActiveCodexRequest(
@@ -2986,10 +2976,14 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             ]
         )
         voiceState.requestStop()
+        collapseEmptyVoiceSurfaceAfterStop(
+            forceHoverExit: reason == "voice_toggle"
+        )
         updateVoiceSurface()
         realtimeController.stop(
             generation: generation,
-            reason: reason
+            reason: reason,
+            preserveCaptureForWake: config.wakePhraseEnabled
         )
 
         voiceStopFallbackWorkItem?.cancel()
@@ -2999,7 +2993,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                   self.voiceState.phase == .stopping else {
                 return
             }
-            self.completeVoiceStop(generation: generation)
+            self.completeVoiceStop(
+                generation: generation,
+                audioHandoffReady: false
+            )
         }
         voiceStopFallbackWorkItem = fallback
         DispatchQueue.main.asyncAfter(
@@ -3015,8 +3012,6 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         }
         voiceIdleWorkItem?.cancel()
         voiceIdleWorkItem = nil
-        mediaDetectionWorkItem?.cancel()
-        mediaDetectionWorkItem = nil
         assistantOutputLifecycle.cancelAll(generation: generation)
         if activeCodexGeneration == generation {
             cancelActiveCodexRequest(
@@ -3064,7 +3059,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         )
     }
 
-    private func completeVoiceStop(generation: Int) {
+    private func completeVoiceStop(
+        generation: Int,
+        audioHandoffReady: Bool
+    ) {
         guard voiceState.generation == generation else { return }
         realtimeStopAcknowledgementFallbackWorkItem?.cancel()
         realtimeStopAcknowledgementFallbackWorkItem = nil
@@ -3073,12 +3071,42 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         isWaitingForReply = false
         voiceIdleWorkItem?.cancel()
         voiceIdleWorkItem = nil
-        resetExternalAudioMonitoring()
+        conversationTranscript.sealDraftAtSessionBoundary(
+            limit: config.recentTurnLimit
+        )
+        resetRealtimeTurnState()
         voiceState.finishStop()
         hideToast(animated: false)
+        collapseEmptyVoiceSurfaceAfterStop(forceHoverExit: false)
         updateVoiceSurface()
         scheduleConversationCollapse(delay: max(config.collapseDelay, 1.1))
-        resumeWakePhraseSoon()
+        if audioHandoffReady {
+            resumeWakePhraseSoon(
+                reason: "persistent_capture_handoff_ready"
+            )
+        }
+    }
+
+    private func collapseEmptyVoiceSurfaceAfterStop(
+        forceHoverExit: Bool
+    ) {
+        guard VoiceSurfaceCollapsePolicy.shouldCollapseAfterStop(
+            renderedText: answerTextView.string
+        ) else {
+            return
+        }
+        hoverCollapseWorkItem?.cancel()
+        hoverCollapseWorkItem = nil
+        isHoverPreviewVisible = false
+        isReplyPreviewVisible = false
+        replyRetainUntil = .distantPast
+        realtimeUserDraft = ""
+        realtimeDraft = ""
+        if forceHoverExit {
+            hoveredNotchRegions.removeAll()
+            isHoveringNotch = false
+        }
+        setAnswerVisible(false, animated: false)
     }
 
     private func prepareCodexGeneration(_ generation: Int) {
@@ -3236,6 +3264,74 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         )
     }
 
+    private func stabilizeExpandedConversationForVoiceRestart() -> Bool {
+        let hasConversation =
+            !conversationHistory.isEmpty
+            || !lastAnswer.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty
+        let answerAnimationInFlight = surfaceAnimationTarget.map {
+            $0.startAnswerHeight > 0 || $0.answerHeight > 0
+        } ?? false
+        guard VoiceSurfaceRestartPolicy.shouldStabilizeExpandedConversation(
+            answerTargetVisible: answerTargetVisible,
+            answerCardHidden: answerCardView.isHidden,
+            answerAnimationInFlight: answerAnimationInFlight,
+            hasConversation: hasConversation
+        ) else {
+            return false
+        }
+        VoiceRelayDiagnostics.flow(
+            "conversation_surface_restart_stabilized",
+            generation: voiceState.generation,
+            fields: [
+                "answer_animation_in_flight":
+                    String(answerAnimationInFlight),
+                "answer_card_hidden": String(answerCardView.isHidden),
+                "answer_target_visible": String(answerTargetVisible),
+                "reason": "manual_voice_restart",
+            ]
+        )
+
+        cancelAnswerLayout()
+        surfaceAnimationGeneration += 1
+        panelAnimationGeneration += 1
+        stopSurfaceDisplayLink()
+
+        let renderedHistory = setConversationHistoryText()
+        let renderedText: String
+        if renderedHistory.isEmpty {
+            renderedText = lastAnswer.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            setAnswerText(renderedText)
+        } else {
+            renderedText = renderedHistory
+        }
+        guard !renderedText.isEmpty else { return false }
+
+        isReplyPreviewVisible = true
+        answerTargetVisible = true
+        answerCardView.isHidden = false
+        answerCardView.alphaValue = 1
+        currentAnswerHeight = measuredAnswerHeight(for: renderedText)
+        currentAnswerWidth = measuredAnswerWidth(for: renderedText)
+        if resolvedAnchor == .notch {
+            lastNotchActivityLayoutState = NotchPresentation.resolve(
+                phase: voiceState.phase,
+                answerVisible: true,
+                hovering: isHoveringNotch
+            ).headerExpanded
+        }
+        positionPanel(
+            height: desiredPanelHeight(answerVisible: true),
+            animated: false,
+            answerHeight: currentAnswerHeight
+        )
+        scheduleScrollHistoryToBottom()
+        return true
+    }
+
     private func updateVoiceSurface() {
         let colors = currentColors()
         let copy = AppCopy(
@@ -3373,20 +3469,17 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         }
     }
 
-    private func appendConversation(_ speaker: ConversationSpeaker, text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        if let last = conversationHistory.last,
-           last.speaker == speaker,
-           last.text == trimmed {
-            return
-        }
-        conversationHistory.append(ConversationEntry(speaker: speaker, text: trimmed))
-        if conversationHistory.count > config.recentTurnLimit {
-            conversationHistory.removeFirst(
-                conversationHistory.count - config.recentTurnLimit
-            )
-        }
+    private func appendConversation(
+        _ speaker: ConversationSpeaker,
+        text: String,
+        deliveryID: String? = nil
+    ) {
+        conversationTranscript.finalize(
+            speaker: speaker,
+            text: text,
+            deliveryID: deliveryID,
+            limit: config.recentTurnLimit
+        )
     }
 
     private func showConversationHistory(animated: Bool) {

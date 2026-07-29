@@ -121,14 +121,22 @@ assert.equal(
 );
 assert.deepEqual(
   Array.from(responseCreates().at(-1).response.tools[0].parameters.required),
-  ["kind", "social_origin", "spoken_language"],
-  "the route tool must require social-origin and spoken-language classification",
+  ["kind", "social_origin", "spoken_language", "spoken_register"],
+  "the route tool must require social-origin, language, and register classification",
 );
 assert.equal(
   responseCreates().at(-1).response.tools[0]
     .parameters.properties.spoken_language.type,
   "string",
   "the route tool must carry a language tag without a phrase table",
+);
+assert.deepEqual(
+  Array.from(
+    responseCreates().at(-1).response.tools[0]
+      .parameters.properties.spoken_register.enum,
+  ),
+  ["casual", "polite", "neutral"],
+  "the route tool must carry a language-neutral speaking register",
 );
 assert.deepEqual(
   Array.from(
@@ -161,6 +169,7 @@ receive({
     kind: "codex",
     social_origin: "not_applicable",
     spoken_language: "ko",
+    spoken_register: "casual",
   }),
 });
 assert.equal(
@@ -213,6 +222,11 @@ assert.match(
   progressInstructions,
   /BCP 47 tag: "ko"/,
   "handoff speech must use the classified language without receiving the request",
+);
+assert.match(
+  progressInstructions,
+  /speaking register: "casual"/,
+  "handoff speech must preserve the classified conversational register",
 );
 assert.match(
   progressInstructions,
@@ -929,6 +943,7 @@ runtime.receiveRealtimeEvent({
       kind: "codex",
       social_origin: "not_applicable",
       spoken_language: "es-MX",
+      spoken_register: "polite",
     }),
   },
 });
@@ -961,6 +976,11 @@ assert.match(
   /BCP 47 tag: "es-MX"/,
   "handoff progress must support languages outside a hard-coded language pair",
 );
+assert.match(
+  variedHandoffRequest?.response?.instructions || "",
+  /speaking register: "polite"/,
+  "handoff progress must preserve register across configured languages",
+);
 
 const wakeAcknowledgementStart = nativeMessages.length;
 runtime.start({
@@ -991,6 +1011,43 @@ assert.match(
   wakeAcknowledgement.response.instructions,
   /fresh wording freely instead of using a fixed stock phrase/,
   "wake acknowledgement wording must not be fixed",
+);
+
+const presenceReturnStart = nativeMessages.length;
+runtime.start({
+  generation: 70,
+  language: "en-US",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Relay",
+  wakePhrases: ["Relay"],
+  shouldGreet: true,
+  activationReason: "presence_return",
+});
+runtime.transportOpened({ generation: 70 });
+runtime.transportReady({ generation: 70 });
+const presenceReturnGreeting = nativeMessages
+  .slice(presenceReturnStart)
+  .filter(message => message.type === "realtimeSend")
+  .map(message => JSON.parse(message.eventJSON))
+  .find(event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind
+      === "presence_return_greeting"
+  );
+assert.ok(
+  presenceReturnGreeting,
+  "a return candidate must create one spoken presence greeting",
+);
+assert.match(
+  presenceReturnGreeting.response.instructions,
+  /just returned after being away/,
+  "presence return must use the return-specific semantic prompt",
+);
+assert.match(
+  presenceReturnGreeting.response.instructions,
+  /fresh wording freely instead of using a fixed stock phrase/,
+  "presence greeting wording must not be fixed",
 );
 
 const earlyBargeInStart = nativeMessages.length;

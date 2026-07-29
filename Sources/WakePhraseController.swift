@@ -4,8 +4,21 @@ import Foundation
 import OSLog
 import Speech
 
+protocol WakeAudioBufferSource: AnyObject {
+    var wakeAudioFormat: AVAudioFormat? { get }
+
+    @discardableResult
+    func beginWakeAudioDelivery(
+        _ handler: @escaping (AVAudioPCMBuffer) -> Void,
+        onFailure: @escaping () -> Void
+    ) -> Bool
+
+    func endWakeAudioDelivery()
+}
+
 private struct WakeCaptureCandidate: Equatable {
     let match: WakePhraseMatch
+    let realtimePrefill: String
     let isFinal: Bool
     let laneIndex: Int
 }
@@ -21,7 +34,8 @@ final class WakePhraseController {
     private let phrases: [String]
     private let preferModernSpeechAnalyzer: Bool
     private let captureAdmission: (String) -> Bool
-    private let audioEngine = AVAudioEngine()
+    private weak var externalAudioSource: WakeAudioBufferSource?
+    private var legacyAudioEngine: AVAudioEngine?
     private var requests: [SFSpeechAudioBufferRecognitionRequest] = []
     private var tasks: [SFSpeechRecognitionTask] = []
     private var completedLaneIndexes = Set<Int>()
@@ -31,15 +45,22 @@ final class WakePhraseController {
     private var wakeCandidates: [Int: WakeCaptureCandidate] = [:]
     private var modernStartTask: Task<Void, Never>?
     private var modernSession: AnyObject?
+    private var modernCircuitProbeWorkItem: DispatchWorkItem?
+    private var modernStabilityWorkItem: DispatchWorkItem?
+    private var modernRotationWorkItem: DispatchWorkItem?
+    private var retiredWakeAudioOwners: [AnyObject] = []
     private var wantsMonitoring = false
     private var permissionRequestInFlight = false
     private var recognitionGeneration = 0
     private var modernAnalyzerCircuit = WakeAnalyzerCircuitBreaker()
     private var modernTransientRetryCount = 0
+    private var modernRuntimeRetryCount = 0
     private var captureStarted = false
+    private var legacyUsesExternalAudioSource = false
 
     private(set) var isMonitoring = false
-    var onWake: ((WakePhraseMatch) -> Void)?
+    var onWake: ((WakePhraseMatch, String) -> Void)?
+    var onWakeCandidate: (() -> Void)?
     var onState: ((Bool) -> Void)?
     var onError: ((String) -> Void)?
     var onCaptureDeferred: (() -> Void)?
@@ -48,6 +69,7 @@ final class WakePhraseController {
         localeIdentifiers: [String],
         phrases: [String],
         preferModernSpeechAnalyzer: Bool = true,
+        externalAudioSource: WakeAudioBufferSource? = nil,
         captureAdmission: @escaping (String) -> Bool = { _ in true }
     ) {
         let resolved = SettingsStore.resolvedSpeechLocaleIdentifiers(
@@ -59,6 +81,7 @@ final class WakePhraseController {
         }
         self.phrases = SettingsStore.normalizedWakePhrases(phrases)
         self.preferModernSpeechAnalyzer = preferModernSpeechAnalyzer
+        self.externalAudioSource = externalAudioSource
         self.captureAdmission = captureAdmission
         Self.logger.info(
             "Wake configuration locales=\(resolved.joined(separator: ","), privacy: .public) phrase_count=\(self.phrases.count)"
@@ -103,7 +126,10 @@ final class WakePhraseController {
         requestPermissionsAndStart()
     }
 
-    func pause(reason: String = "requested") {
+    func pause(
+        reason: String = "requested",
+        cleanupCompletion: (() -> Void)? = nil
+    ) {
         let hadPendingOrActiveWork =
             wantsMonitoring
             || isMonitoring
@@ -114,12 +140,18 @@ final class WakePhraseController {
             || modernStartTask != nil
             || modernSession != nil
             || captureStarted
-            || audioEngine.isRunning
+            || legacyAudioEngine?.isRunning == true
             || !requests.isEmpty
             || !tasks.isEmpty
         wantsMonitoring = false
-        guard hadPendingOrActiveWork else { return }
-        stopRecognition(reason: reason)
+        guard hadPendingOrActiveWork else {
+            cleanupCompletion?()
+            return
+        }
+        stopRecognition(
+            reason: reason,
+            cleanupCompletion: cleanupCompletion
+        )
     }
 
     private func requestPermissionsAndStart() {
@@ -195,15 +227,19 @@ final class WakePhraseController {
             onCaptureDeferred?()
             return
         }
+        let analyzerCircuitBlocksAttempt =
+            modernAnalyzerCircuit.blocksAttempt()
         if #available(macOS 26.0, *),
            preferModernSpeechAnalyzer,
-           !modernAnalyzerCircuit.isOpen {
+           !analyzerCircuitBlocksAttempt {
             VoiceRelayDiagnostics.flow(
                 "wake_backend_selected",
                 generation: recognitionGeneration,
                 fields: [
                     "backend": "speech_analyzer",
-                    "reason": "preferred_and_available",
+                    "reason": modernAnalyzerCircuit.isOpen
+                        ? "half_open_probe"
+                        : "preferred_and_available",
                 ]
             )
             startModernRecognitionIfPossible()
@@ -319,6 +355,7 @@ final class WakePhraseController {
             diagnosticGeneration: generation,
             locales: locales,
             phrases: phrases,
+            externalAudioSource: externalAudioSource,
             onTranscript: { [weak self] laneIndex, transcript, isFinal in
                 DispatchQueue.main.async {
                     guard let self,
@@ -326,6 +363,10 @@ final class WakePhraseController {
                           self.recognitionGeneration == generation else {
                         return
                     }
+                    self.markModernAnalyzerHealthy(
+                        generation: generation,
+                        reason: "transcript_received"
+                    )
                     _ = self.handleWakeTranscript(
                         transcript,
                         laneIndex: laneIndex,
@@ -354,15 +395,20 @@ final class WakePhraseController {
                             "stage": "runtime",
                         ]
                     )
-                    self.openModernAnalyzerCircuit(
-                        stage: "runtime",
-                        generation: generation
+                    let retryModern =
+                        self.modernRuntimeRetryCount < 1
+                    if retryModern {
+                        self.modernRuntimeRetryCount += 1
+                    } else {
+                        self.openModernAnalyzerCircuit(
+                            stage: "runtime",
+                            generation: generation
+                        )
+                    }
+                    self.restartAfterFullCleanup(
+                        reason: "speech_analyzer_runtime_failure",
+                        delay: retryModern ? 0.15 : 0.8
                     )
-                    self.stopRecognition(
-                        reason: "speech_analyzer_runtime_failure"
-                    )
-                    self.wantsMonitoring = true
-                    self.scheduleRestart()
                 }
             }
         )
@@ -378,8 +424,16 @@ final class WakePhraseController {
                 switch result {
                 case .success:
                     self.modernTransientRetryCount = 0
+                    self.modernCircuitProbeWorkItem?.cancel()
+                    self.modernCircuitProbeWorkItem = nil
                     self.isMonitoring = true
                     self.captureStarted = true
+                    self.scheduleModernAnalyzerStabilityCheck(
+                        generation: generation
+                    )
+                    self.scheduleModernAnalyzerRotation(
+                        generation: generation
+                    )
                     VoiceRelayDiagnostics.flow(
                         "wake_microphone_started",
                         generation: generation,
@@ -405,11 +459,8 @@ final class WakePhraseController {
                         Self.logger.notice(
                             "SpeechAnalyzer audio device was still switching, retrying modern recognition once"
                         )
-                        self.stopRecognition(
-                            reason: "speech_analyzer_start_retry"
-                        )
-                        self.wantsMonitoring = true
-                        self.scheduleRestart(
+                        self.restartAfterFullCleanup(
+                            reason: "speech_analyzer_start_retry",
                             delay: WakeAnalyzerRetryPolicy.retryDelay
                         )
                         return
@@ -431,11 +482,9 @@ final class WakePhraseController {
                         stage: "startup",
                         generation: generation
                     )
-                    self.stopRecognition(
+                    self.restartAfterFullCleanup(
                         reason: "speech_analyzer_start_failure"
                     )
-                    self.wantsMonitoring = true
-                    self.scheduleRestart()
                 }
             }
         }
@@ -499,8 +548,66 @@ final class WakePhraseController {
             return request
         }
 
-        let inputNode = audioEngine.inputNode
-        let captureFormat = inputNode.outputFormat(forBus: 0)
+        legacyUsesExternalAudioSource = false
+        let externalCaptureFormat = externalAudioSource?.wakeAudioFormat
+        let captureFormat: AVAudioFormat
+        if let externalCaptureFormat,
+           externalAudioSource?.beginWakeAudioDelivery({
+               [weak self] buffer in
+               self?.requests.forEach { $0.append(buffer) }
+           }, onFailure: { [weak self] in
+               DispatchQueue.main.async {
+                   guard let self,
+                         self.wantsMonitoring,
+                         self.recognitionGeneration == generation,
+                         self.legacyUsesExternalAudioSource else {
+                       return
+                   }
+                   self.restartAfterFullCleanup(
+                       reason: "legacy_external_audio_source_failed",
+                       delay: 0.15
+                   )
+               }
+           }) == true {
+            legacyUsesExternalAudioSource = true
+            captureFormat = externalCaptureFormat
+        } else {
+            let audioEngine = AVAudioEngine()
+            legacyAudioEngine = audioEngine
+            let inputNode = audioEngine.inputNode
+            captureFormat = inputNode.outputFormat(forBus: 0)
+            inputNode.removeTap(onBus: 0)
+            inputNode.installTap(
+                onBus: 0,
+                bufferSize: 1024,
+                format: nil
+            ) { [weak self] buffer, _ in
+                self?.requests.forEach { $0.append(buffer) }
+            }
+            audioEngine.prepare()
+            do {
+                try audioEngine.start()
+            } catch {
+                inputNode.removeTap(onBus: 0)
+                audioEngine.stop()
+                audioEngine.reset()
+                legacyAudioEngine = nil
+                requests.removeAll()
+                wantsMonitoring = false
+                VoiceRelayDiagnostics.flow(
+                    "wake_backend_failed",
+                    generation: generation,
+                    fields: [
+                        "backend": "legacy_speech",
+                        "error_code": String((error as NSError).code),
+                        "error_domain": (error as NSError).domain,
+                        "stage": "audio_engine_start",
+                    ]
+                )
+                onError?("웨이크워드 마이크를 시작하지 못했어")
+                return
+            }
+        }
         VoiceRelayDiagnostics.flow(
             "wake_microphone_capture_configured",
             generation: generation,
@@ -512,37 +619,11 @@ final class WakePhraseController {
                     format: "%.0f",
                     captureFormat.sampleRate
                 ),
+                "source": legacyUsesExternalAudioSource
+                    ? "persistent_realtime_capture"
+                    : "legacy_speech_engine",
             ]
         )
-        inputNode.removeTap(onBus: 0)
-        inputNode.installTap(
-            onBus: 0,
-            bufferSize: 1024,
-            format: nil
-        ) { [weak self] buffer, _ in
-            self?.requests.forEach { $0.append(buffer) }
-        }
-
-        audioEngine.prepare()
-        do {
-            try audioEngine.start()
-        } catch {
-            inputNode.removeTap(onBus: 0)
-            requests.removeAll()
-            wantsMonitoring = false
-            VoiceRelayDiagnostics.flow(
-                "wake_backend_failed",
-                generation: generation,
-                fields: [
-                    "backend": "legacy_speech",
-                    "error_code": String((error as NSError).code),
-                    "error_domain": (error as NSError).domain,
-                    "stage": "audio_engine_start",
-                ]
-            )
-            onError?("웨이크워드 마이크를 시작하지 못했어")
-            return
-        }
 
         isMonitoring = true
         captureStarted = true
@@ -566,15 +647,24 @@ final class WakePhraseController {
                 guard let self else { return }
                 DispatchQueue.main.async {
                     guard generation == self.recognitionGeneration else { return }
-                    if let transcript =
-                        result?.bestTranscription.formattedString,
-                       self.handleWakeTranscript(
+                    if let transcription = result?.bestTranscription {
+                        let transcripts =
+                            result?.transcriptions.map(\.formattedString)
+                                ?? [transcription.formattedString]
+                        let transcript =
+                            WakeTranscriptCandidatePolicy
+                                .preferredWakeTranscript(
+                                    transcripts: transcripts,
+                                    phrases: self.phrases
+                                )
+                        if self.handleWakeTranscript(
                             transcript,
                             laneIndex: laneIndex,
                             isFinal: result?.isFinal == true,
                             generation: generation
-                       ) {
-                        return
+                        ) {
+                            return
+                        }
                     }
 
                     if error != nil || result?.isFinal == true {
@@ -590,6 +680,7 @@ final class WakePhraseController {
                 }
             }
         }
+        scheduleModernAnalyzerProbeIfNeeded()
     }
 
     @discardableResult
@@ -620,6 +711,9 @@ final class WakePhraseController {
         ) {
             wakeCandidates[laneIndex] = WakeCaptureCandidate(
                 match: match,
+                realtimePrefill: WakeRealtimePrefillPolicy.prefill(
+                    recognizedTranscript: transcript
+                ),
                 isFinal: isFinal,
                 laneIndex: laneIndex
             )
@@ -639,6 +733,7 @@ final class WakePhraseController {
             return false
         }
         guard candidate != pendingWakeCandidate else { return true }
+        onWakeCandidate?()
 
         pendingWakeWorkItem?.cancel()
         pendingWakeWorkItem = nil
@@ -669,20 +764,24 @@ final class WakePhraseController {
                 ],
                 transcriptFields: [
                     "command": candidate.match.command,
-                    "text": transcript,
+                    "text": candidate.realtimePrefill,
                 ]
             )
             self.stopRecognition(
-                reason: "wake_handoff"
-            ) { [weak self] in
-                guard let self, !self.wantsMonitoring else { return }
-                VoiceRelayDiagnostics.flow(
-                    "wake_microphone_released",
-                    generation: generation,
-                    fields: ["next": "realtime_start"]
-                )
-                self.onWake?(candidate.match)
-            }
+                reason: "wake_handoff",
+                cleanupCompletion: { [weak self] in
+                    guard let self, !self.wantsMonitoring else { return }
+                    VoiceRelayDiagnostics.flow(
+                        "wake_cleanup_barrier_released",
+                        generation: generation,
+                        fields: ["next": "realtime_start"]
+                    )
+                    self.onWake?(
+                        candidate.match,
+                        candidate.realtimePrefill
+                    )
+                }
+            )
         }
         pendingWakeWorkItem = item
         DispatchQueue.main.asyncAfter(
@@ -697,7 +796,8 @@ final class WakePhraseController {
 
     private func stopRecognition(
         reason: String,
-        completion: (() -> Void)? = nil
+        completion: (() -> Void)? = nil,
+        cleanupCompletion: (() -> Void)? = nil
     ) {
         let stoppedGeneration = recognitionGeneration
         let backend = modernSession == nil
@@ -718,6 +818,12 @@ final class WakePhraseController {
         )
         restartWorkItem?.cancel()
         restartWorkItem = nil
+        modernCircuitProbeWorkItem?.cancel()
+        modernCircuitProbeWorkItem = nil
+        modernStabilityWorkItem?.cancel()
+        modernStabilityWorkItem = nil
+        modernRotationWorkItem?.cancel()
+        modernRotationWorkItem = nil
         pendingWakeWorkItem?.cancel()
         pendingWakeWorkItem = nil
         pendingWakeCandidate = nil
@@ -742,6 +848,10 @@ final class WakePhraseController {
             )
             completion?()
         }
+        if legacyUsesExternalAudioSource {
+            externalAudioSource?.endWakeAudioDelivery()
+            legacyUsesExternalAudioSource = false
+        }
         requests.forEach { $0.endAudio() }
         tasks.forEach { $0.cancel() }
         requests.removeAll()
@@ -755,14 +865,39 @@ final class WakePhraseController {
            let modernWakeSession =
             modernSession as? SpeechAnalyzerWakeSession {
             modernSession = nil
-            modernWakeSession.stop(completion: finish)
+            modernWakeSession.stop(
+                completion: finish,
+                cleanupCompletion: { [weak self, modernWakeSession] in
+                    guard let self else {
+                        cleanupCompletion?()
+                        return
+                    }
+                    self.retireWakeAudioOwner(
+                        modernWakeSession,
+                        completion: cleanupCompletion
+                    )
+                }
+            )
         } else {
             modernSession = nil
-            if audioEngine.isRunning {
-                audioEngine.stop()
+            let audioEngine = legacyAudioEngine
+            legacyAudioEngine = nil
+            if let audioEngine {
+                if audioEngine.isRunning {
+                    audioEngine.stop()
+                }
+                audioEngine.inputNode.removeTap(onBus: 0)
+                audioEngine.reset()
             }
-            audioEngine.inputNode.removeTap(onBus: 0)
             finish()
+            if let audioEngine {
+                retireWakeAudioOwner(
+                    audioEngine,
+                    completion: cleanupCompletion
+                )
+            } else {
+                cleanupCompletion?()
+            }
         }
     }
 
@@ -805,6 +940,168 @@ final class WakePhraseController {
         )
     }
 
+    private func scheduleModernAnalyzerProbeIfNeeded() {
+        guard #available(macOS 26.0, *),
+              wantsMonitoring,
+              preferModernSpeechAnalyzer,
+              let delay = modernAnalyzerCircuit.remainingCooldown() else {
+            return
+        }
+        modernCircuitProbeWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.modernCircuitProbeWorkItem = nil
+            guard self.wantsMonitoring,
+                  self.modernAnalyzerCircuit.isOpen,
+                  !self.modernAnalyzerCircuit.blocksAttempt() else {
+                return
+            }
+            VoiceRelayDiagnostics.flow(
+                "wake_backend_half_open_probe",
+                generation: self.recognitionGeneration,
+                fields: [
+                    "backend": "speech_analyzer",
+                    "fallback": "legacy_speech",
+                ]
+            )
+            if self.isMonitoring {
+                self.stopRecognition(
+                    reason: "speech_analyzer_half_open_probe",
+                    cleanupCompletion: { [weak self] in
+                        guard let self, self.wantsMonitoring else { return }
+                        self.startRecognitionIfPossible()
+                    }
+                )
+            } else {
+                self.startRecognitionIfPossible()
+            }
+        }
+        modernCircuitProbeWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + max(0.05, delay),
+            execute: item
+        )
+    }
+
+    private func scheduleModernAnalyzerStabilityCheck(
+        generation: Int
+    ) {
+        modernStabilityWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.wantsMonitoring,
+                  self.recognitionGeneration == generation,
+                  self.modernSession != nil else {
+                return
+            }
+            self.markModernAnalyzerHealthy(
+                generation: generation,
+                reason: "stable_runtime"
+            )
+        }
+        modernStabilityWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + 30,
+            execute: item
+        )
+    }
+
+    private func scheduleModernAnalyzerRotation(
+        generation: Int
+    ) {
+        modernRotationWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.wantsMonitoring,
+                  self.recognitionGeneration == generation,
+                  self.modernSession != nil else {
+                return
+            }
+            VoiceRelayDiagnostics.flow(
+                "wake_backend_rotation_started",
+                generation: generation,
+                fields: [
+                    "backend": "speech_analyzer",
+                    "reason": "bounded_session_lifetime",
+                ]
+            )
+            self.restartAfterFullCleanup(
+                reason: "speech_analyzer_session_rotation",
+                delay: 0.05
+            )
+        }
+        modernRotationWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now()
+                + WakeAnalyzerSessionPolicy.maximumContinuousDuration,
+            execute: item
+        )
+    }
+
+    private func restartAfterFullCleanup(
+        reason: String,
+        delay: TimeInterval = 0.8
+    ) {
+        guard wantsMonitoring else { return }
+        let expectedGeneration = recognitionGeneration + 1
+        stopRecognition(
+            reason: reason,
+            cleanupCompletion: { [weak self] in
+                guard let self,
+                      self.wantsMonitoring,
+                      self.recognitionGeneration == expectedGeneration else {
+                    return
+                }
+                self.scheduleRestart(delay: delay)
+            }
+        )
+    }
+
+    private func markModernAnalyzerHealthy(
+        generation: Int,
+        reason: String
+    ) {
+        modernRuntimeRetryCount = 0
+        modernStabilityWorkItem?.cancel()
+        modernStabilityWorkItem = nil
+        guard modernAnalyzerCircuit.close() else { return }
+        VoiceRelayDiagnostics.flow(
+            "wake_backend_circuit_closed",
+            generation: generation,
+            fields: [
+                "backend": "speech_analyzer",
+                "reason": reason,
+            ]
+        )
+    }
+
+    private func retireWakeAudioOwner(
+        _ owner: AnyObject,
+        completion: (() -> Void)?
+    ) {
+        retiredWakeAudioOwners.append(owner)
+        DispatchQueue.main.asyncAfter(
+            deadline: .now()
+                + WakeAudioHandoffPolicy.retiredEngineReleaseDelay
+        ) { [weak self, weak owner] in
+            guard let self else {
+                completion?()
+                return
+            }
+            if let owner {
+                self.retiredWakeAudioOwners.removeAll { $0 === owner }
+            } else {
+                self.retiredWakeAudioOwners.removeAll()
+            }
+            DispatchQueue.main.asyncAfter(
+                deadline: .now()
+                    + WakeAudioHandoffPolicy.postReleaseSettleDelay
+            ) {
+                completion?()
+            }
+        }
+    }
+
     private static func localeKey(_ locale: Locale) -> String {
         locale.identifier
             .replacingOccurrences(of: "-", with: "_")
@@ -817,6 +1114,7 @@ private final class SpeechAnalyzerWakeSession {
     private let diagnosticGeneration: Int
     private let locales: [Locale]
     private let phrases: [String]
+    private weak var externalAudioSource: WakeAudioBufferSource?
     private let onTranscript: (Int, String, Bool) -> Void
     private let onFailure: (Error) -> Void
     private let audioEngine = AVAudioEngine()
@@ -824,49 +1122,55 @@ private final class SpeechAnalyzerWakeSession {
     private let lifecycleLock = NSLock()
     private var analyzer: SpeechAnalyzer?
     private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
+    private var startupTask: Task<Void, Never>?
     private var analysisTask: Task<Void, Never>?
     private var resultTasks: [Task<Void, Never>] = []
     private var reservedLocales: [Locale] = []
+    private var audioConfigurationObserver: NSObjectProtocol?
+    private var configurationRecoveryNotBefore: TimeInterval = 0
     private var stopped = false
     private var audioReleaseCompleted = false
     private var audioReleaseCompletions: [() -> Void] = []
     private var cleanupCompleted = false
+    private var cleanupCompletions: [() -> Void] = []
     private var failureReported = false
+    private var usesExternalAudioSource = false
 
     init(
         diagnosticGeneration: Int,
         locales: [Locale],
         phrases: [String],
+        externalAudioSource: WakeAudioBufferSource?,
         onTranscript: @escaping (Int, String, Bool) -> Void,
         onFailure: @escaping (Error) -> Void
     ) {
         self.diagnosticGeneration = diagnosticGeneration
         self.locales = locales
         self.phrases = phrases
+        self.externalAudioSource = externalAudioSource
         self.onTranscript = onTranscript
         self.onFailure = onFailure
     }
 
     func start(completion: @escaping (Result<Void, Error>) -> Void) {
-        Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
+            defer { self.markStartupFinished() }
             var startupStage = WakeAnalyzerStartStage.assetReservation
             do {
-                var acquiredLocales: [Locale] = []
                 for locale in locales {
                     _ = try await AssetInventory.reserve(locale: locale)
-                    acquiredLocales.append(locale)
-                    if isStopped {
-                        for acquiredLocale in acquiredLocales {
-                            _ = await AssetInventory.release(
-                                reservedLocale: acquiredLocale
-                            )
-                        }
+                    let accepted = self.stateLock.withLock {
+                        guard !self.stopped else { return false }
+                        self.reservedLocales.append(locale)
+                        return true
+                    }
+                    if !accepted {
+                        _ = await AssetInventory.release(
+                            reservedLocale: locale
+                        )
                         return
                     }
-                }
-                stateLock.withLock {
-                    self.reservedLocales = acquiredLocales
                 }
                 let transcribers = locales.map {
                     DictationTranscriber(
@@ -878,7 +1182,10 @@ private final class SpeechAnalyzerWakeSession {
                     )
                 }
                 let modules: [any SpeechModule] = transcribers
-                let naturalFormat = audioEngine.inputNode.outputFormat(forBus: 0)
+                let externalNaturalFormat =
+                    externalAudioSource?.wakeAudioFormat
+                let naturalFormat = externalNaturalFormat
+                    ?? audioEngine.inputNode.outputFormat(forBus: 0)
                 guard let analysisFormat =
                     await SpeechAnalyzer.bestAvailableAudioFormat(
                         compatibleWith: modules,
@@ -919,7 +1226,7 @@ private final class SpeechAnalyzerWakeSession {
                     modules: modules,
                     options: .init(
                         priority: .high,
-                        modelRetention: .lingering
+                        modelRetention: .whileInUse
                     )
                 )
                 startupStage = .analysisContext
@@ -1013,13 +1320,8 @@ private final class SpeechAnalyzerWakeSession {
                     }
                     guard ownsLifecycle else { return false }
 
-                    let inputNode = self.audioEngine.inputNode
-                    inputNode.removeTap(onBus: 0)
-                    inputNode.installTap(
-                        onBus: 0,
-                        bufferSize: 1024,
-                        format: nil
-                    ) { [weak self] buffer, _ in
+                    let consumeBuffer: (AVAudioPCMBuffer) -> Void = {
+                        [weak self] buffer in
                         guard let self else { return }
                         let analyzerBuffer: AVAudioPCMBuffer
                         let resolvedConverter: AVAudioConverter?
@@ -1052,9 +1354,37 @@ private final class SpeechAnalyzerWakeSession {
                             AnalyzerInput(buffer: analyzerBuffer)
                         )
                     }
-                    startupStage = .audioEngineStart
-                    self.audioEngine.prepare()
-                    try self.audioEngine.start()
+                    let usesExternalAudioSource =
+                        self.externalAudioSource?
+                            .beginWakeAudioDelivery(
+                                consumeBuffer,
+                                onFailure: { [weak self] in
+                                    self?.reportFailure(
+                                        WakeRecognitionError
+                                            .audioConfigurationChanged
+                                    )
+                                }
+                            )
+                        == true
+                    self.usesExternalAudioSource =
+                        usesExternalAudioSource
+                    if !usesExternalAudioSource {
+                        let inputNode = self.audioEngine.inputNode
+                        inputNode.removeTap(onBus: 0)
+                        inputNode.installTap(
+                            onBus: 0,
+                            bufferSize: 1024,
+                            format: nil
+                        ) { buffer, _ in
+                            consumeBuffer(buffer)
+                        }
+                        startupStage = .audioEngineStart
+                        self.audioEngine.prepare()
+                        try self.audioEngine.start()
+                        self.configurationRecoveryNotBefore =
+                            ProcessInfo.processInfo.systemUptime + 1.5
+                        self.observeAudioConfigurationChanges()
+                    }
                     self.analysisTask = Task { [weak self] in
                         do {
                             try await analyzer.start(
@@ -1064,6 +1394,15 @@ private final class SpeechAnalyzerWakeSession {
                             self?.reportFailure(error)
                         }
                     }
+                    VoiceRelayDiagnostics.flow(
+                        "wake_audio_source_bound",
+                        generation: self.diagnosticGeneration,
+                        fields: [
+                            "source": usesExternalAudioSource
+                                ? "persistent_realtime_capture"
+                                : "speech_analyzer_engine",
+                        ]
+                    )
                     return true
                 }
                 guard didStart else {
@@ -1084,6 +1423,12 @@ private final class SpeechAnalyzerWakeSession {
                 )
             }
         }
+        stateLock.withLock {
+            startupTask = task
+            if stopped {
+                task.cancel()
+            }
+        }
     }
 
     private static func milliseconds(_ seconds: TimeInterval) -> String {
@@ -1091,23 +1436,31 @@ private final class SpeechAnalyzerWakeSession {
         return String(Int(max(0, seconds * 1_000)))
     }
 
-    func stop(completion: @escaping () -> Void = {}) {
+    func stop(
+        completion: @escaping () -> Void = {},
+        cleanupCompletion: @escaping () -> Void = {}
+    ) {
         stateLock.lock()
         if audioReleaseCompleted {
+            let alreadyCleanedUp = cleanupCompleted
+            if !alreadyCleanedUp {
+                cleanupCompletions.append(cleanupCompletion)
+            }
             stateLock.unlock()
             DispatchQueue.main.async(execute: completion)
+            if alreadyCleanedUp {
+                DispatchQueue.main.async(execute: cleanupCompletion)
+            }
             return
         }
         audioReleaseCompletions.append(completion)
+        cleanupCompletions.append(cleanupCompletion)
         if stopped {
             stateLock.unlock()
             return
         }
         stopped = true
-        let analyzerToCancel = analyzer
-        analyzer = nil
-        let localesToRelease = reservedLocales
-        reservedLocales.removeAll()
+        let startupTaskToAwait = startupTask
         stateLock.unlock()
 
         let stopStartedAt = ProcessInfo.processInfo.systemUptime
@@ -1117,16 +1470,24 @@ private final class SpeechAnalyzerWakeSession {
             fields: ["backend": "speech_analyzer"]
         )
         lifecycleLock.withLock {
+            removeAudioConfigurationObserver()
+            let hadExternalAudioSource = usesExternalAudioSource
+            if hadExternalAudioSource {
+                externalAudioSource?.endWakeAudioDelivery()
+                usesExternalAudioSource = false
+            }
             inputContinuation?.finish()
             inputContinuation = nil
             analysisTask?.cancel()
             analysisTask = nil
             resultTasks.forEach { $0.cancel() }
             resultTasks.removeAll()
-            if audioEngine.isRunning {
-                audioEngine.stop()
+            if !hadExternalAudioSource {
+                if audioEngine.isRunning {
+                    audioEngine.stop()
+                }
+                audioEngine.inputNode.removeTap(onBus: 0)
             }
-            audioEngine.inputNode.removeTap(onBus: 0)
         }
         VoiceRelayDiagnostics.flow(
             "wake_audio_capture_released",
@@ -1140,6 +1501,16 @@ private final class SpeechAnalyzerWakeSession {
         )
         finishAudioRelease()
         Task { [self] in
+            await startupTaskToAwait?.value
+            let cleanupState = stateLock.withLock {
+                let analyzerToCancel = analyzer
+                analyzer = nil
+                let localesToRelease = reservedLocales
+                reservedLocales.removeAll()
+                return (analyzerToCancel, localesToRelease)
+            }
+            let analyzerToCancel = cleanupState.0
+            let localesToRelease = cleanupState.1
             if let analyzerToCancel {
                 await analyzerToCancel.cancelAndFinishNow()
             }
@@ -1171,6 +1542,39 @@ private final class SpeechAnalyzerWakeSession {
         }
     }
 
+    private func markStartupFinished() {
+        stateLock.withLock {
+            startupTask = nil
+        }
+    }
+
+    private func observeAudioConfigurationChanges() {
+        removeAudioConfigurationObserver()
+        audioConfigurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: audioEngine,
+            queue: nil
+        ) { [weak self] _ in
+            guard let self,
+                  ProcessInfo.processInfo.systemUptime
+                    >= self.configurationRecoveryNotBefore else {
+                return
+            }
+            self.reportFailure(
+                WakeRecognitionError.audioConfigurationChanged
+            )
+        }
+    }
+
+    private func removeAudioConfigurationObserver() {
+        if let audioConfigurationObserver {
+            NotificationCenter.default.removeObserver(
+                audioConfigurationObserver
+            )
+        }
+        audioConfigurationObserver = nil
+    }
+
     private func finishAudioRelease() {
         stateLock.lock()
         guard !audioReleaseCompleted else {
@@ -1193,6 +1597,8 @@ private final class SpeechAnalyzerWakeSession {
             return
         }
         cleanupCompleted = true
+        let completions = cleanupCompletions
+        cleanupCompletions.removeAll()
         stateLock.unlock()
         VoiceRelayDiagnostics.flow(
             "wake_cleanup_completed",
@@ -1203,6 +1609,9 @@ private final class SpeechAnalyzerWakeSession {
                 )
             ]
         )
+        DispatchQueue.main.async {
+            completions.forEach { $0() }
+        }
     }
 
     private static func elapsedMilliseconds(
@@ -1281,6 +1690,7 @@ private enum WakeRecognitionError: LocalizedError {
     case noCompatibleAudioFormat
     case noCompatibleAudioConverter
     case audioConversionFailed
+    case audioConfigurationChanged
 
     var errorDescription: String? {
         switch self {
@@ -1290,6 +1700,8 @@ private enum WakeRecognitionError: LocalizedError {
             "호출어 인식용 오디오 변환기를 준비하지 못했어"
         case .audioConversionFailed:
             "호출어 인식용 오디오를 변환하지 못했어"
+        case .audioConfigurationChanged:
+            "호출어 인식 중 오디오 장치 구성이 바뀌었어"
         }
     }
 }

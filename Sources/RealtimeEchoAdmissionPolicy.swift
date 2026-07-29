@@ -33,6 +33,88 @@ struct AudioConfigurationRecoveryPolicy {
     }
 }
 
+struct AudioCaptureRoutingToken: Equatable {
+    let epoch: UInt64
+    let beginsAtHostTime: UInt64
+}
+
+struct AudioCaptureRoutingEpoch {
+    private(set) var token = AudioCaptureRoutingToken(
+        epoch: 0,
+        beginsAtHostTime: 0
+    )
+
+    @discardableResult
+    mutating func advance(
+        atHostTime hostTime: UInt64
+    ) -> AudioCaptureRoutingToken {
+        token = AudioCaptureRoutingToken(
+            epoch: token.epoch &+ 1,
+            beginsAtHostTime: hostTime
+        )
+        return token
+    }
+
+    func accepts(
+        _ candidate: AudioCaptureRoutingToken,
+        bufferHostTime: UInt64?
+    ) -> Bool {
+        guard candidate == token,
+              let bufferHostTime else {
+            return false
+        }
+        return bufferHostTime >= token.beginsAtHostTime
+    }
+
+    func isCurrent(_ candidate: AudioCaptureRoutingToken) -> Bool {
+        candidate == token
+    }
+}
+
+struct AudioCaptureTimingHealth {
+    let maximumUnavailableBuffers: Int
+    private(set) var consecutiveUnavailableBuffers = 0
+
+    init(maximumUnavailableBuffers: Int = 3) {
+        self.maximumUnavailableBuffers = max(1, maximumUnavailableBuffers)
+    }
+
+    mutating func record(timestampAvailable: Bool) -> Bool {
+        if timestampAvailable {
+            consecutiveUnavailableBuffers = 0
+            return false
+        }
+        consecutiveUnavailableBuffers += 1
+        return consecutiveUnavailableBuffers >= maximumUnavailableBuffers
+    }
+
+    mutating func reset() {
+        consecutiveUnavailableBuffers = 0
+    }
+}
+
+enum PersistentAudioCaptureOwner: Equatable {
+    case realtime(generation: Int)
+    case wake
+    case none
+}
+
+struct PersistentAudioCaptureOwnerPolicy {
+    static func resolve(
+        activeGeneration: Int?,
+        realtimeStopping: Bool,
+        wakeConsumerBound: Bool
+    ) -> PersistentAudioCaptureOwner {
+        if let activeGeneration, !realtimeStopping {
+            return .realtime(generation: activeGeneration)
+        }
+        if activeGeneration == nil, wakeConsumerBound {
+            return .wake
+        }
+        return .none
+    }
+}
+
 struct RealtimeEchoFilterResult {
     enum Classification: Equatable {
         case noPlaybackReference
@@ -57,16 +139,16 @@ struct RealtimeEchoAdmissionPolicy {
     private let audibleReferenceHoldDuration: TimeInterval = 0.12
     private let playbackTailDuration: TimeInterval = 1.6
     private let bargeInPermitDuration: TimeInterval = 2.5
-    private let provisionalPauseEchoDecayDuration: TimeInterval = 0.16
-    private let uncertainSpeechConfirmationDuration: TimeInterval = 0.30
+    private let uncertainSpeechConfirmationDuration: TimeInterval = 0.16
+    private let uncertainSpeechGapTolerance: TimeInterval = 0.20
 
     private var referenceStartTick: Int64?
     private var referenceSamples: [Float] = []
     private var audibleReferenceUntil = -Double.greatestFiniteMagnitude
     private var playbackGuardUntil = -Double.greatestFiniteMagnitude
     private var bargeInPermitUntil = -Double.greatestFiniteMagnitude
-    private var provisionalPauseObservedAt: TimeInterval?
     private var uncertainSpeechStartedAt: TimeInterval?
+    private var uncertainSpeechLastObservedAt: TimeInterval?
     private var discardingUnadmittedServerTurn = false
 
     mutating func appendPlaybackReference(
@@ -161,11 +243,9 @@ struct RealtimeEchoAdmissionPolicy {
         }
         let isPlaybackWindow =
             playbackActive || startTime <= playbackGuardUntil
-        let isAudiblePlayback =
-            playbackActive || startTime <= audibleReferenceUntil
         guard isPlaybackWindow else {
-            provisionalPauseObservedAt = nil
             uncertainSpeechStartedAt = nil
+            uncertainSpeechLastObservedAt = nil
             return RealtimeEchoFilterResult(
                 samples: input,
                 classification: .noPlaybackReference,
@@ -177,9 +257,7 @@ struct RealtimeEchoAdmissionPolicy {
             return classifyUncorrelatedPlaybackInput(
                 input,
                 startTime: startTime,
-                requiresPlaybackPause: isAudiblePlayback,
-                playbackProvisionallyPaused:
-                    playbackProvisionallyPaused
+                correlation: 0
             )
         }
 
@@ -216,9 +294,6 @@ struct RealtimeEchoAdmissionPolicy {
             return classifyUncorrelatedPlaybackInput(
                 input,
                 startTime: startTime,
-                requiresPlaybackPause: isAudiblePlayback,
-                playbackProvisionallyPaused:
-                    playbackProvisionallyPaused,
                 correlation: bestCorrelation
             )
         }
@@ -237,7 +312,7 @@ struct RealtimeEchoAdmissionPolicy {
             inputRMS * 0.30
         )
         if residualRMS <= echoOnlyThreshold {
-            uncertainSpeechStartedAt = nil
+            expireUncertainSpeechIfGapExceeded(at: startTime)
             return RealtimeEchoFilterResult(
                 samples: [],
                 classification: .echoOnly,
@@ -246,9 +321,7 @@ struct RealtimeEchoAdmissionPolicy {
         }
 
         guard confirmSustainedSpeech(
-            startTime: startTime,
-            requiresPlaybackPause: isAudiblePlayback,
-            playbackProvisionallyPaused: playbackProvisionallyPaused
+            startTime: startTime
         ) else {
             return RealtimeEchoFilterResult(
                 samples: residual,
@@ -266,12 +339,10 @@ struct RealtimeEchoAdmissionPolicy {
     private mutating func classifyUncorrelatedPlaybackInput(
         _ input: [Float],
         startTime: TimeInterval,
-        requiresPlaybackPause: Bool,
-        playbackProvisionallyPaused: Bool,
         correlation: Float = 0
     ) -> RealtimeEchoFilterResult {
         guard Self.rms(input) >= minimumResidualRMS else {
-            uncertainSpeechStartedAt = nil
+            expireUncertainSpeechIfGapExceeded(at: startTime)
             return RealtimeEchoFilterResult(
                 samples: [],
                 classification: .echoOnly,
@@ -279,10 +350,7 @@ struct RealtimeEchoAdmissionPolicy {
             )
         }
         if confirmSustainedSpeech(
-            startTime: startTime,
-            requiresPlaybackPause: requiresPlaybackPause,
-            playbackProvisionallyPaused:
-                playbackProvisionallyPaused
+            startTime: startTime
         ) {
             return RealtimeEchoFilterResult(
                 samples: input,
@@ -298,30 +366,15 @@ struct RealtimeEchoAdmissionPolicy {
     }
 
     private mutating func confirmSustainedSpeech(
-        startTime: TimeInterval,
-        requiresPlaybackPause: Bool,
-        playbackProvisionallyPaused: Bool
+        startTime: TimeInterval
     ) -> Bool {
-        guard !requiresPlaybackPause
-                || playbackProvisionallyPaused else {
-            provisionalPauseObservedAt = nil
+        if let lastObservedAt = uncertainSpeechLastObservedAt,
+           startTime - lastObservedAt > uncertainSpeechGapTolerance {
             uncertainSpeechStartedAt = nil
-            return false
-        }
-        if playbackProvisionallyPaused {
-            let pauseObservedAt =
-                provisionalPauseObservedAt ?? startTime
-            provisionalPauseObservedAt = pauseObservedAt
-            guard startTime - pauseObservedAt
-                    >= provisionalPauseEchoDecayDuration else {
-                uncertainSpeechStartedAt = nil
-                return false
-            }
-        } else {
-            provisionalPauseObservedAt = nil
         }
         let startedAt = uncertainSpeechStartedAt ?? startTime
         uncertainSpeechStartedAt = startedAt
+        uncertainSpeechLastObservedAt = startTime
         guard startTime - startedAt
                 >= uncertainSpeechConfirmationDuration else {
             return false
@@ -331,12 +384,32 @@ struct RealtimeEchoAdmissionPolicy {
             startTime + bargeInPermitDuration
         )
         uncertainSpeechStartedAt = nil
+        uncertainSpeechLastObservedAt = nil
         return true
     }
 
+    private mutating func expireUncertainSpeechIfGapExceeded(
+        at time: TimeInterval
+    ) {
+        guard let lastObservedAt = uncertainSpeechLastObservedAt else {
+            return
+        }
+        if time - lastObservedAt > uncertainSpeechGapTolerance {
+            uncertainSpeechStartedAt = nil
+            uncertainSpeechLastObservedAt = nil
+        }
+    }
+
+    mutating func shouldRetainPendingSpeechCandidate(
+        at time: TimeInterval
+    ) -> Bool {
+        expireUncertainSpeechIfGapExceeded(at: time)
+        return uncertainSpeechStartedAt != nil
+    }
+
     mutating func cancelProvisionalSpeech() {
-        provisionalPauseObservedAt = nil
         uncertainSpeechStartedAt = nil
+        uncertainSpeechLastObservedAt = nil
     }
 
     mutating func shouldForwardServerEvent(
@@ -374,8 +447,8 @@ struct RealtimeEchoAdmissionPolicy {
         audibleReferenceUntil = -Double.greatestFiniteMagnitude
         playbackGuardUntil = -Double.greatestFiniteMagnitude
         bargeInPermitUntil = -Double.greatestFiniteMagnitude
-        provisionalPauseObservedAt = nil
         uncertainSpeechStartedAt = nil
+        uncertainSpeechLastObservedAt = nil
         discardingUnadmittedServerTurn = false
     }
 

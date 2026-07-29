@@ -56,6 +56,9 @@ final class DirectRealtimeController: NSObject {
     var onCodexSteer: ((String, @escaping (Result<Void, Error>) -> Void) -> Void)?
     var onCredentialRequest: ((@escaping (Result<String, Error>) -> Void) -> Void)?
     var onSDPOffer: ((String, @escaping (Result<String, Error>) -> Void) -> Void)?
+    var wakeAudioSource: WakeAudioBufferSource {
+        transport
+    }
 
     init(
         model: String,
@@ -131,6 +134,18 @@ final class DirectRealtimeController: NSObject {
                 message: message
             )
         }
+        transport.onClosed = { [weak self] generation in
+            guard let self,
+                  self.stoppingGenerations.contains(generation) else {
+                return
+            }
+            self.stoppingGenerations.remove(generation)
+            self.onEvent?([
+                "type": "terminal",
+                "generation": generation,
+                "reason": "native_transport_closed",
+            ])
+        }
     }
 
     func attach(to hostView: NSView) {
@@ -205,7 +220,8 @@ final class DirectRealtimeController: NSObject {
 
     func stop(
         generation: Int,
-        reason: String = "host_stop"
+        reason: String = "host_stop",
+        preserveCaptureForWake: Bool = true
     ) {
         VoiceRelayDiagnostics.flow(
             "realtime_host_stop_requested",
@@ -223,7 +239,8 @@ final class DirectRealtimeController: NSObject {
         activeGeneration = nil
         transport.stop(
             generation: generation,
-            reason: reason
+            reason: reason,
+            preserveCaptureForWake: preserveCaptureForWake
         )
         evaluate(
             method: "stop",
@@ -266,7 +283,8 @@ final class DirectRealtimeController: NSObject {
             )
             transport.stop(
                 generation: generation,
-                reason: "controller_shutdown"
+                reason: "controller_shutdown",
+                preserveCaptureForWake: false
             )
             evaluate(
                 method: "stop",
@@ -457,9 +475,6 @@ extension DirectRealtimeController: WKScriptMessageHandler {
             stoppingGenerations: stoppingGenerations
         ) else {
             return
-        }
-        if type == "terminal", let eventGeneration {
-            stoppingGenerations.remove(eventGeneration)
         }
         onEvent?(body)
     }
@@ -836,7 +851,6 @@ extension DirectRealtimeController: WKScriptMessageHandler {
         "realtimeSend",
         "playbackInterrupt",
         "playbackResume",
-        "terminal",
         "turnError",
         "error",
         "diagnostic",
@@ -919,13 +933,12 @@ private extension DirectRealtimeController {
         });
       }
 
-      function closeSession(generation, emitTerminal = true) {
+      function closeSession() {
         const current = session;
         session = null;
         if (current) {
           try { clearTimeout(current.draftFlushTimer); } catch (_) {}
         }
-        if (emitTerminal) send({ type: "terminal", generation });
       }
 
       function dataSend(payload) {
@@ -1347,11 +1360,31 @@ private extension DirectRealtimeController {
         return "und";
       }
 
-      function handoffProgressInstructions(spokenLanguage) {
+      function normalizeSpokenRegister(value) {
+        const candidate = String(value || "").trim();
+        return new Set(["casual", "polite", "neutral"]).has(candidate)
+          ? candidate
+          : "neutral";
+      }
+
+      function spokenDeliveryBoundary(spokenLanguage, spokenRegister) {
         const language = normalizeSpokenLanguageTag(spokenLanguage);
+        const register = normalizeSpokenRegister(spokenRegister);
+        return [
+          `Speak naturally in the language identified by this BCP 47 tag: ${JSON.stringify(language)}.`,
+          `Match this speaking register: ${JSON.stringify(register)}.`,
+          "Casual means familiar conversational wording without adding honorific distance. Polite means respectful wording. Neutral means preserve the configured session voice without inventing extra formality.",
+          "Do not switch register merely because this is an operational status message."
+        ].join(" ");
+      }
+
+      function handoffProgressInstructions(
+        spokenLanguage,
+        spokenRegister
+      ) {
         return [
           "This response is only a brief UI progress cue for work that has already been delegated.",
-          `Speak naturally in the language identified by this BCP 47 tag: ${JSON.stringify(language)}.`,
+          spokenDeliveryBoundary(spokenLanguage, spokenRegister),
           "Convey only that the user should wait briefly because checking has started. Choose fresh, idiomatic wording in that language instead of a fixed stock phrase.",
           "Do not merely acknowledge receipt. Do not answer the user's request, discuss the request, judge capabilities, mention limitations, ask a follow-up, or use facts from the conversation.",
           "Do not mention Codex, routing, tools, or capabilities.",
@@ -1595,9 +1628,20 @@ private extension DirectRealtimeController {
                 type: "string",
                 description:
                   "BCP 47 language tag matching the language actually spoken in this completed utterance."
+              },
+              spoken_register: {
+                type: "string",
+                enum: ["casual", "polite", "neutral"],
+                description:
+                  "Speaking register used by the user in this utterance. Use neutral only when casual versus polite cannot be determined."
               }
             },
-            required: ["kind", "social_origin", "spoken_language"],
+            required: [
+              "kind",
+              "social_origin",
+              "spoken_language",
+              "spoken_register"
+            ],
             additionalProperties: false
           }
         };
@@ -1640,7 +1684,7 @@ private extension DirectRealtimeController {
             parallel_tool_calls: false,
             metadata: { voice_relay_kind: "route_classifier" },
             instructions:
-              "Call route_voice_turn immediately. Decide semantically from the complete utterance. Set spoken_language to the BCP 47 tag matching the language actually spoken in this utterance. Direct chat is only pure social speech with no factual or contextual content. Every current, factual, personal-context, device-state, external-information, calculation, verification, lookup, analysis, tool, file, app, memory, or source-dependent request must use codex. Set social_origin to user_reply only when the utterance is a social response to the immediately preceding assistant turn, such as a conversational receipt, approval, thanks, repeat request, or farewell, and it adds no work. Set assistant_like_playback when the utterance speaks from the assistant's role or appears to continue or reproduce assistant output. Use independent for other social speech and not_applicable for every non-social route. Mixed social and factual speech must use codex with not_applicable. When in doubt, use codex. Do not answer or produce audio before the tool call."
+              "Call route_voice_turn immediately. Decide semantically from the complete utterance. Set spoken_language to the BCP 47 tag matching the language actually spoken in this utterance. Set spoken_register to casual for familiar conversational wording, polite for respectful wording, and neutral only when the distinction cannot be determined. Direct chat is only pure social speech with no factual or contextual content. Every current, factual, personal-context, device-state, external-information, calculation, verification, lookup, analysis, tool, file, app, memory, or source-dependent request must use codex. Set social_origin to user_reply only when the utterance is a social response to the immediately preceding assistant turn, such as a conversational receipt, approval, thanks, repeat request, or farewell, and it adds no work. Set assistant_like_playback when the utterance speaks from the assistant's role or appears to continue or reproduce assistant output. Use independent for other social speech and not_applicable for every non-social route. Mixed social and factual speech must use codex with not_applicable. When in doubt, use codex. Do not answer or produce audio before the tool call."
           }
         });
       }
@@ -1692,6 +1736,7 @@ private extension DirectRealtimeController {
           send({
             type: "userTranscript",
             generation: session.generation,
+            turnId: String(turn.id || ""),
             text: turn.text
           });
           turn.transcriptAlreadyReported = true;
@@ -1743,6 +1788,7 @@ private extension DirectRealtimeController {
         send({
           type: "userTranscript",
           generation: session.generation,
+          turnId: String(turn.id || ""),
           text: turn.text
         });
         turn.transcriptAlreadyReported = true;
@@ -1777,19 +1823,39 @@ private extension DirectRealtimeController {
                   "acknowledge_only",
                   "clarify"
                 ]
+              },
+              spoken_language: {
+                type: "string",
+                description:
+                  "BCP 47 language tag matching the language actually spoken in this completed utterance."
+              },
+              spoken_register: {
+                type: "string",
+                enum: ["casual", "polite", "neutral"],
+                description:
+                  "Speaking register used by the user in this utterance. Use neutral only when casual versus polite cannot be determined."
               }
             },
-            required: ["action"],
+            required: [
+              "action",
+              "spoken_language",
+              "spoken_register"
+            ],
             additionalProperties: false
           }
         };
       }
 
-      function speakActiveCodexControlAcknowledgement(instructions) {
+      function speakActiveCodexControlAcknowledgement(
+        instructions,
+        spokenLanguage,
+        spokenRegister
+      ) {
         enqueueCodexSpeech(
           "codex_steer",
           [
             "This response is only a brief UI cue for active Codex control.",
+            spokenDeliveryBoundary(spokenLanguage, spokenRegister),
             "Ignore all prior conversational content.",
             "Do not answer any request, mention capabilities or limitations, or continue any prior topic.",
             String(instructions || "").trim()
@@ -1824,7 +1890,7 @@ private extension DirectRealtimeController {
             parallel_tool_calls: false,
             metadata: { voice_relay_kind: "active_codex_control" },
             instructions:
-              "Call route_active_codex_turn immediately. Decide semantically from the complete utterance. Do not answer before the tool call, do not use a phrase list, and do not infer a stop from mere discussion of stopping."
+              "Call route_active_codex_turn immediately. Decide semantically from the complete utterance. Set spoken_language to the BCP 47 tag matching the language actually spoken in this utterance. Set spoken_register to casual for familiar conversational wording, polite for respectful wording, and neutral only when the distinction cannot be determined. Do not answer before the tool call, do not use a phrase list, and do not infer a stop from mere discussion of stopping."
           }
         });
       }
@@ -1845,7 +1911,11 @@ private extension DirectRealtimeController {
         return true;
       }
 
-      function beginSemanticStop(text) {
+      function beginSemanticStop(
+        text,
+        spokenLanguage,
+        spokenRegister
+      ) {
         if (!session || session.lifecycle !== "active") return false;
         const value = String(text || "").trim();
         session.lifecycle = "stop_requested";
@@ -1873,7 +1943,12 @@ private extension DirectRealtimeController {
             tool_choice: "none",
             metadata: { voice_relay_kind: "semantic_stop" },
             instructions:
-              "Give one brief natural confirmation in the user's language that all current voice and Codex work has stopped. Do not add a new topic."
+              [
+                spokenDeliveryBoundary(spokenLanguage, spokenRegister),
+                "Give one very short natural confirmation that all current voice and Codex work has stopped.",
+                "Use no more than five words where the language permits.",
+                "Do not add a new topic."
+              ].join(" ")
           }
         });
         return true;
@@ -1886,11 +1961,17 @@ private extension DirectRealtimeController {
         try { args = JSON.parse(event.arguments || "{}"); } catch (_) {}
         const text = String(session.activeCodexControlText || "").trim();
         const action = String(args.action || "clarify");
+        const spokenLanguage = normalizeSpokenLanguageTag(
+          args.spoken_language
+        );
+        const spokenRegister = normalizeSpokenRegister(
+          args.spoken_register
+        );
         session.controlRouteInFlight = false;
         session.activeCodexControlText = "";
 
         if (action === "stop_session") {
-          beginSemanticStop(text);
+          beginSemanticStop(text, spokenLanguage, spokenRegister);
           return;
         }
 
@@ -1902,7 +1983,9 @@ private extension DirectRealtimeController {
               text
             });
             speakActiveCodexControlAcknowledgement(
-              "Give one brief natural acknowledgement in the user's language that the additional request will be applied now. Do not add facts, advice, or a new topic."
+              "Give one brief natural acknowledgement that the additional request will be applied now. Do not add facts, advice, or a new topic.",
+              spokenLanguage,
+              spokenRegister
             );
           } else {
             acceptUserTurn(text, false, true);
@@ -1910,11 +1993,17 @@ private extension DirectRealtimeController {
         } else if (action === "acknowledge_only") {
           enqueueCodexSpeech(
             "codex_acknowledgement",
-            "Give one brief natural acknowledgement in the user's language. Do not add work, facts, advice, or a new topic."
+            [
+              spokenDeliveryBoundary(spokenLanguage, spokenRegister),
+              "Give one brief natural acknowledgement.",
+              "Do not add work, facts, advice, or a new topic."
+            ].join(" ")
           );
         } else {
           speakActiveCodexControlAcknowledgement(
-            "Ask one brief clarification question in the user's language: should Voice Relay stop the current task, or add the request to it? Do not add facts or advice."
+            "Ask one brief clarification question: should Voice Relay stop the current task, or add the request to it? Do not add facts or advice.",
+            spokenLanguage,
+            spokenRegister
           );
         }
         startNextActiveCodexControlTurn();
@@ -2075,6 +2164,7 @@ private extension DirectRealtimeController {
               send({
                 type: "userTranscript",
                 generation: session.generation,
+                turnId: String(itemID || ""),
                 text
               });
               queueActiveCodexControlTurn(text);
@@ -2118,6 +2208,9 @@ private extension DirectRealtimeController {
             const spokenLanguage = normalizeSpokenLanguageTag(
               args.spoken_language
             );
+            const spokenRegister = normalizeSpokenRegister(
+              args.spoken_register
+            );
             const socialOrigin = kind === "direct_chat"
               ? normalizeSocialOrigin(args.social_origin)
               : "not_applicable";
@@ -2129,6 +2222,7 @@ private extension DirectRealtimeController {
                 ? "playback_contended"
                 : "normal",
               spokenLanguage,
+              spokenRegister,
               socialOrigin,
               text,
               turnID: String(activeTurn?.id || "")
@@ -2194,7 +2288,7 @@ private extension DirectRealtimeController {
             reportActiveUserTurnIfNeeded();
             if (kind === "stop_session") {
               session.pendingCalls.delete(callId);
-              beginSemanticStop(text);
+              beginSemanticStop(text, spokenLanguage, spokenRegister);
               break;
             }
             if (kind === "local_datetime") {
@@ -2274,7 +2368,10 @@ private extension DirectRealtimeController {
             session.codexInFlight = true;
             enqueueCodexSpeech(
               "codex_progress",
-              handoffProgressInstructions(spokenLanguage)
+              handoffProgressInstructions(
+                spokenLanguage,
+                spokenRegister
+              )
             );
             send({
               type: "codexRequest",
@@ -2515,7 +2612,7 @@ private extension DirectRealtimeController {
 
       function start(payload) {
         const generation = Number(payload.generation || 0);
-        closeSession(generation, false);
+        closeSession();
         activeStartGeneration = generation;
         state("starting", generation);
         session = {
@@ -2690,15 +2787,21 @@ private extension DirectRealtimeController {
           acceptUserTurn(prefill, true);
         } else if (startPayload.shouldGreet) {
           session.awaitingFinal = true;
+          const isPresenceReturn =
+            String(startPayload.activationReason || "") === "presence_return";
           dataSend({
             type: "response.create",
             response: {
               tool_choice: "none",
               metadata: {
-                voice_relay_kind: "wake_acknowledgement"
+                voice_relay_kind: isPresenceReturn
+                  ? "presence_return_greeting"
+                  : "wake_acknowledgement"
               },
               instructions:
-                `You are ${session.assistantName} in ${session.productName}. The user just called your configured wake phrase. Give one very brief, natural acknowledgement in ${startPayload.language || "the system language"} that you heard them and are listening, then stop and listen. Choose fresh wording freely instead of using a fixed stock phrase. Do not mention tools, routing, or capabilities.`
+                isPresenceReturn
+                  ? `You are ${session.assistantName} in ${session.productName}. The user has just returned after being away. Give one very brief, natural welcome-back greeting in ${startPayload.language || "the system language"}, then stop and listen. Choose fresh wording freely instead of using a fixed stock phrase. Do not mention tools, routing, absence duration, or capabilities.`
+                  : `You are ${session.assistantName} in ${session.productName}. The user just called your configured wake phrase. Give one very brief, natural acknowledgement in ${startPayload.language || "the system language"} that you heard them and are listening, then stop and listen. Choose fresh wording freely instead of using a fixed stock phrase. Do not mention tools, routing, or capabilities.`
             }
           });
           state("speaking", generation);
@@ -2723,7 +2826,7 @@ private extension DirectRealtimeController {
         if (activeStartGeneration === generation) {
           activeStartGeneration = 0;
         }
-        closeSession(generation, true);
+        closeSession();
       }
 
       function playbackDrained(payload) {

@@ -316,6 +316,10 @@ Codex Remote. The first-install greeting is persisted so an ordinary restart
 does not greet again. When no accepted user speech arrives for the configured
 interval, Realtime closes and the local wake-phrase listener resumes. The
 default interval is five minutes and can be changed in Voice settings.
+When Return Greeting is enabled, fresh input after the configured away interval
+starts one short, naturally worded Realtime welcome only after microphone
+capture is safe. Active media, another voice session, or pending Codex work
+defers the greeting instead of consuming it or showing a fixed toast.
 
 ## License and commercial builds
 

@@ -76,6 +76,126 @@ struct PolicyTests {
             "all diagnostic values must redact credential canaries"
         )
 
+        var transcript = ConversationTranscriptState()
+        transcript.updateDraft(
+            speaker: .assistant,
+            text: "Hang tight",
+            limit: 8
+        )
+        transcript.updateDraft(
+            speaker: .user,
+            text: "멈춰",
+            limit: 8
+        )
+        transcript.updateDraft(
+            speaker: .user,
+            text: "멈춰 줘",
+            limit: 8
+        )
+        transcript.finalize(
+            speaker: .user,
+            text: "멈춰 줘.",
+            deliveryID: "turn-1",
+            limit: 8
+        )
+        expect(
+            transcript.history == [
+                ConversationEntry(
+                    speaker: .assistant,
+                    text: "Hang tight"
+                ),
+                ConversationEntry(
+                    speaker: .user,
+                    text: "멈춰 줘."
+                ),
+            ] && transcript.draft == nil,
+            "a new user turn must seal older assistant progress before finalizing once"
+        )
+
+        transcript.updateDraft(
+            speaker: .assistant,
+            text: "Checking",
+            limit: 8
+        )
+        transcript.updateDraft(
+            speaker: .assistant,
+            text: "Checking now",
+            limit: 8
+        )
+        transcript.finalize(
+            speaker: .assistant,
+            text: "Done",
+            deliveryID: "response-1",
+            limit: 8
+        )
+        transcript.finalize(
+            speaker: .assistant,
+            text: "Done",
+            deliveryID: "response-1",
+            limit: 8
+        )
+        expect(
+            transcript.history.suffix(2) == [
+                ConversationEntry(
+                    speaker: .user,
+                    text: "멈춰 줘."
+                ),
+                ConversationEntry(
+                    speaker: .assistant,
+                    text: "Done"
+                ),
+            ],
+            "streaming assistant updates and a repeated final must produce one durable reply"
+        )
+        transcript.updateDraft(
+            speaker: .assistant,
+            text: "A newer reply",
+            limit: 8
+        )
+        transcript.finalize(
+            speaker: .assistant,
+            text: "Done",
+            deliveryID: "response-1",
+            limit: 8
+        )
+        expect(
+            transcript.draft
+                == ConversationEntry(
+                    speaker: .assistant,
+                    text: "A newer reply"
+                ),
+            "a delayed duplicate final must not clear a newer same-speaker draft"
+        )
+        transcript.sealDraftAtSessionBoundary(limit: 8)
+        expect(
+            transcript.history.last
+                == ConversationEntry(
+                    speaker: .assistant,
+                    text: "A newer reply"
+                )
+                && transcript.draft == nil,
+            "session stop must preserve an interrupted visible draft exactly once"
+        )
+        transcript.finalize(
+            speaker: .assistant,
+            text: "A newer reply",
+            deliveryID: "response-2",
+            limit: 8
+        )
+        expect(
+            transcript.history.suffix(2) == [
+                ConversationEntry(
+                    speaker: .assistant,
+                    text: "A newer reply"
+                ),
+                ConversationEntry(
+                    speaker: .assistant,
+                    text: "A newer reply"
+                ),
+            ],
+            "distinct turns with identical text must remain visible"
+        )
+
         var recoveryPolicy = AudioConfigurationRecoveryPolicy(
             quietWindow: 0.45
         )
@@ -105,10 +225,97 @@ struct PolicyTests {
             !recoveryPolicy.isCurrent(token: laterChange.token),
             "teardown must invalidate pending audio recovery work"
         )
+        var routingEpoch = AudioCaptureRoutingEpoch()
+        let realtimeBufferToken = routingEpoch.advance(atHostTime: 100)
+        let wakeBufferToken = routingEpoch.advance(atHostTime: 200)
+        expect(
+            !routingEpoch.accepts(
+                realtimeBufferToken,
+                bufferHostTime: 150
+            )
+                && !routingEpoch.accepts(
+                    wakeBufferToken,
+                    bufferHostTime: 199
+                )
+                && routingEpoch.accepts(
+                    wakeBufferToken,
+                    bufferHostTime: 200
+                ),
+            "stop-to-wake handoff must reject delayed Realtime buffers"
+        )
+        let nextRealtimeBufferToken = routingEpoch.advance(atHostTime: 300)
+        expect(
+            !routingEpoch.accepts(
+                wakeBufferToken,
+                bufferHostTime: 301
+            )
+                && !routingEpoch.accepts(
+                    nextRealtimeBufferToken,
+                    bufferHostTime: 299
+                )
+                && routingEpoch.accepts(
+                    nextRealtimeBufferToken,
+                    bufferHostTime: 300
+                ),
+            "wake-to-Realtime handoff must reject dormant capture buffers"
+        )
+        var timingHealth = AudioCaptureTimingHealth(
+            maximumUnavailableBuffers: 3
+        )
+        expect(
+            !timingHealth.record(timestampAvailable: false)
+                && !timingHealth.record(timestampAvailable: false)
+                && timingHealth.record(timestampAvailable: false),
+            "missing capture timestamps must fail closed after a bounded threshold"
+        )
+        expect(
+            !timingHealth.record(timestampAvailable: true)
+                && timingHealth.consecutiveUnavailableBuffers == 0,
+            "a valid timestamp must restore capture timing health"
+        )
+        expect(
+            PersistentAudioCaptureOwnerPolicy.resolve(
+                activeGeneration: 12,
+                realtimeStopping: false,
+                wakeConsumerBound: false
+            ) == .realtime(generation: 12),
+            "route changes during Realtime must recover the active session"
+        )
+        expect(
+            PersistentAudioCaptureOwnerPolicy.resolve(
+                activeGeneration: nil,
+                realtimeStopping: true,
+                wakeConsumerBound: true
+            ) == .wake,
+            "route changes after stop must recover the bound wake consumer"
+        )
+        expect(
+            PersistentAudioCaptureOwnerPolicy.resolve(
+                activeGeneration: nil,
+                realtimeStopping: true,
+                wakeConsumerBound: false
+            ) == .none,
+            "an unowned persistent graph must not start speculative recovery"
+        )
 
         let echoReference = (0..<4_800).map { index in
             Float(sin(Double(index) * 2 * .pi * 440 / 24_000)) * 0.20
         }
+        expect(
+            RealtimePlaybackActivityPolicy.isActive(
+                scheduledPlaybackBuffers: 1,
+                playbackProvisionallyPaused: false
+            )
+                && RealtimePlaybackActivityPolicy.isActive(
+                    scheduledPlaybackBuffers: 0,
+                    playbackProvisionallyPaused: true
+                )
+                && !RealtimePlaybackActivityPolicy.isActive(
+                    scheduledPlaybackBuffers: 0,
+                    playbackProvisionallyPaused: false
+                ),
+            "server and microphone echo admission must use the live assistant playback state"
+        )
         var echoAdmission = RealtimeEchoAdmissionPolicy()
         echoAdmission.appendPlaybackReference(
             echoReference,
@@ -172,31 +379,21 @@ struct PolicyTests {
             humanOverlay,
             startTime: 20.12,
             playbackActive: true,
-            playbackProvisionallyPaused: true
+            playbackProvisionallyPaused: false
         )
         expect(
             pausedBargeIn.classification == .uncertainSpeech,
-            "barge-in confirmation must start after playback actually pauses"
+            "barge-in confirmation must not interrupt playback on first suspicion"
         )
         let decayedBargeIn = bargeInAdmission.filterCapture(
             humanOverlay,
             startTime: 20.30,
             playbackActive: true,
-            playbackProvisionallyPaused: true
+            playbackProvisionallyPaused: false
         )
         expect(
-            decayedBargeIn.classification == .uncertainSpeech,
-            "speaker echo decay time must not count as confirmed human speech"
-        )
-        let admittedBargeIn = bargeInAdmission.filterCapture(
-            humanOverlay,
-            startTime: 20.62,
-            playbackActive: true,
-            playbackProvisionallyPaused: true
-        )
-        expect(
-            admittedBargeIn.classification == .residualSpeech,
-            "speech must be admitted only after it continues through the confirmation window"
+            decayedBargeIn.classification == .residualSpeech,
+            "speech that survives system echo cancellation must interrupt promptly without a provisional playback pause"
         )
         expect(
             !bargeInAdmission.shouldForwardServerEvent(
@@ -269,36 +466,64 @@ struct PolicyTests {
             decorrelatedSpeech,
             startTime: 25.12,
             playbackActive: true,
-            playbackProvisionallyPaused: true
+            playbackProvisionallyPaused: false
         )
         expect(
             pausedSpeech.classification == .uncertainSpeech,
-            "pre-pause echo time must not count toward human speech confirmation"
+            "one short residual burst must not interrupt assistant playback"
         )
         let decayedSpeech = uncertainAdmission.filterCapture(
             decorrelatedSpeech,
             startTime: 25.30,
             playbackActive: true,
-            playbackProvisionallyPaused: true
+            playbackProvisionallyPaused: false
         )
         expect(
-            decayedSpeech.classification == .uncertainSpeech,
-            "post-pause echo decay must finish before human confirmation starts"
+            decayedSpeech.classification == .residualSpeech,
+            "sustained residual speech must be admitted without first muting assistant playback"
         )
-        let confirmedSpeech = uncertainAdmission.filterCapture(
+        var gapTolerantAdmission = RealtimeEchoAdmissionPolicy()
+        gapTolerantAdmission.markPlaybackActive(at: 26)
+        let gapCandidate = gapTolerantAdmission.filterCapture(
             decorrelatedSpeech,
-            startTime: 25.62,
+            startTime: 26.02,
+            playbackActive: true
+        )
+        let gapPauseStarted = gapTolerantAdmission.filterCapture(
+            decorrelatedSpeech,
+            startTime: 26.05,
             playbackActive: true,
-            playbackProvisionallyPaused: true
+            playbackProvisionallyPaused: false
+        )
+        let quietGap = gapTolerantAdmission.filterCapture(
+            [Float](repeating: 0.001, count: 960),
+            startTime: 26.13,
+            playbackActive: true,
+            playbackProvisionallyPaused: false
+        )
+        let shortCommandTail = gapTolerantAdmission.filterCapture(
+            decorrelatedSpeech,
+            startTime: 26.22,
+            playbackActive: true,
+            playbackProvisionallyPaused: false
         )
         expect(
-            confirmedSpeech.classification == .residualSpeech
-                && uncertainAdmission.shouldForwardServerEvent(
+            gapCandidate.classification == .uncertainSpeech
+                && gapPauseStarted.classification == .uncertainSpeech
+                && quietGap.classification == .echoOnly
+                && shortCommandTail.classification == .residualSpeech
+                && gapTolerantAdmission.shouldForwardServerEvent(
                     type: "input_audio_buffer.speech_started",
                     playbackActive: true,
-                    now: 25.63
+                    now: 26.23
                 ),
-            "speech that continues after provisional playback pause must preserve human barge-in"
+            "a short barge-in must survive a brief quiet or echo gap and interrupt promptly"
+        )
+        expect(
+            !gapTolerantAdmission.shouldRetainPendingSpeechCandidate(
+                at: 26.23
+            ),
+            "committed residual speech must not leave stale preroll behind"
         )
         var playbackTailAdmission = RealtimeEchoAdmissionPolicy()
         playbackTailAdmission.appendPlaybackReference(
@@ -1095,6 +1320,12 @@ struct PolicyTests {
             "wake command tail must be preserved exactly"
         )
         expect(
+            WakeRealtimePrefillPolicy.prefill(
+                recognizedTranscript: "  Aria 영상 좀 멈춰  "
+            ) == "Aria 영상 좀 멈춰",
+            "the complete Apple Speech utterance, including the wake phrase, must reach Realtime"
+        )
+        expect(
             WakePhrasePolicy.match(
                 "오늘 릴레이야 일정 알려줘",
                 phrases: ["릴레이야"]
@@ -1366,6 +1597,60 @@ struct PolicyTests {
         }
         voiceState.finishStop()
         expect(voiceState.phase == .dormantWake, "terminal stop should resume wake state")
+        var audioStartCancellation = AudioStartCancellationState()
+        audioStartCancellation.requestStart(generation: generation)
+        expect(
+            !audioStartCancellation.isCancelled(generation: generation),
+            "a fresh audio generation must begin uncancelled"
+        )
+        audioStartCancellation.requestStop(generation: generation)
+        expect(
+            audioStartCancellation.isCancelled(generation: generation),
+            "manual stop must synchronously cancel the matching in-flight audio start"
+        )
+        audioStartCancellation.requestStart(generation: generation + 1)
+        expect(
+            !audioStartCancellation.isCancelled(generation: generation + 1)
+                && audioStartCancellation.isCancelled(generation: generation),
+            "a newer audio generation must not erase an older stop signal"
+        )
+        expect(
+            VoiceSurfaceCollapsePolicy.shouldCollapseAfterStop(
+                renderedText: "  \n"
+            ),
+            "a stopped voice surface with no rendered text must collapse instead of leaving an empty box"
+        )
+        expect(
+            !VoiceSurfaceCollapsePolicy.shouldCollapseAfterStop(
+                renderedText: "kept answer"
+            ),
+            "a stopped voice surface must preserve a rendered answer"
+        )
+        expect(
+            VoiceSurfaceRestartPolicy.shouldStabilizeExpandedConversation(
+                answerTargetVisible: false,
+                answerCardHidden: false,
+                answerAnimationInFlight: true,
+                hasConversation: true
+            ),
+            "manual restart during collapse must stabilize the visible conversation before starting"
+        )
+        expect(
+            !VoiceSurfaceRestartPolicy.shouldStabilizeExpandedConversation(
+                answerTargetVisible: false,
+                answerCardHidden: true,
+                answerAnimationInFlight: false,
+                hasConversation: true
+            )
+                && !VoiceSurfaceRestartPolicy
+                    .shouldStabilizeExpandedConversation(
+                        answerTargetVisible: true,
+                        answerCardHidden: false,
+                        answerAnimationInFlight: true,
+                        hasConversation: false
+                    ),
+            "manual restart must not reopen a fully collapsed or empty conversation surface"
+        )
 
         var assistantOutput = AssistantOutputLifecycle()
         assistantOutput.reset(generation: generation)
@@ -1419,12 +1704,12 @@ struct PolicyTests {
             "wake monitoring should resume only after voice and output are idle"
         )
         expect(
-            !WakeMonitoringResumePolicy.shouldStart(
+            WakeMonitoringResumePolicy.shouldStart(
                 voiceSessionActive: false,
                 externalAudioPlaying: true,
                 assistantOutputActive: false
             ),
-            "wake monitoring must stay paused while external media is playing"
+            "wake monitoring must remain available while external media is playing"
         )
         expect(
             !WakeMonitoringResumePolicy.shouldStart(
@@ -1443,8 +1728,10 @@ struct PolicyTests {
             "wake monitoring must stay paused until assistant output finishes"
         )
         expect(
-            WakeMonitoringResumePolicy.activationDelay >= 1.5,
-            "wake monitoring must wait for the Realtime aggregate audio device to settle"
+            WakeMonitoringResumePolicy.activationDelay <= 0.5
+                && WakeAudioHandoffPolicy.retiredEngineReleaseDelay > 0
+                && WakeAudioHandoffPolicy.postReleaseSettleDelay > 0,
+            "wake handoff must use a short explicit engine-retirement barrier without an aggregate-device delay"
         )
         var wakeAdmission = WakeCaptureAdmission()
         let playingSnapshot = ExternalAudioPlaybackSnapshot(
@@ -1456,26 +1743,19 @@ struct PolicyTests {
             isAvailable: false
         )
         expect(
-            wakeAdmission.observe(playingSnapshot, now: 1.0) == .waitForMedia,
-            "external playback must latch wake capture closed"
+            wakeAdmission.observe(playingSnapshot, now: 1.0) == .start,
+            "external playback must not block wake capture"
         )
         expect(
             wakeAdmission.observe(unavailableSnapshot, now: 2.0)
-                == .waitForDetector,
-            "a CoreAudio query failure must never be treated as idle"
+                == .start,
+            "a media detector failure must not disable wake capture"
         )
         expect(
-            wakeAdmission.observe(idleSnapshot, now: 3.0)
-                == .waitForStableIdle
-                && wakeAdmission.observe(idleSnapshot, now: 3.1)
-                    == .waitForStableIdle,
-            "duplicate idle checks inside one transition must not clear the media latch"
-        )
-        expect(
-            wakeAdmission.observe(idleSnapshot, now: 3.3)
-                == .waitForStableIdle
-                && wakeAdmission.observe(idleSnapshot, now: 3.6) == .start,
-            "wake capture must reopen only after stable, time-separated idle samples"
+            wakeAdmission.observe(idleSnapshot, now: 3.0) == .start
+                && !wakeAdmission.mediaLatched
+                && wakeAdmission.stableIdleSamples == 0,
+            "wake capture admission must stay media-independent"
         )
         expect(
             WakeAnalyzerRetryPolicy.shouldRetry(
@@ -1505,15 +1785,70 @@ struct PolicyTests {
             "the modern wake analyzer circuit must begin closed"
         )
         expect(
-            analyzerCircuit.open(stage: "runtime")
+            analyzerCircuit.open(stage: "runtime", now: 100)
                 && analyzerCircuit.isOpen
-                && analyzerCircuit.failureStage == "runtime",
-            "a SpeechAnalyzer runtime failure must open the process-lifetime circuit"
+                && analyzerCircuit.failureStage == "runtime"
+                && analyzerCircuit.blocksAttempt(at: 110)
+                && analyzerCircuit.remainingCooldown(at: 110) == 5,
+            "a SpeechAnalyzer runtime failure must open a bounded cooldown"
         )
         expect(
-            !analyzerCircuit.open(stage: "startup")
-                && analyzerCircuit.failureStage == "runtime",
-            "the first SpeechAnalyzer failure stage must remain stable after the circuit opens"
+            !analyzerCircuit.blocksAttempt(at: 115),
+            "the SpeechAnalyzer circuit must permit a half-open retry after cooldown"
+        )
+        expect(
+            !analyzerCircuit.open(stage: "startup", now: 115)
+                && analyzerCircuit.failureStage == "runtime"
+                && analyzerCircuit.failureCount == 2
+                && analyzerCircuit.retryNotBefore == 145,
+            "repeat SpeechAnalyzer failure must back off without losing the first stage"
+        )
+        expect(
+            analyzerCircuit.close()
+                && !analyzerCircuit.isOpen
+                && analyzerCircuit.failureCount == 0,
+            "stable SpeechAnalyzer runtime must fully close the circuit"
+        )
+        expect(
+            WakeTranscriptCandidatePolicy.preferredWakeTranscript(
+                transcripts: ["Arya", "Aria"],
+                phrases: ["Aria"]
+            ) == "Aria",
+            "legacy recognition must prefer a complete alternative that exactly matches the wake phrase"
+        )
+        let unrelatedWakeAlternative =
+            WakeTranscriptCandidatePolicy.preferredWakeTranscript(
+                transcripts: ["area", "a rear"],
+                phrases: ["Aria"]
+            )
+        expect(
+            WakePhrasePolicy.match(
+                unrelatedWakeAlternative,
+                phrases: ["Aria"]
+            ) == nil,
+            "complete alternatives must not weaken exact wake matching"
+        )
+        expect(
+            WakePhrasePolicy.match(
+                "please Aria help",
+                phrases: ["Aria"]
+            ) == nil,
+            "wake phrases embedded later in a transcript must stay rejected"
+        )
+        expect(
+            WakeAnalyzerSessionPolicy.maximumContinuousDuration == 600
+                && !WakeAnalyzerSessionPolicy.shouldRotate(
+                startedAt: 100,
+                now: 100
+                    + WakeAnalyzerSessionPolicy.maximumContinuousDuration
+                    - 0.001
+            )
+                && WakeAnalyzerSessionPolicy.shouldRotate(
+                    startedAt: 100,
+                    now: 100
+                        + WakeAnalyzerSessionPolicy.maximumContinuousDuration
+                ),
+            "modern wake sessions must rotate only at the bounded lifetime"
         )
 
         var audioConfirmation = ExternalAudioOutputConfirmation()
@@ -1550,61 +1885,6 @@ struct PolicyTests {
                 ExternalAudioPlaybackSnapshot(processLabels: ["second.player"])
             ),
             "different one-shot output processes must not combine into media"
-        )
-        expect(
-            !ExternalMediaVoiceYieldPolicy.shouldStop(
-                mediaConfirmed: false,
-                finalPlaybackDrained: true,
-                userActivityObserved: false,
-                assistantFinalObserved: true,
-                backendWorkActive: false,
-                phase: .listening
-            ),
-            "ordinary wake sessions must stay open without confirmed media"
-        )
-        expect(
-            ExternalMediaVoiceYieldPolicy.shouldStop(
-                mediaConfirmed: true,
-                finalPlaybackDrained: true,
-                userActivityObserved: true,
-                assistantFinalObserved: true,
-                backendWorkActive: false,
-                phase: .speaking
-            ),
-            "confirmed media should yield after final playback drains"
-        )
-        expect(
-            ExternalMediaVoiceYieldPolicy.shouldStop(
-                mediaConfirmed: true,
-                finalPlaybackDrained: false,
-                userActivityObserved: false,
-                assistantFinalObserved: false,
-                backendWorkActive: false,
-                phase: .listening
-            ),
-            "confirmed media should release an otherwise idle microphone"
-        )
-        expect(
-            !ExternalMediaVoiceYieldPolicy.shouldStop(
-                mediaConfirmed: true,
-                finalPlaybackDrained: false,
-                userActivityObserved: true,
-                assistantFinalObserved: false,
-                backendWorkActive: false,
-                phase: .listening
-            ),
-            "media detection must not interrupt an active user turn"
-        )
-        expect(
-            !ExternalMediaVoiceYieldPolicy.shouldStop(
-                mediaConfirmed: true,
-                finalPlaybackDrained: true,
-                userActivityObserved: true,
-                assistantFinalObserved: true,
-                backendWorkActive: true,
-                phase: .speaking
-            ),
-            "external audio must never interrupt active backend work"
         )
         expect(
             ExternalMediaTurnBoundaryPolicy.beginsNewUserTurn(

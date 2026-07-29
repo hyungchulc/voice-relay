@@ -481,6 +481,30 @@ struct RealtimeStartupRetryState {
     }
 }
 
+struct AudioStartCancellationState {
+    private(set) var cancelledGenerations = Set<Int>()
+
+    mutating func requestStart(generation: Int) {
+        cancelledGenerations.remove(generation)
+        prune(around: generation)
+    }
+
+    mutating func requestStop(generation: Int) {
+        cancelledGenerations.insert(generation)
+        prune(around: generation)
+    }
+
+    func isCancelled(generation: Int) -> Bool {
+        cancelledGenerations.contains(generation)
+    }
+
+    private mutating func prune(around generation: Int) {
+        cancelledGenerations = Set(
+            cancelledGenerations.filter { $0 >= generation - 16 }
+        )
+    }
+}
+
 struct ExternalAudioPlaybackSnapshot: Equatable {
     let processLabels: Set<String>
     let isAvailable: Bool
@@ -502,17 +526,165 @@ struct ExternalAudioPlaybackSnapshot: Equatable {
     }
 }
 
+enum ConversationSpeaker: Equatable {
+    case user
+    case assistant
+}
+
+struct ConversationEntry: Equatable {
+    let speaker: ConversationSpeaker
+    var text: String
+}
+
+struct ConversationTranscriptState {
+    private(set) var history: [ConversationEntry] = []
+    private(set) var draft: ConversationEntry?
+    private var finalizedDeliveryIDs = Set<String>()
+    private var finalizedDeliveryOrder: [String] = []
+    private let maximumRememberedDeliveryIDs = 64
+
+    mutating func updateDraft(
+        speaker: ConversationSpeaker,
+        text: String,
+        limit: Int
+    ) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            clearDraft(speaker: speaker)
+            return
+        }
+        if draft?.speaker == speaker {
+            draft?.text = trimmed
+            return
+        }
+        sealDraft(limit: limit)
+        draft = ConversationEntry(speaker: speaker, text: trimmed)
+    }
+
+    mutating func finalize(
+        speaker: ConversationSpeaker,
+        text: String,
+        deliveryID: String? = nil,
+        limit: Int
+    ) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let normalizedDeliveryID = deliveryID?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !normalizedDeliveryID.isEmpty,
+           finalizedDeliveryIDs.contains(normalizedDeliveryID) {
+            return
+        }
+        let finalizedEntry = ConversationEntry(
+            speaker: speaker,
+            text: trimmed
+        )
+        if draft?.speaker == speaker {
+            draft = nil
+        } else {
+            sealDraft(limit: limit)
+        }
+        append(finalizedEntry, limit: limit)
+        rememberFinalizedDeliveryID(normalizedDeliveryID)
+    }
+
+    mutating func sealDraftAtSessionBoundary(limit: Int) {
+        sealDraft(limit: limit)
+    }
+
+    mutating func clearDraft(speaker: ConversationSpeaker) {
+        guard draft?.speaker == speaker else { return }
+        draft = nil
+    }
+
+    mutating func clearAllDrafts() {
+        draft = nil
+    }
+
+    private mutating func sealDraft(limit: Int) {
+        guard let draft else { return }
+        self.draft = nil
+        append(draft, limit: limit)
+    }
+
+    private mutating func append(
+        _ entry: ConversationEntry,
+        limit: Int
+    ) {
+        history.append(entry)
+        let boundedLimit = max(1, limit)
+        if history.count > boundedLimit {
+            history.removeFirst(history.count - boundedLimit)
+        }
+    }
+
+    private mutating func rememberFinalizedDeliveryID(_ deliveryID: String) {
+        guard !deliveryID.isEmpty,
+              finalizedDeliveryIDs.insert(deliveryID).inserted else {
+            return
+        }
+        finalizedDeliveryOrder.append(deliveryID)
+        if finalizedDeliveryOrder.count > maximumRememberedDeliveryIDs {
+            let removalCount =
+                finalizedDeliveryOrder.count - maximumRememberedDeliveryIDs
+            let removed = Array(
+                finalizedDeliveryOrder.prefix(removalCount)
+            )
+            finalizedDeliveryOrder.removeFirst(removalCount)
+            finalizedDeliveryIDs.subtract(removed)
+        }
+    }
+}
+
 struct WakeAnalyzerCircuitBreaker {
+    static let baseCooldown: TimeInterval = 15
+    static let maximumCooldown: TimeInterval = 120
+
     private(set) var isOpen = false
     private(set) var failureStage = ""
+    private(set) var failureCount = 0
+    private(set) var retryNotBefore: TimeInterval = 0
 
     @discardableResult
-    mutating func open(stage: String) -> Bool {
+    mutating func open(
+        stage: String,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> Bool {
         let changed = !isOpen
         isOpen = true
+        failureCount += 1
         if failureStage.isEmpty {
             failureStage = stage
         }
+        let exponent = min(max(0, failureCount - 1), 3)
+        let cooldown = min(
+            Self.maximumCooldown,
+            Self.baseCooldown * pow(2, Double(exponent))
+        )
+        retryNotBefore = now + cooldown
+        return changed
+    }
+
+    func blocksAttempt(
+        at now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> Bool {
+        isOpen && now < retryNotBefore
+    }
+
+    func remainingCooldown(
+        at now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> TimeInterval? {
+        guard isOpen else { return nil }
+        return max(0, retryNotBefore - now)
+    }
+
+    @discardableResult
+    mutating func close() -> Bool {
+        let changed = isOpen
+        isOpen = false
+        failureStage = ""
+        failureCount = 0
+        retryNotBefore = 0
         return changed
     }
 }
@@ -548,71 +720,21 @@ struct ExternalAudioOutputConfirmation {
 
 enum WakeCaptureAdmissionDecision: Equatable {
     case start
-    case waitForMedia
-    case waitForDetector
-    case waitForStableIdle
 }
 
 struct WakeCaptureAdmission {
-    static let stableIdleSampleRequirement = 3
-    static let minimumIdleSampleInterval: TimeInterval = 0.25
     private(set) var mediaLatched = false
     private(set) var stableIdleSamples = 0
-    private var lastIdleSampleTime: TimeInterval?
 
     mutating func observe(
         _ snapshot: ExternalAudioPlaybackSnapshot,
-        requiredIdleSamples: Int = Self.stableIdleSampleRequirement,
-        now: TimeInterval = ProcessInfo.processInfo.systemUptime
+        requiredIdleSamples _: Int = 1,
+        now _: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) -> WakeCaptureAdmissionDecision {
-        guard snapshot.isAvailable else {
-            stableIdleSamples = 0
-            lastIdleSampleTime = nil
-            return .waitForDetector
-        }
-        if snapshot.isPlaying {
-            mediaLatched = true
-            stableIdleSamples = 0
-            lastIdleSampleTime = nil
-            return .waitForMedia
-        }
-        guard mediaLatched else {
-            stableIdleSamples = 0
-            lastIdleSampleTime = nil
-            return .start
-        }
-        if lastIdleSampleTime == nil
-            || now - (lastIdleSampleTime ?? now)
-                >= Self.minimumIdleSampleInterval {
-            stableIdleSamples += 1
-            lastIdleSampleTime = now
-        }
-        guard stableIdleSamples >= max(1, requiredIdleSamples) else {
-            return .waitForStableIdle
-        }
+        _ = snapshot
         mediaLatched = false
         stableIdleSamples = 0
-        lastIdleSampleTime = nil
         return .start
-    }
-}
-
-enum ExternalMediaVoiceYieldPolicy {
-    static func shouldStop(
-        mediaConfirmed: Bool,
-        finalPlaybackDrained: Bool,
-        userActivityObserved: Bool,
-        assistantFinalObserved: Bool,
-        backendWorkActive: Bool,
-        phase: VoiceSurfacePhase
-    ) -> Bool {
-        guard mediaConfirmed, !backendWorkActive else { return false }
-        if finalPlaybackDrained {
-            return true
-        }
-        return !userActivityObserved
-            && !assistantFinalObserved
-            && phase == .listening
     }
 }
 
@@ -694,16 +816,29 @@ struct AssistantOutputLifecycle {
 }
 
 enum WakeMonitoringResumePolicy {
-    static let activationDelay: TimeInterval = 1.6
+    static let activationDelay: TimeInterval = 0.35
 
     static func shouldStart(
         voiceSessionActive: Bool,
-        externalAudioPlaying: Bool,
+        externalAudioPlaying _: Bool,
         assistantOutputActive: Bool
     ) -> Bool {
         !voiceSessionActive
-            && !externalAudioPlaying
             && !assistantOutputActive
+    }
+}
+
+enum WakeAudioHandoffPolicy {
+    static let retiredEngineReleaseDelay: TimeInterval = 0.08
+    static let postReleaseSettleDelay: TimeInterval = 0.18
+}
+
+enum RealtimePlaybackActivityPolicy {
+    static func isActive(
+        scheduledPlaybackBuffers: Int,
+        playbackProvisionallyPaused: Bool
+    ) -> Bool {
+        scheduledPlaybackBuffers > 0 || playbackProvisionallyPaused
     }
 }
 
@@ -760,8 +895,40 @@ struct VoiceSurfaceReducer {
     }
 }
 
+enum VoiceSurfaceCollapsePolicy {
+    static func shouldCollapseAfterStop(renderedText: String) -> Bool {
+        renderedText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+    }
+}
+
+enum VoiceSurfaceRestartPolicy {
+    static func shouldStabilizeExpandedConversation(
+        answerTargetVisible: Bool,
+        answerCardHidden: Bool,
+        answerAnimationInFlight: Bool,
+        hasConversation: Bool
+    ) -> Bool {
+        hasConversation
+            && (
+                answerTargetVisible
+                || !answerCardHidden
+                || answerAnimationInFlight
+            )
+    }
+}
+
 struct WakePhraseMatch: Equatable {
     let command: String
+}
+
+enum WakeRealtimePrefillPolicy {
+    static func prefill(recognizedTranscript: String) -> String {
+        recognizedTranscript.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+    }
 }
 
 struct SpeechAnalyzerWakeTranscriptReducer {
@@ -908,6 +1075,31 @@ enum WakePhraseCapturePolicy {
             return !lhs.command.isEmpty
         }
         return lhs.command.count > rhs.command.count
+    }
+}
+
+enum WakeTranscriptCandidatePolicy {
+    static let maximumCandidates = 8
+
+    static func preferredWakeTranscript(
+        transcripts: [String],
+        phrases: [String]
+    ) -> String {
+        let bounded = Array(transcripts.prefix(maximumCandidates))
+        return bounded.first(where: {
+            WakePhrasePolicy.match($0, phrases: phrases) != nil
+        }) ?? bounded.first ?? ""
+    }
+}
+
+enum WakeAnalyzerSessionPolicy {
+    static let maximumContinuousDuration: TimeInterval = 10 * 60
+
+    static func shouldRotate(
+        startedAt: TimeInterval,
+        now: TimeInterval
+    ) -> Bool {
+        now - startedAt >= maximumContinuousDuration
     }
 }
 

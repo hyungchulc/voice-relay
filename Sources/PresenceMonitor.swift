@@ -82,6 +82,9 @@ final class PresenceMonitor {
         wasIdle = false
         if onReturnCandidate?() == true {
             defaults.set(now, forKey: lastGreetingKey)
+        } else {
+            candidateClaimed = false
+            wasIdle = true
         }
     }
 }
