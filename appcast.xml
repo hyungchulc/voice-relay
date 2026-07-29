@@ -1,0 +1,19 @@
+<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Voice Relay</title>
+        <item>
+            <title>0.4.0</title>
+            <pubDate>Wed, 29 Jul 2026 04:24:00 +0200</pubDate>
+            <link>https://github.com/hyungchulc/voice-relay/releases/tag/v0.4.0-alpha.11</link>
+            <sparkle:version>22</sparkle:version>
+            <sparkle:shortVersionString>0.4.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/hyungchulc/voice-relay/releases/download/v0.4.0-alpha.11/Voice-Relay-0.4.0-alpha.11-update.zip" length="4747639" type="application/octet-stream" sparkle:edSignature="b53oUXjmQX7kOsX5G/34Zp+gVWwdwux6iRFQieeKpc4zcuTL0XWyxfxKiRjl2UW42jv6Cy8/FlOH754Gbw77DA=="></enclosure>
+        </item>
+    </channel>
+</rss><!-- sparkle-signatures:
+edSignature: D70XG6HcEWvuuF2a+HgLaZUfI9HE9guChA8OYhSQ8fpfBGAZnJV520R7tVc1aga+L4GJQigmEJl/+XiNLVR2BA==
+length: 1174
+-->
