@@ -573,6 +573,24 @@ struct PolicyTests {
             audioAdmission.shouldAdmit(responseID: "codex-final"),
             "spoken final responses must remain eligible for native playback"
         )
+        audioAdmission.register(
+            responseID: "codex-progress",
+            responseKind: "codex_progress"
+        )
+        let preemptedAudioResponses =
+            audioAdmission.suppressActiveAudioResponses()
+        expect(
+            preemptedAudioResponses.contains("codex-progress")
+                && !audioAdmission.shouldAdmit(
+                    responseID: "codex-progress"
+                ),
+            "admitted user speech must suppress a created assistant audio response before its first delta"
+        )
+        audioAdmission.finish(responseID: "codex-progress")
+        expect(
+            audioAdmission.shouldAdmit(responseID: "codex-progress"),
+            "a completed preempted response must leave no stale suppression"
+        )
         audioAdmission.finish(responseID: "route-response")
         expect(
             audioAdmission.shouldAdmit(responseID: "route-response"),
@@ -586,6 +604,36 @@ struct PolicyTests {
         expect(
             audioAdmission.shouldAdmit(responseID: "route-reset"),
             "session reset must clear classifier audio suppression"
+        )
+        var pendingAudioPreemption =
+            RealtimePendingAudioPreemptionPolicy()
+        pendingAudioPreemption.registerOutboundAudioResponseCreate(
+            eventID: "create-a"
+        )
+        pendingAudioPreemption.admitUserSpeech()
+        pendingAudioPreemption.admitUserSpeech()
+        expect(
+            pendingAudioPreemption.registerCreatedAudioResponse()
+                && pendingAudioPreemption.pendingResponseCreates == 0
+                && pendingAudioPreemption.preemptionsOnCreate == 0,
+            "repeated speech-start events must preempt one requested-but-unidentified response exactly once"
+        )
+        expect(
+            !pendingAudioPreemption.registerCreatedAudioResponse(),
+            "a later response must not inherit a stale user-voice preemption"
+        )
+        pendingAudioPreemption.registerOutboundAudioResponseCreate(
+            eventID: "create-rejected"
+        )
+        pendingAudioPreemption.admitUserSpeech()
+        pendingAudioPreemption.rejectOutboundAudioResponseCreate(
+            eventID: "create-rejected"
+        )
+        expect(
+            pendingAudioPreemption.pendingResponseCreates == 0
+                && pendingAudioPreemption.preemptionsOnCreate == 0
+                && !pendingAudioPreemption.registerCreatedAudioResponse(),
+            "a rejected response.create must not leave stale preemption for a later response"
         )
 
         let notchedDisplay = DisplayGeometry(
@@ -885,6 +933,87 @@ struct PolicyTests {
                     retainUntil: replyDeadline
                 ) == 0.25,
             "reply retention must be measured from answer completion instead of timer rescheduling"
+        )
+        var stopAcknowledgement = StopAcknowledgementLifecycle()
+        stopAcknowledgement.begin(generation: 17)
+        expect(
+            stopAcknowledgement.mirror(
+                generation: 16,
+                responseID: "stop-ack-17",
+                text: "late"
+            ) == nil
+                && stopAcknowledgement.mirror(
+                    generation: 17,
+                    responseID: "",
+                    text: "empty id"
+                ) == nil
+                && stopAcknowledgement.mirror(
+                    generation: 17,
+                    responseID: "stop-ack-17",
+                    text: "  "
+                ) == nil
+                && !stopAcknowledgement.consumeDrain(
+                    generation: 17,
+                    responseID: "stop-ack-17"
+                ),
+            "stop acknowledgement must fail closed for stale, empty, or drain-before-visible events"
+        )
+        let stopAcknowledgementNow = Date(timeIntervalSince1970: 2_000)
+        expect(
+            stopAcknowledgement.mirror(
+                generation: 17,
+                responseID: "stop-ack-17",
+                text: "  작업을 멈췄어.  ",
+                now: stopAcknowledgementNow
+            ) == "작업을 멈췄어."
+                && stopAcknowledgement.mirror(
+                    generation: 17,
+                    responseID: "stop-ack-17",
+                    text: "duplicate",
+                    now: stopAcknowledgementNow
+                ) == nil
+                && stopAcknowledgement.remainingRetention(
+                    generation: 17,
+                    now: stopAcknowledgementNow.addingTimeInterval(1)
+                ) == 3,
+            "a spoken control acknowledgement must mirror once and retain the visible reply for the full answer dwell"
+        )
+        expect(
+            !stopAcknowledgement.consumeDrain(
+                generation: 17,
+                responseID: "different-stop-ack"
+            )
+                && stopAcknowledgement.consumeDrain(
+                    generation: 17,
+                    responseID: "stop-ack-17"
+                )
+                && !stopAcknowledgement.consumeDrain(
+                    generation: 17,
+                    responseID: "stop-ack-17"
+                ),
+            "only the matching visible acknowledgement may authorize teardown once"
+        )
+        stopAcknowledgement.reset(generation: 16)
+        expect(
+            stopAcknowledgement.remainingRetention(
+                generation: 17,
+                now: stopAcknowledgementNow
+            ) == 4,
+            "a stale reset must not cancel the current stop acknowledgement"
+        )
+        stopAcknowledgement.reset(generation: 17)
+        expect(
+            stopAcknowledgement.remainingRetention(
+                generation: 17,
+                now: stopAcknowledgementNow
+            ) == 0
+                && stopAcknowledgement.mirror(
+                    generation: 17,
+                    responseID: "stop-ack-17",
+                    text: "late after reset",
+                    now: stopAcknowledgementNow
+                ) == nil,
+            "timeout or teardown reset must invalidate late acknowledgement events"
         )
         let midpointProgress = SurfaceMotionPolicy.animationProgress(
             elapsed: SurfaceMotionPolicy.maximumDuration / 2
@@ -1455,11 +1584,21 @@ struct PolicyTests {
             WakePhraseCapturePolicy.activationDelay(
                 for: wakeOnlyMatch,
                 isFinal: false
-            ) < WakePhraseCapturePolicy.activationDelay(
+            ) >= WakePhraseCapturePolicy.activationDelay(
                 for: wakeCommandMatch,
                 isFinal: false
             ),
-            "a name-only wake should acknowledge quickly while a command tail waits for a stable transcript"
+            "a provisional wake-only prefix must stay open long enough for a command-bearing continuation"
+        )
+        expect(
+            WakePhraseCapturePolicy.activationDelay(
+                for: wakeOnlyMatch,
+                isFinal: true
+            ) < WakePhraseCapturePolicy.activationDelay(
+                for: wakeOnlyMatch,
+                isFinal: false
+            ),
+            "a finalized wake-only utterance should still activate promptly"
         )
         expect(
             WakePhraseCapturePolicy.activationDelay(
@@ -1477,6 +1616,25 @@ struct PolicyTests {
                 over: WakePhraseMatch(command: "오늘 일정")
             ),
             "wake capture must retain the longest stable command tail"
+        )
+        var wakeCommitment = WakePhraseCommitmentRevision()
+        let provisionalWakeOnly = wakeCommitment.advance()
+        let wakeWithCommand = wakeCommitment.advance()
+        expect(
+            !wakeCommitment.isCurrent(provisionalWakeOnly)
+                && wakeCommitment.isCurrent(wakeWithCommand),
+            "a command-bearing continuation must invalidate the earlier provisional wake-only commitment"
+        )
+        let repeatedPartial = wakeCommitment.advance()
+        expect(
+            !wakeCommitment.isCurrent(wakeWithCommand)
+                && wakeCommitment.isCurrent(repeatedPartial),
+            "every repeated provisional transcript must refresh the quiet-period commitment"
+        )
+        wakeCommitment.invalidate()
+        expect(
+            !wakeCommitment.isCurrent(repeatedPartial),
+            "a retracted wake candidate must invalidate every pending commitment"
         )
 
         let disabledLoginService = FakeLaunchAtLoginService(
@@ -1694,6 +1852,32 @@ struct PolicyTests {
             assistantOutput.finishLocalSpeech(generation: generation)
                 && !assistantOutput.isActive,
             "the surface may collapse only after every output path finishes"
+        )
+        expect(
+            VoiceIdleTimeoutPolicy.shouldArm(
+                phase: .listening,
+                activeCodex: false,
+                assistantOutputActive: false
+            ),
+            "idle timeout may arm only in a fully quiescent listening state"
+        )
+        expect(
+            !VoiceIdleTimeoutPolicy.shouldArm(
+                phase: .thinking,
+                activeCodex: false,
+                assistantOutputActive: false
+            )
+                && !VoiceIdleTimeoutPolicy.shouldArm(
+                    phase: .listening,
+                    activeCodex: true,
+                    assistantOutputActive: false
+                )
+                && !VoiceIdleTimeoutPolicy.shouldArm(
+                    phase: .listening,
+                    activeCodex: false,
+                    assistantOutputActive: true
+                ),
+            "thinking, active Codex work, and assistant playback must all suspend idle termination"
         )
         expect(
             WakeMonitoringResumePolicy.shouldStart(
@@ -2193,7 +2377,10 @@ struct PolicyTests {
         explicitSettings.userDisplayName = "  John  "
         explicitSettings.appDisplayLanguage = "ko"
         explicitSettings.appearanceMode = "dark"
-        try! isolatedStore.save(explicitSettings)
+        try! isolatedStore.save(
+            explicitSettings,
+            threadBindingIntent: .applyDraft
+        )
         let savedVoiceSettings = isolatedStore.load()
         expect(
             savedVoiceSettings.productName == "Orbit"
@@ -2309,7 +2496,10 @@ struct PolicyTests {
         authoritySettings.codexWorkspacePath = temporaryRoot.path
         authoritySettings.includeAuthorityPack = true
         authoritySettings.authorityPackRoot = authorityRoot.path
-        try! authorityStore.save(authoritySettings)
+        try! authorityStore.save(
+            authoritySettings,
+            threadBindingIntent: .applyDraft
+        )
         let savedAuthority = authorityStore.load()
         expect(
             savedAuthority.authorityPackFingerprint.count == 64,
@@ -2350,17 +2540,43 @@ struct PolicyTests {
             atomically: true,
             encoding: .utf8
         )
-        let changedManagedPack = authorityStore.load()
-        try! authorityStore.save(changedManagedPack)
+        var stalePresentationDraft = authorityStore.load()
+        stalePresentationDraft.codexThreadID = ""
+        stalePresentationDraft.codexThreadSource = ""
+        stalePresentationDraft.assistantName = "Nova"
+        stalePresentationDraft.wakePhrases = ["Computer", "A+B"]
+        stalePresentationDraft.speechLocale = "ko-KR"
+        stalePresentationDraft.additionalSpeechLocales = ["en-US", "sv-SE"]
+        stalePresentationDraft.realtimeVoice = "cedar"
+        try! authorityStore.save(
+            stalePresentationDraft,
+            threadBindingIntent: .preserveCurrent
+        )
         expect(
-            authorityStore.load().codexThreadID.isEmpty,
-            "changing Authority Pack content must rotate an app-managed dedicated session"
+            authorityStore.load().codexThreadID
+                == "22222222-2222-4222-8222-222222222222"
+                && authorityStore.load().codexThreadSource == "app",
+            "a stale blank presentation draft must preserve the live app-managed session binding"
+        )
+        var invalidPresentationDraft = authorityStore.load()
+        invalidPresentationDraft.realtimeInstructions = ""
+        expect(
+            (try? authorityStore.save(
+                invalidPresentationDraft,
+                threadBindingIntent: .preserveCurrent
+            )) == nil
+                && authorityStore.load().codexThreadID
+                    == "22222222-2222-4222-8222-222222222222",
+            "failed presentation validation must not partially clear the live session binding"
         )
         var userSelectedSession = authorityStore.load()
         userSelectedSession.codexThreadID =
             "33333333-3333-4333-8333-333333333333"
         userSelectedSession.codexThreadSource = "user"
-        try! authorityStore.save(userSelectedSession)
+        try! authorityStore.save(
+            userSelectedSession,
+            threadBindingIntent: .applyDraft
+        )
         try! "# SOUL.md\nChanged again.\n".write(
             to: authorityRoot.appendingPathComponent("SOUL.md"),
             atomically: true,
@@ -2368,7 +2584,10 @@ struct PolicyTests {
         )
         let changedUserPack = authorityStore.load()
         expect(
-            (try? authorityStore.save(changedUserPack)) == nil,
+            (try? authorityStore.save(
+                changedUserPack,
+                threadBindingIntent: .applyDraft
+            )) == nil,
             "changing Authority Pack content must require clearing a user-selected Session ID"
         )
         try! authorityStore.resetToDefaults()
@@ -2379,6 +2598,49 @@ struct PolicyTests {
                 && !authorityStore.load().includeAdditionalContextProviders
                 && authorityStore.load().additionalContextProvidersRoot.isEmpty,
             "Reset must clear Authority Pack and Additional Context Provider state"
+        )
+
+        let migrationSuite =
+            "VoiceRelay.AuthorityMigrationTests.\(UUID().uuidString)"
+        let migrationDefaults = UserDefaults(suiteName: migrationSuite)!
+        migrationDefaults.removePersistentDomain(forName: migrationSuite)
+        defer {
+            migrationDefaults.removePersistentDomain(forName: migrationSuite)
+        }
+        migrationDefaults.set(
+            true,
+            forKey: "voiceRelay.injection.enabled"
+        )
+        migrationDefaults.set(
+            authorityRoot.path,
+            forKey: "voiceRelay.injection.authorityRoot"
+        )
+        migrationDefaults.set(
+            "44444444-4444-4444-8444-444444444444",
+            forKey: "voiceRelay.codex.threadID"
+        )
+        migrationDefaults.set(
+            "app",
+            forKey: "voiceRelay.codex.threadSource"
+        )
+        migrationDefaults.set(
+            true,
+            forKey: "voiceRelay.codex.threadManaged"
+        )
+        let migrationStore = SettingsStore(
+            defaults: migrationDefaults,
+            threadBindingLockURL:
+                temporaryRoot.appendingPathComponent(
+                    "migration-thread.lock"
+                )
+        )
+        let migratedSettings = migrationStore.load()
+        expect(
+            migratedSettings.codexThreadID
+                == "44444444-4444-4444-8444-444444444444"
+                && migratedSettings.codexThreadSource == "app"
+                && migratedSettings.authorityPackFingerprint.count == 64,
+            "Authority Pack fingerprint migration must seed context state without rotating the managed session"
         )
 
         print("Voice Relay policy tests passed")

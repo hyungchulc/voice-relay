@@ -903,6 +903,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private var toastHideWorkItem: DispatchWorkItem?
     private var lastAnswer = ""
     private var realtimeStopAcknowledgementFallbackWorkItem: DispatchWorkItem?
+    private var stopAcknowledgementLifecycle =
+        StopAcknowledgementLifecycle()
     private var hoverStartWorkItem: DispatchWorkItem?
     private var hoverCollapseWorkItem: DispatchWorkItem?
     private var errorCollapseWorkItem: DispatchWorkItem?
@@ -1379,6 +1381,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
         streamedAnswer = ""
         activeCodexGeneration = generation
+        scheduleVoiceIdleTimeout()
         VoiceRelayDiagnostics.flow(
             "codex_request_started",
             generation: generation,
@@ -1465,6 +1468,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                     if self.activeCodexGeneration == generation {
                         self.activeCodexGeneration = nil
                     }
+                    self.scheduleVoiceIdleTimeout()
                     self.completeCodexRequest(
                         result,
                         generation: generation,
@@ -1490,6 +1494,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         realtimeDraft = text
+        scheduleVoiceIdleTimeout()
         isReplyPreviewVisible = true
         replyRetainUntil =
             NotchAnswerLifecyclePolicy.retentionDeadline()
@@ -2581,6 +2586,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
             realtimeDraft = trimmed
+            scheduleVoiceIdleTimeout()
             isReplyPreviewVisible = true
             replyRetainUntil =
                 NotchAnswerLifecyclePolicy.retentionDeadline()
@@ -2595,6 +2601,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
             realtimeDraft = trimmed
+            scheduleVoiceIdleTimeout()
             isReplyPreviewVisible = true
             showConversationHistory(
                 animated: !answerTargetVisible && config.animateSurface
@@ -2604,6 +2611,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
             realtimeDraft = trimmed
+            scheduleVoiceIdleTimeout()
             if resolvedAnchor == .notch {
                 isReplyPreviewVisible = true
                 replyRetainUntil =
@@ -2622,7 +2630,6 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             let responseID = (event["responseId"] as? String) ?? ""
             SettingsStore.shared.completedFirstVoiceGreeting = true
             assistantFinalGeneration = generation
-            scheduleVoiceIdleTimeout()
             lastAnswer = trimmed
             appendConversation(
                 .assistant,
@@ -2643,6 +2650,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                     delay: max(config.collapseDelay, 1.1)
                 )
             }
+            scheduleVoiceIdleTimeout()
         case "assistantPlaybackDrained":
             guard let responseID = event["responseId"] as? String,
                   assistantOutputLifecycle.finishNativePlayback(
@@ -2652,6 +2660,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 return
             }
             finalPlaybackDrainedGeneration = generation
+            scheduleVoiceIdleTimeout()
             replyRetainUntil =
                 NotchAnswerLifecyclePolicy.retentionDeadline()
             scheduleConversationCollapse(
@@ -2659,7 +2668,46 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             )
         case "stopIntent":
             beginRealtimeSpokenStop(generation: generation)
+        case "stopAcknowledgementFinal":
+            guard let text = event["text"] as? String,
+                  let responseID = event["responseId"] as? String,
+                  let mirroredText = stopAcknowledgementLifecycle.mirror(
+                    generation: generation,
+                    responseID: responseID,
+                    text: text
+                  ) else {
+                return
+            }
+            lastAnswer = mirroredText
+            realtimeDraft = ""
+            appendConversation(
+                .assistant,
+                text: mirroredText,
+                deliveryID: responseID
+            )
+            isReplyPreviewVisible = true
+            replyRetainUntil = stopAcknowledgementLifecycle.retainUntil
+            showConversationHistory(animated: true)
+            scheduleConversationCollapse(
+                delay: max(config.collapseDelay, 1.1)
+            )
+            scheduleRealtimeSpokenStopFallback(
+                generation: generation,
+                delay: max(
+                    5,
+                    stopAcknowledgementLifecycle.remainingRetention(
+                        generation: generation
+                    )
+                )
+            )
         case "stopAcknowledgementDrained":
+            guard let responseID = event["responseId"] as? String,
+                  stopAcknowledgementLifecycle.consumeDrain(
+                    generation: generation,
+                    responseID: responseID
+                  ) else {
+                return
+            }
             finishRealtimeSpokenStop(generation: generation)
         case "terminal":
             guard !isShowingTransientError else { return }
@@ -2910,13 +2958,26 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
     private func scheduleVoiceIdleTimeout() {
         voiceIdleWorkItem?.cancel()
-        guard voiceState.phase.isSessionActive else { return }
+        voiceIdleWorkItem = nil
         let generation = voiceState.generation
+        guard VoiceIdleTimeoutPolicy.shouldArm(
+            phase: voiceState.phase,
+            activeCodex: activeCodexGeneration == generation,
+            assistantOutputActive: assistantOutputLifecycle.isActive
+        ) else {
+            return
+        }
         let delay = TimeInterval(config.voiceIdleTimeoutMinutes * 60)
         let workItem = DispatchWorkItem { [weak self] in
             guard let self,
                   self.voiceState.generation == generation,
-                  self.voiceState.phase.isSessionActive else {
+                  VoiceIdleTimeoutPolicy.shouldArm(
+                    phase: self.voiceState.phase,
+                    activeCodex:
+                        self.activeCodexGeneration == generation,
+                    assistantOutputActive:
+                        self.assistantOutputLifecycle.isActive
+                  ) else {
                 return
             }
             self.requestVoiceSessionStop(
@@ -3010,6 +3071,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
               voiceState.phase.isSessionActive else {
             return
         }
+        stopAcknowledgementLifecycle.begin(generation: generation)
         voiceIdleWorkItem?.cancel()
         voiceIdleWorkItem = nil
         assistantOutputLifecycle.cancelAll(generation: generation)
@@ -3026,7 +3088,16 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         )
         voiceState.requestStop()
         updateVoiceSurface()
+        scheduleRealtimeSpokenStopFallback(
+            generation: generation,
+            delay: 5
+        )
+    }
 
+    private func scheduleRealtimeSpokenStopFallback(
+        generation: Int,
+        delay: TimeInterval
+    ) {
         realtimeStopAcknowledgementFallbackWorkItem?.cancel()
         let fallback = DispatchWorkItem { [weak self] in
             guard let self,
@@ -3041,7 +3112,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         }
         realtimeStopAcknowledgementFallbackWorkItem = fallback
         DispatchQueue.main.asyncAfter(
-            deadline: .now() + 5,
+            deadline: .now() + max(delay, 0),
             execute: fallback
         )
     }
@@ -3052,11 +3123,30 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             return
         }
         realtimeStopAcknowledgementFallbackWorkItem?.cancel()
-        realtimeStopAcknowledgementFallbackWorkItem = nil
-        requestVoiceSessionStop(
-            generation: generation,
-            reason: "spoken_stop_completed"
-        )
+        let completion = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.voiceState.generation == generation,
+                  self.voiceState.phase == .stopping else {
+                return
+            }
+            self.requestVoiceSessionStop(
+                generation: generation,
+                reason: "spoken_stop_completed"
+            )
+        }
+        realtimeStopAcknowledgementFallbackWorkItem = completion
+        let remainingRetention =
+            stopAcknowledgementLifecycle.remainingRetention(
+                generation: generation
+            )
+        if remainingRetention <= 0 {
+            completion.perform()
+        } else {
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + remainingRetention,
+                execute: completion
+            )
+        }
     }
 
     private func completeVoiceStop(
@@ -3066,6 +3156,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         guard voiceState.generation == generation else { return }
         realtimeStopAcknowledgementFallbackWorkItem?.cancel()
         realtimeStopAcknowledgementFallbackWorkItem = nil
+        stopAcknowledgementLifecycle.reset(generation: generation)
         voiceStopFallbackWorkItem?.cancel()
         voiceStopFallbackWorkItem = nil
         isWaitingForReply = false

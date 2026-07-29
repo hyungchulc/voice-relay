@@ -146,6 +146,12 @@ COMMAND=(
   "$REPOSITORY"
 )
 
+if [[ "$RELEASE_KIND" == "preview" ]]; then
+  COMMAND+=(--prerelease --latest=false)
+else
+  COMMAND+=(--latest)
+fi
+
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '%q ' "${COMMAND[@]}"
   printf '\n'

@@ -251,6 +251,8 @@ final class SettingsWindowController:
     private var builtLanguage: AppDisplayLanguage
     private var builtAppearanceMode: AppAppearanceMode
     private var displayedAppearanceMode: AppAppearanceMode
+    private var loadedThreadID = ""
+    private var explicitThreadBindingEditRequested = false
 
     var onSave: (() -> Void)?
     var onReset: (() -> Void)?
@@ -1342,6 +1344,8 @@ final class SettingsWindowController:
         additionalContextProvidersRootControl.stringValue =
             settings.additionalContextProvidersRoot
         refreshLaunchAtLogin()
+        loadedThreadID = settings.codexThreadID
+        explicitThreadBindingEditRequested = false
         threadIDControl.stringValue = settings.codexThreadID
         taskStatus.stringValue = settings.codexThreadID.isEmpty
             ? localizedCopy.text(
@@ -1719,6 +1723,7 @@ final class SettingsWindowController:
     }
 
     @objc private func clearTaskField() {
+        explicitThreadBindingEditRequested = true
         threadIDControl.stringValue = ""
         taskStatus.stringValue = localizedCopy.text(
             "A new dedicated session will be created when voice starts.",
@@ -1765,6 +1770,9 @@ final class SettingsWindowController:
         let previousThreadID = settings.codexThreadID
         let taskID = threadIDControl.stringValue
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let threadBindingWasEdited =
+            explicitThreadBindingEditRequested
+            || taskID != loadedThreadID
         settings.productName = SettingsStore.normalizedDisplayName(
             productNameControl.stringValue,
             fallback: AppSettings.defaults.productName
@@ -1820,20 +1828,27 @@ final class SettingsWindowController:
             additionalContextProvidersControl.state == .on
         settings.additionalContextProvidersRoot =
             additionalContextProvidersRootControl.stringValue
-        settings.codexThreadID = taskID
-        if taskID.isEmpty {
-            settings.codexThreadSource = ""
-            settings.codexThreadTitle = ""
-        } else if taskID != previousThreadID {
-            settings.codexThreadSource = "user"
-            settings.codexThreadTitle = settings.productName
+        if threadBindingWasEdited {
+            settings.codexThreadID = taskID
+            if taskID.isEmpty {
+                settings.codexThreadSource = ""
+                settings.codexThreadTitle = ""
+            } else if taskID != previousThreadID {
+                settings.codexThreadSource = "user"
+                settings.codexThreadTitle = settings.productName
+            }
         }
         settings.codexModel = "inherit"
         settings.codexReasoningEffort = "inherit"
         settings.codexSandbox = "inherit"
         settings.codexApprovalPolicy = "inherit"
         do {
-            try store.save(settings)
+            try store.save(
+                settings,
+                threadBindingIntent: threadBindingWasEdited
+                    ? .applyDraft
+                    : .preserveCurrent
+            )
             builtAppearanceMode = AppAppearanceMode.parse(
                 settings.appearanceMode
             )

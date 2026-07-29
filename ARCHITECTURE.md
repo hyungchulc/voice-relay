@@ -220,8 +220,8 @@ Codex task. Quit terminates the app through AppKit.
 The Advanced pane also contains About Voice Relay. Release builds embed the
 exact public alpha, beta, or release-candidate tag, numeric bundle version,
 build number, and internal preview channel. GitHub records these builds as
-ordinary releases and selects `Latest` automatically. The explicit update
-action is backed by pinned Sparkle 2. Its stable signed appcast points to
+prereleases with `Latest` explicitly disabled. The explicit update action is
+backed by pinned Sparkle 2. Its stable signed appcast points to
 preview-channel update archives, and its embedded EdDSA public key authenticates
 both the feed and enclosure before extraction. Sparkle owns download,
 replacement, authorization, and relaunch. Background checks and silent

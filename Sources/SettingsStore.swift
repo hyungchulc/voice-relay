@@ -397,6 +397,11 @@ final class SettingsStore {
         let source: String
     }
 
+    enum ThreadBindingSaveIntent {
+        case preserveCurrent
+        case applyDraft
+    }
+
     private let defaults: UserDefaults
     private let threadBindingLockURL: URL
 
@@ -556,7 +561,10 @@ final class SettingsStore {
         )
     }
 
-    func save(_ settings: AppSettings) throws {
+    func save(
+        _ settings: AppSettings,
+        threadBindingIntent: ThreadBindingSaveIntent
+    ) throws {
         let workspace = try Self.validatedCodexWorkspacePath(settings.codexWorkspacePath)
         let authorityPackRoot = Self.normalizedLocalPath(settings.authorityPackRoot)
         let authorityPackFingerprint = settings.includeAuthorityPack
@@ -595,48 +603,6 @@ final class SettingsStore {
                     ) ?? ""
                 )
 
-        let rawThreadID = settings.codexThreadID
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        var threadID = Self.normalizedThreadID(settings.codexThreadID)
-        guard rawThreadID.isEmpty || !threadID.isEmpty else {
-            throw NSError(
-                domain: "VoiceRelay.Settings",
-                code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "The Codex Session ID format is invalid"]
-            )
-        }
-        var threadSource = threadID.isEmpty
-            ? ""
-            : Self.normalizedThreadSource(settings.codexThreadSource)
-        guard threadID.isEmpty || !threadSource.isEmpty else {
-            throw NSError(
-                domain: "VoiceRelay.Settings",
-                code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "The Codex Session ID source is unavailable"]
-            )
-        }
-        if (authorityChanged || additionalContextProvidersChanged),
-           !threadID.isEmpty {
-            if threadSource == "user" {
-                throw NSError(
-                    domain: "VoiceRelay.Settings",
-                    code: 7,
-                    userInfo: [
-                        NSLocalizedDescriptionKey:
-                            "Authority Pack or Additional Context settings changed. Clear the existing Session ID and save to create a new dedicated session."
-                    ]
-                )
-            }
-            threadID = ""
-            threadSource = ""
-        }
-        try withThreadBindingLock {
-            defaults.set(threadID, forKey: Key.codexThreadID)
-            defaults.set(threadSource, forKey: Key.codexThreadSource)
-            defaults.set(threadSource == "app", forKey: Key.codexThreadManaged)
-            try persistThreadBindingUnlocked()
-        }
-
         let realtimeInstructions = settings.realtimeInstructions
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !realtimeInstructions.isEmpty,
@@ -650,6 +616,59 @@ final class SettingsStore {
                         "The Realtime prompt must be non-empty text no larger than 16 KB."
                 ]
             )
+        }
+
+        if threadBindingIntent == .applyDraft {
+            let rawThreadID = settings.codexThreadID
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var threadID = Self.normalizedThreadID(settings.codexThreadID)
+            guard rawThreadID.isEmpty || !threadID.isEmpty else {
+                throw NSError(
+                    domain: "VoiceRelay.Settings",
+                    code: 3,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "The Codex Session ID format is invalid"
+                    ]
+                )
+            }
+            var threadSource = threadID.isEmpty
+                ? ""
+                : Self.normalizedThreadSource(settings.codexThreadSource)
+            guard threadID.isEmpty || !threadSource.isEmpty else {
+                throw NSError(
+                    domain: "VoiceRelay.Settings",
+                    code: 3,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "The Codex Session ID source is unavailable"
+                    ]
+                )
+            }
+            if (authorityChanged || additionalContextProvidersChanged),
+               !threadID.isEmpty {
+                if threadSource == "user" {
+                    throw NSError(
+                        domain: "VoiceRelay.Settings",
+                        code: 7,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Authority Pack or Additional Context settings changed. Clear the existing Session ID and save to create a new dedicated session."
+                        ]
+                    )
+                }
+                threadID = ""
+                threadSource = ""
+            }
+            try withThreadBindingLock {
+                defaults.set(threadID, forKey: Key.codexThreadID)
+                defaults.set(threadSource, forKey: Key.codexThreadSource)
+                defaults.set(
+                    threadSource == "app",
+                    forKey: Key.codexThreadManaged
+                )
+                try persistThreadBindingUnlocked()
+            }
         }
 
         defaults.set(Self.currentSchemaVersion, forKey: Key.schemaVersion)
@@ -789,7 +808,10 @@ final class SettingsStore {
         reset.codexThreadID = ""
         reset.codexThreadSource = ""
         reset.codexThreadTitle = ""
-        try save(reset)
+        try save(
+            reset,
+            threadBindingIntent: .applyDraft
+        )
         onboardingCompleted = false
         codexAppConnectionCompleted = false
         completedFirstVoiceGreeting = false
@@ -919,21 +941,6 @@ final class SettingsStore {
         let root = defaults.string(forKey: Key.authorityPackRoot) ?? ""
         guard let fingerprint = try? AuthorityPackComposer.fingerprint(from: root) else {
             return
-        }
-        let source = Self.normalizedThreadSource(
-            defaults.string(forKey: Key.codexThreadSource)
-                ?? (defaults.bool(forKey: Key.codexThreadManaged) ? "app" : "")
-        )
-        guard source != "user" else {
-            return
-        }
-        if source == "app" {
-            try? withThreadBindingLock {
-                defaults.set("", forKey: Key.codexThreadID)
-                defaults.set("", forKey: Key.codexThreadSource)
-                defaults.set(false, forKey: Key.codexThreadManaged)
-                try persistThreadBindingUnlocked()
-            }
         }
         defaults.set(fingerprint, forKey: Key.authorityPackFingerprint)
     }

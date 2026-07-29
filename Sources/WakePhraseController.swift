@@ -42,6 +42,8 @@ final class WakePhraseController {
     private var restartWorkItem: DispatchWorkItem?
     private var pendingWakeWorkItem: DispatchWorkItem?
     private var pendingWakeCandidate: WakeCaptureCandidate?
+    private var pendingWakeCommitmentRevision =
+        WakePhraseCommitmentRevision()
     private var wakeCandidates: [Int: WakeCaptureCandidate] = [:]
     private var modernStartTask: Task<Void, Never>?
     private var modernSession: AnyObject?
@@ -730,18 +732,30 @@ final class WakePhraseController {
             pendingWakeWorkItem?.cancel()
             pendingWakeWorkItem = nil
             pendingWakeCandidate = nil
+            pendingWakeCommitmentRevision.invalidate()
             return false
         }
-        guard candidate != pendingWakeCandidate else { return true }
-        onWakeCandidate?()
+        let candidateChanged = candidate != pendingWakeCandidate
+        if !candidateChanged, candidate.isFinal {
+            return true
+        }
+        if candidateChanged {
+            onWakeCandidate?()
+        }
 
         pendingWakeWorkItem?.cancel()
         pendingWakeWorkItem = nil
         pendingWakeCandidate = candidate
+        let commitmentRevision =
+            pendingWakeCommitmentRevision.advance()
         let item = DispatchWorkItem { [weak self] in
             guard let self,
                   self.wantsMonitoring,
-                  self.recognitionGeneration == generation else {
+                  self.recognitionGeneration == generation,
+                  self.pendingWakeCommitmentRevision.isCurrent(
+                      commitmentRevision
+                  ),
+                  self.pendingWakeCandidate == candidate else {
                 return
             }
             self.wantsMonitoring = false
@@ -827,6 +841,7 @@ final class WakePhraseController {
         pendingWakeWorkItem?.cancel()
         pendingWakeWorkItem = nil
         pendingWakeCandidate = nil
+        pendingWakeCommitmentRevision.invalidate()
         wakeCandidates.removeAll()
         modernStartTask?.cancel()
         modernStartTask = nil

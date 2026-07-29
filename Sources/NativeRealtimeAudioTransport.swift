@@ -132,6 +132,8 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private var controlEventSequence: UInt64 = 0
     private var mediaEpoch = 0
     private var audioAdmissionPolicy = RealtimeAudioAdmissionPolicy()
+    private var pendingAudioPreemptionPolicy =
+        RealtimePendingAudioPreemptionPolicy()
     private var echoAdmissionPolicy = RealtimeEchoAdmissionPolicy()
 
     private var capturedChunks = 0
@@ -261,8 +263,35 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                   event["type"] is String else {
                 return
             }
+            if Self.isOutboundAudioResponseCreate(event),
+               let eventID = event["event_id"] as? String {
+                self.pendingAudioPreemptionPolicy
+                    .registerOutboundAudioResponseCreate(
+                        eventID: eventID
+                    )
+            }
             self.enqueueOutbound(text: jsonEvent, isAudio: false)
         }
+    }
+
+    private static func isOutboundAudioResponseCreate(
+        _ event: JSONDictionary
+    ) -> Bool {
+        guard event["type"] as? String == "response.create",
+              let response = event["response"] as? JSONDictionary else {
+            return false
+        }
+        let metadata = response["metadata"] as? JSONDictionary
+        let responseKind =
+            metadata?["voice_relay_kind"] as? String ?? ""
+        if responseKind == "route_classifier"
+            || responseKind == "active_codex_control" {
+            return false
+        }
+        if let modalities = response["output_modalities"] as? [String] {
+            return modalities.contains("audio")
+        }
+        return true
     }
 
     func stop(
@@ -531,16 +560,35 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             }
         }
 
+        if type == "error",
+           let error = event["error"] as? JSONDictionary,
+           let eventID = error["event_id"] as? String {
+            pendingAudioPreemptionPolicy
+                .rejectOutboundAudioResponseCreate(
+                    eventID: eventID
+                )
+        }
+
         if type == "response.created",
            let response = event["response"] as? JSONDictionary {
             let metadata = response["metadata"] as? JSONDictionary
             let responseID = response["id"] as? String ?? ""
             let responseKind =
                 metadata?["voice_relay_kind"] as? String ?? ""
-            audioAdmissionPolicy.register(
+            let isAudioResponse = audioAdmissionPolicy.register(
                 responseID: responseID,
                 responseKind: responseKind
             )
+            if isAudioResponse,
+               pendingAudioPreemptionPolicy.registerCreatedAudioResponse() {
+                audioAdmissionPolicy.suppressAudioResponse(
+                    responseID: responseID
+                )
+                if !responseID.isEmpty {
+                    discardedAudioResponseIDs.insert(responseID)
+                }
+                emitDiagnostic("preempted_audio_response_suppressed")
+            }
             let detachedSpeechKinds: Set<String> = [
                 "codex_progress",
                 "codex_commentary",
@@ -610,6 +658,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             completedAudioResponseID = responseID
         } else if type == "input_audio_buffer.speech_started" {
             if shouldForwardInputEvent {
+                discardedAudioResponseIDs.formUnion(
+                    audioAdmissionPolicy.suppressActiveAudioResponses()
+                )
+                pendingAudioPreemptionPolicy.admitUserSpeech()
                 interruptPlaybackForBargeIn()
             } else {
                 emitDiagnostic("unadmitted_playback_turn_suppressed")
@@ -2264,6 +2316,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         activePlaybackStartedAt = nil
         activePlaybackScheduledFrames = 0
         audioAdmissionPolicy.reset()
+        pendingAudioPreemptionPolicy.reset()
         echoAdmissionPolicy.reset()
         pendingPCM.removeAll(keepingCapacity: false)
         pendingBargeInPCM.removeAll(keepingCapacity: false)

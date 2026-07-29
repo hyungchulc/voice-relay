@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "campaign": "voice-relay-public-developer-alpha",
+  "created_on": "2026-07-29",
+  "publication_authorized": false,
+  "release_snapshot": {
+    "tag": "v0.5.1-alpha.1",
+    "published_at": "2026-07-29T16:34:53Z",
+    "github_draft": false,
+    "github_prerelease": false,
+    "github_latest": true,
+    "internal_distribution_channel": "prerelease",
+    "stable_approved": false,
+    "signing": "Apple Development signed",
+    "notarized": false,
+    "freshness_rule": "Reverify every field immediately before publication."
+  },
+  "source_asset": {
+    "path": "../../Resources/VoiceRelayIcon-1024.png",
+    "sha256": "daf75038e270199df6a0f1ae98a30c111547fb7b51afb25ab8e2b40fdaecfa8e"
+  },
+  "exports": [
+    {
+      "path": "assets/voice-relay-square-1080.png",
+      "width": 1080,
+      "height": 1080,
+      "purpose": "Square social hero",
+      "sha256": "c730a1bc27622dbd770c19824393437fb8af6f601b2615e388e50340ded568ff"
+    },
+    {
+      "path": "assets/voice-relay-threads-1080x1350.png",
+      "width": 1080,
+      "height": 1350,
+      "purpose": "Korean Threads portrait card",
+      "sha256": "34fc970c19b4be093a3edb3d2dd6ab79e3eb598060f4b96b4207a7e96193b2ee"
+    },
+    {
+      "path": "assets/voice-relay-x-1600x900.png",
+      "width": 1600,
+      "height": 900,
+      "purpose": "X landscape card and motion-bumper source",
+      "sha256": "6449f411fd6a90b757e8cdbfbd4848095d083ea8f2b0c123ab383a5db4a6e82c"
+    },
+    {
+      "path": "assets/voice-relay-vertical-1080x1920.png",
+      "width": 1080,
+      "height": 1920,
+      "purpose": "Vertical video end card",
+      "sha256": "3b7ff274ad695092e5470275d814ddd4b06fb8208841ef9d648ec27e29365758"
+    },
+    {
+      "path": "motion/voice-relay-bumper-16x9-6s.mp4",
+      "width": 1920,
+      "height": 1080,
+      "duration_seconds": 6,
+      "purpose": "Silent asset-only bumper, not a product demo",
+      "sha256": "e1fb547d13309a220e1a84665890686b57e6ba808c1af0a3864b93efaad93312"
+    }
+  ],
+  "live_demo_gate": {
+    "required": true,
+    "status": "ready_for_controlled_capture",
+    "validated_development_commit": "da04b58",
+    "validation": "Exact queue regression, full isolated test suite, signed universal build, and live relaunch checks passed.",
+    "remaining_limit": "No physical spoken canary was performed. The recorded take must pass VIDEO_PLAN.md before publication review."
+  }
+}

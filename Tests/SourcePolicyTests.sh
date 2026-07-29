@@ -77,6 +77,26 @@ require_text \
   "recoverable Realtime event errors must stay scoped to one turn"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
+  'if (session.userUtterancePending)' \
+  "Codex speech must wait while a user utterance is unresolved"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'case "conversation.item.input_audio_transcription.failed"' \
+  "failed transcription must release deferred Codex speech"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"user_transcription_settlement_timeout"' \
+  "missing transcription terminals must have a bounded settlement watchdog"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'session.userUtteranceEpoch !== epoch' \
+  "a stale transcription watchdog must not release a newer utterance"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"deferred_codex_final_superseded"' \
+  "a committed replacement must explicitly retire the deferred old final"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
   'diagnostic("route_decision", generation' \
   "route decisions must be diagnosable without logging the transcript"
 require_text \
@@ -109,8 +129,16 @@ require_text \
   "Codex Remote completion must be distinguishable from connection health"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'const kind = normalizeRouteKind(args.kind);' \
+  'const requestedKind = normalizeRouteKind(args.kind);' \
   "route diagnostics and dispatch must use a bounded route enum"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'const stopTarget = normalizeStopTarget(args.stop_target);' \
+  "session-stop routing must use a bounded semantic target"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Choose clarify only when the meaning cannot be distinguished.' \
+  "active Codex control must not expose stop-versus-add clarification as an action"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   '"spoken_register"' \
@@ -431,6 +459,18 @@ require_text \
   "$ROOT/Sources/SettingsWindowController.swift" \
   'threadIDControl' \
   "settings must let the user edit the optional dedicated Session ID"
+require_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  'threadBindingIntent: threadBindingWasEdited' \
+  "ordinary settings saves must preserve the live Session ID unless task editing was explicit"
+require_text \
+  "$ROOT/Sources/SettingsStore.swift" \
+  'case preserveCurrent' \
+  "settings persistence must expose an explicit unchanged task-binding intent"
+reject_text \
+  "$ROOT/Sources/SettingsStore.swift" \
+  'if source == "app" {' \
+  "Authority Pack fingerprint migration must never clear an app-managed Session ID"
 require_text \
   "$ROOT/Sources/SettingsWindowController.swift" \
   'remoteClient.inspect(workspacePath: settings.codexWorkspacePath)' \
@@ -2107,14 +2147,17 @@ NODE
   if (posted.some(event => event.type === "codexSteer")) {
     throw new Error("active speech was steered before semantic classification");
   }
-  if (posted
-      .filter(event => event.type === "realtimeSend")
-      .map(event => JSON.parse(event.eventJSON))
-      .some(event =>
-        event.type === "response.create"
-        && event.response?.metadata?.voice_relay_kind === "active_codex_control"
-      )) {
-    throw new Error("semantic control routing overlapped response cancellation");
+  const activeControlBeforeLateError = posted
+    .filter(event => event.type === "realtimeSend")
+    .map(event => JSON.parse(event.eventJSON))
+    .filter(event =>
+      event.type === "response.create"
+      && event.response?.metadata?.voice_relay_kind === "active_codex_control"
+    );
+  if (activeControlBeforeLateError.length !== 1) {
+    throw new Error(
+      "committed semantic control did not start after local cancellation settlement"
+    );
   }
   const cancellationEvents = posted
     .filter(event => event.type === "realtimeSend")
@@ -2139,25 +2182,27 @@ NODE
   if (posted.some(event => event.type === "error")) {
     throw new Error("correlated response cancellation became a fatal host error");
   }
-  const stopClassifierRequest = posted
+  const stopClassifierRequests = posted
     .filter(event => event.type === "realtimeSend")
     .map(event => JSON.parse(event.eventJSON))
-    .find(event =>
+    .filter(event =>
       event.type === "response.create"
       && event.response?.metadata?.voice_relay_kind === "active_codex_control"
     );
-  if (!stopClassifierRequest) {
-    throw new Error("active speech did not start semantic control routing");
+  if (stopClassifierRequests.length !== 1) {
+    throw new Error("late cancellation error duplicated semantic control routing");
   }
+  const stopClassifierRequest = stopClassifierRequests[0];
   const activeControlRequired =
     stopClassifierRequest.response?.tools?.[0]?.parameters?.required || [];
   if (JSON.stringify(activeControlRequired)
       !== JSON.stringify([
         "action",
         "spoken_language",
-        "spoken_register"
+        "spoken_register",
+        "stop_target"
       ])) {
-    throw new Error("active control routing did not require language and register");
+    throw new Error("active control routing did not require language, register, and semantic stop target");
   }
   const activeControlInput =
     stopClassifierRequest.response?.input?.[0]?.content?.[0]?.text;
@@ -2174,7 +2219,8 @@ NODE
       arguments: JSON.stringify({
         action: "stop_session",
         spoken_language: "ko-KR",
-        spoken_register: "casual"
+        spoken_register: "casual",
+        stop_target: "current_voice_or_codex_work"
       })
     }
   });
@@ -2249,6 +2295,36 @@ NODE
       }
     }
   });
+  voice.receiveRealtimeEvent({
+    generation: 31,
+    event: {
+      type: "response.output_audio_transcript.done",
+      response_id: "stop-ack-31",
+      transcript: "지금 다 멈췄어."
+    }
+  });
+  voice.receiveRealtimeEvent({
+    generation: 31,
+    event: {
+      type: "response.output_audio_transcript.done",
+      response_id: "stop-ack-31",
+      transcript: "duplicate"
+    }
+  });
+  const visibleStopAcknowledgements = posted.filter(
+    event => event.type === "stopAcknowledgementFinal"
+  );
+  if (visibleStopAcknowledgements.length !== 1
+      || visibleStopAcknowledgements[0].responseId !== "stop-ack-31"
+      || visibleStopAcknowledgements[0].text !== "지금 다 멈췄어.") {
+    throw new Error("semantic stop acknowledgement was not mirrored visibly exactly once");
+  }
+  if (posted.some(event =>
+    ["assistantProgress", "assistantFinal"].includes(event.type)
+    && event.responseId === "stop-ack-31"
+  )) {
+    throw new Error("semantic stop acknowledgement leaked into ordinary assistant output");
+  }
   voice.playbackDrained({
     generation: 31,
     responseId: "stop-ack-31"
@@ -2393,8 +2469,40 @@ require_text \
   "barge-in cancellation errors must be correlated by client event ID"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'response_id: session.activeResponseId' \
+  'response_id: responseId' \
   "barge-in must cancel only the active server response"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'session.pendingResponseCancel = { eventId, responseId };' \
+  "barge-in cancellation must retain exact response and client-event ownership"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'session.retiredResponseIds.has(eventResponseId)' \
+  "late events from a locally settled response must not mutate newer response state"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'session.retiredCancelEventIds.has(causalEventId)' \
+  "late correlated cancellation errors must not recover or clear newer response state"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'response_cancel_deferred_until_created' \
+  "admitted user speech must preempt requested assistant audio before a server response ID exists"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'pendingAudioPreemptionPolicy.admitUserSpeech()' \
+  "native audio admission must suppress the first delta from a requested-but-unidentified response"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'rejectOutboundAudioResponseCreate' \
+  "a rejected audio response.create must not leave stale native preemption state"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'session.userVoicePreemptionPending' \
+  "route work must wait while an unidentified assistant audio response is being preempted"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'session.activeResponseKind' \
+  "barge-in cancellation must distinguish audio responses from text-only classifiers"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'session.lifecycle = "stop_requested"' \
@@ -2539,6 +2647,14 @@ reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'strictStopIntentRequest' \
   "spoken stop must use semantic routing instead of a fixed phrase list"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'should Voice Relay stop the current task' \
+  "active-control clarification must not contain a product-named stock question"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'When the target or action is ambiguous, use steer_active_codex.' \
+  "ambiguous active control must default to additive steering"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'name: "route_active_codex_turn"' \
@@ -2557,8 +2673,20 @@ require_text \
   "the semantic stop lane must emit a typed native event"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
+  'type: "stopAcknowledgementFinal"' \
+  "spoken control acknowledgement must be mirrored visibly before teardown"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
   'type: "stopAcknowledgementDrained"' \
   "the semantic stop lane must wait for Realtime audio playback to drain"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'case "stopAcknowledgementFinal":' \
+  "the native surface must append the spoken control acknowledgement"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'struct StopAcknowledgementLifecycle' \
+  "stop acknowledgement visibility and teardown ordering must remain mechanically guarded"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'private var stoppingGenerations = Set<Int>()' \
@@ -3364,14 +3492,14 @@ require_text \
   "$ROOT/package-release.sh" \
   '/usr/bin/lipo "$BINARY" -verify_arch arm64 x86_64' \
   "release packaging must verify both architectures"
-reject_text \
+require_text \
   "$ROOT/publish-github-release.sh" \
-  '--prerelease' \
-  "preview-channel publishing must create an ordinary GitHub release"
-reject_text \
+  'COMMAND+=(--prerelease --latest=false)' \
+  "preview-channel publishing must create a non-latest GitHub prerelease"
+require_text \
   "$ROOT/publish-github-release.sh" \
-  '--latest' \
-  "release publishing must leave GitHub Latest selection automatic"
+  'COMMAND+=(--latest)' \
+  "an explicitly approved stable release must become GitHub Latest"
 require_text \
   "$ROOT/publish-github-release.sh" \
   "'^#{1,6}[[:space:]]'" \
@@ -3388,14 +3516,10 @@ require_text \
   "$ROOT/publish-github-release.sh" \
   '[[ "$TAG" == "v1.0.0" ]]' \
   "the first stable release gate must be limited to v1.0.0"
-reject_text \
-  "$ROOT/publish-github-release.sh" \
-  'make_latest=' \
-  "release publishing must not override GitHub automatic Latest selection"
 require_text \
   "$ROOT/publish-sparkle-feed.sh" \
-  "\$'false\\tfalse\\ttrue'" \
-  "Sparkle feed publication must require an ordinary GitHub release"
+  "\$'false\\ttrue\\ttrue'" \
+  "Sparkle feed publication must require a non-draft GitHub prerelease"
 
 "$ROOT/Tests/ReleasePolicyTests.sh"
 

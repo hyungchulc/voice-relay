@@ -52,7 +52,7 @@ printf '%s\n' \
   '  exit 4' \
   'fi' \
   'if [[ "$1" == "api" && "$*" == *"/releases/tags/"* ]]; then' \
-  "  printf 'false\\tfalse\\ttrue\\n'" \
+  "  printf 'false\\ttrue\\ttrue\\n'" \
   '  exit 0' \
   'fi' \
   'if [[ "$1" == "api" && "$*" == *"/contents/appcast.xml?ref=main"* ]]; then' \
@@ -98,12 +98,12 @@ ALPHA_OUTPUT="$(
     "$UPDATE_CHECKSUM_FILE" \
     "$APPCAST_FILE"
 )"
-if [[ "$ALPHA_OUTPUT" == *"--prerelease"* ]]; then
-  echo "FAIL: preview-channel releases must be ordinary GitHub releases" >&2
+if [[ "$ALPHA_OUTPUT" != *"--prerelease"* ]]; then
+  echo "FAIL: preview-channel releases must be GitHub prereleases" >&2
   exit 1
 fi
-if [[ "$ALPHA_OUTPUT" == *"--latest"* ]]; then
-  echo "FAIL: GitHub must choose Latest automatically for preview-channel releases" >&2
+if [[ "$ALPHA_OUTPUT" != *"--latest=false"* ]]; then
+  echo "FAIL: preview-channel releases must be explicitly non-latest" >&2
   exit 1
 fi
 
@@ -170,8 +170,8 @@ STABLE_OUTPUT="$(
     v1.0.0 \
     "$ASSET_FILE"
 )"
-if [[ "$STABLE_OUTPUT" == *"--latest"* ]]; then
-  echo "FAIL: GitHub must choose Latest automatically for an approved v1.0.0" >&2
+if [[ "$STABLE_OUTPUT" != *"--latest"* ]]; then
+  echo "FAIL: an explicitly approved v1.0.0 must become Latest" >&2
   exit 1
 fi
 if [[ "$STABLE_OUTPUT" == *"--prerelease"* ]]; then

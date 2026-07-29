@@ -108,6 +108,75 @@ enum NotchAnswerLifecyclePolicy {
     }
 }
 
+struct StopAcknowledgementLifecycle {
+    private(set) var generation: Int?
+    private(set) var responseID = ""
+    private(set) var retainUntil = Date.distantPast
+    private var mirrored = false
+    private var completionConsumed = false
+
+    mutating func begin(generation: Int) {
+        self.generation = generation
+        responseID = ""
+        retainUntil = .distantPast
+        mirrored = false
+        completionConsumed = false
+    }
+
+    mutating func mirror(
+        generation: Int,
+        responseID: String,
+        text: String,
+        now: Date = Date()
+    ) -> String? {
+        let normalizedID = responseID.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let normalizedText = text.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard self.generation == generation,
+              !normalizedID.isEmpty,
+              !normalizedText.isEmpty,
+              !mirrored,
+              self.responseID.isEmpty || self.responseID == normalizedID else {
+            return nil
+        }
+        self.responseID = normalizedID
+        mirrored = true
+        retainUntil = NotchAnswerLifecyclePolicy.retentionDeadline(now: now)
+        return normalizedText
+    }
+
+    mutating func consumeDrain(
+        generation: Int,
+        responseID: String
+    ) -> Bool {
+        guard self.generation == generation,
+              mirrored,
+              !completionConsumed,
+              !self.responseID.isEmpty,
+              self.responseID == responseID else {
+            return false
+        }
+        completionConsumed = true
+        return true
+    }
+
+    func remainingRetention(
+        generation: Int,
+        now: Date = Date()
+    ) -> TimeInterval {
+        guard self.generation == generation, mirrored else { return 0 }
+        return max(0, retainUntil.timeIntervalSince(now))
+    }
+
+    mutating func reset(generation: Int? = nil) {
+        guard generation == nil || self.generation == generation else { return }
+        self = StopAcknowledgementLifecycle()
+    }
+}
+
 enum SurfaceMotionPolicy {
     static let maximumDuration: TimeInterval = 0.28
 
@@ -815,6 +884,18 @@ struct AssistantOutputLifecycle {
     }
 }
 
+enum VoiceIdleTimeoutPolicy {
+    static func shouldArm(
+        phase: VoiceSurfacePhase,
+        activeCodex: Bool,
+        assistantOutputActive: Bool
+    ) -> Bool {
+        phase == .listening
+            && !activeCodex
+            && !assistantOutputActive
+    }
+}
+
 enum WakeMonitoringResumePolicy {
     static let activationDelay: TimeInterval = 0.35
 
@@ -1053,8 +1134,7 @@ struct SpeechAnalyzerWakeTranscriptReducer {
 }
 
 enum WakePhraseCapturePolicy {
-    static let wakeOnlyGrace: TimeInterval = 0.55
-    static let commandTailGrace: TimeInterval = 1.05
+    static let partialSettlementGrace: TimeInterval = 1.05
     static let finalizedGrace: TimeInterval = 0.16
 
     static func activationDelay(
@@ -1064,7 +1144,7 @@ enum WakePhraseCapturePolicy {
         if isFinal {
             return finalizedGrace
         }
-        return match.command.isEmpty ? wakeOnlyGrace : commandTailGrace
+        return partialSettlementGrace
     }
 
     static func preferred(
@@ -1075,6 +1155,23 @@ enum WakePhraseCapturePolicy {
             return !lhs.command.isEmpty
         }
         return lhs.command.count > rhs.command.count
+    }
+}
+
+struct WakePhraseCommitmentRevision {
+    private(set) var value: UInt64 = 0
+
+    mutating func advance() -> UInt64 {
+        value &+= 1
+        return value
+    }
+
+    mutating func invalidate() {
+        value &+= 1
+    }
+
+    func isCurrent(_ candidate: UInt64) -> Bool {
+        candidate == value
     }
 }
 

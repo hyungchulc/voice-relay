@@ -1293,7 +1293,10 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         settings.returnGreetingEnabled = true
         settings.returnGreetingMinutes = 30
         do {
-            try store.save(settings)
+            try store.save(
+                settings,
+                threadBindingIntent: .applyDraft
+            )
             store.completedFirstVoiceGreeting = false
             store.onboardingCompleted = true
             stopProbe()
