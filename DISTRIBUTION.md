@@ -54,9 +54,10 @@ and testing, but is not notarized.
 
 ## GitHub release policy
 
-- Every alpha, beta, and release candidate is published as a GitHub prerelease
-  with `Latest` explicitly disabled.
-- An explicitly approved `v1.0.0` is published as the stable `Latest` release.
+- Every alpha, beta, release candidate, and approved stable build is published
+  as an ordinary GitHub release.
+- The publisher passes neither `--prerelease` nor a `--latest` option. GitHub
+  chooses the `Latest` marker automatically from its normal release policy.
 - Stable publication is locked until the user explicitly approves `v1.0.0`.
 - `publish-github-release.sh` enforces this policy and rejects other stable
   tags instead of guessing release intent.
@@ -65,13 +66,13 @@ and testing, but is not notarized.
 - Sparkle 2.9.4 is checksum-pinned at build time. Its framework and nested
   services are signed leaf-first; application signing never uses `--deep`.
 - `publish-sparkle-feed.sh` publishes the verified versioned appcast to the
-  stable public `appcast.xml` URL only after the matching GitHub prerelease
-  and archive are visible.
+  stable public `appcast.xml` URL only after the matching ordinary GitHub
+  release and archive are visible.
 - The first Sparkle-enabled alpha still requires one manual installation.
   Later preview-channel builds can be downloaded, verified, installed, and
   relaunched from About Voice Relay.
-- The internal `VoiceRelayDistributionChannel=prerelease` value, signed
-  Sparkle preview feed, and GitHub prerelease metadata remain aligned.
+- The internal `VoiceRelayDistributionChannel=prerelease` value and signed
+  Sparkle preview feed remain separate from GitHub release metadata.
 - Each release must use an existing verified tag, non-empty release notes, and
   the matching package assets.
 
