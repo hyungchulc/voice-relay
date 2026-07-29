@@ -16,6 +16,7 @@ TITLE="${VOICE_RELAY_RELEASE_TITLE:-Voice Relay ${TAG#v}}"
 STABLE_APPROVED="${VOICE_RELAY_STABLE_RELEASE_APPROVED:-false}"
 DRY_RUN="${VOICE_RELAY_RELEASE_DRY_RUN:-0}"
 GH_BIN="${VOICE_RELAY_GH_BIN:-gh}"
+REPOSITORY="${VOICE_RELAY_GITHUB_REPOSITORY:-hyungchulc/voice-relay}"
 
 if [[ -z "$NOTES_FILE" || ! -s "$NOTES_FILE" ]]; then
   echo "Set VOICE_RELAY_RELEASE_NOTES_FILE to a non-empty release notes file." >&2
@@ -115,6 +116,8 @@ COMMAND=(
   "$TITLE"
   --notes-file
   "$NOTES_FILE"
+  --repo
+  "$REPOSITORY"
 )
 
 if [[ "$RELEASE_KIND" == "prerelease" ]]; then
@@ -133,7 +136,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   exit 0
 fi
 
-if "$GH_BIN" release view "$TAG" >/dev/null 2>&1; then
+if "$GH_BIN" release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
   echo "GitHub release already exists for tag $TAG." >&2
   exit 3
 fi
