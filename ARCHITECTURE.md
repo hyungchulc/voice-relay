@@ -78,11 +78,13 @@ single-owner transfer avoids tearing down and recreating CoreAudio's Voice
 Processing aggregate while another app is playing media.
 
 Every wake-capture entry path records external output activity for diagnostics,
-but media never blocks wake recognition. A failed modern SpeechAnalyzer stays
-behind a process-lifetime circuit breaker while the classic on-device
-recognizer remains available, and both recognizers can consume the preserved
-local PCM source. The visual stop fallback cannot acquire audio before native
-transport ownership is released.
+but media never blocks wake recognition. The modern SpeechAnalyzer finalizes
+old volatile state, receives an explicit sample timeline across bounded-buffer
+gaps, and rotates through full cleanup every two minutes. Runtime failures
+restart the modern backend with bounded backoff, while startup incompatibility
+and older systems retain the classic on-device recognizer. Both recognizers can
+consume the preserved local PCM source. The visual stop fallback cannot acquire
+audio before native transport ownership is released.
 
 Apple Voice Processing remains local between completed voice turns after the
 first Realtime session. Advanced activity-driven ducking is disabled and the

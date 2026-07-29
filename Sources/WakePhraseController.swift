@@ -383,7 +383,7 @@ final class WakePhraseController {
                         return
                     }
                     Self.logger.error(
-                        "SpeechAnalyzer runtime failed, using legacy fallback: \(VoiceRelayDiagnostics.safe(error.localizedDescription), privacy: .public)"
+                        "SpeechAnalyzer runtime failed, restarting modern recognition: \(VoiceRelayDiagnostics.safe(error.localizedDescription), privacy: .public)"
                     )
                     VoiceRelayDiagnostics.flow(
                         "wake_backend_failed",
@@ -395,19 +395,19 @@ final class WakePhraseController {
                             "stage": "runtime",
                         ]
                     )
-                    let retryModern =
-                        self.modernRuntimeRetryCount < 1
-                    if retryModern {
-                        self.modernRuntimeRetryCount += 1
-                    } else {
-                        self.openModernAnalyzerCircuit(
-                            stage: "runtime",
-                            generation: generation
+                    self.modernRuntimeRetryCount = min(
+                        self.modernRuntimeRetryCount + 1,
+                        WakeAnalyzerRuntimeRecoveryPolicy
+                            .maximumTrackedFailures
+                    )
+                    let retryDelay =
+                        WakeAnalyzerRuntimeRecoveryPolicy.retryDelay(
+                            consecutiveFailures:
+                                self.modernRuntimeRetryCount
                         )
-                    }
                     self.restartAfterFullCleanup(
                         reason: "speech_analyzer_runtime_failure",
-                        delay: retryModern ? 0.15 : 0.8
+                        delay: retryDelay
                     )
                 }
             }
@@ -994,7 +994,7 @@ final class WakePhraseController {
                   self.modernSession != nil else {
                 return
             }
-            self.markModernAnalyzerHealthy(
+            self.closeModernAnalyzerCircuit(
                 generation: generation,
                 reason: "stable_runtime"
             )
@@ -1024,6 +1024,10 @@ final class WakePhraseController {
                     "backend": "speech_analyzer",
                     "reason": "bounded_session_lifetime",
                 ]
+            )
+            self.markModernAnalyzerHealthy(
+                generation: generation,
+                reason: "completed_bounded_session"
             )
             self.restartAfterFullCleanup(
                 reason: "speech_analyzer_session_rotation",
@@ -1064,6 +1068,16 @@ final class WakePhraseController {
         modernRuntimeRetryCount = 0
         modernStabilityWorkItem?.cancel()
         modernStabilityWorkItem = nil
+        closeModernAnalyzerCircuit(
+            generation: generation,
+            reason: reason
+        )
+    }
+
+    private func closeModernAnalyzerCircuit(
+        generation: Int,
+        reason: String
+    ) {
         guard modernAnalyzerCircuit.close() else { return }
         VoiceRelayDiagnostics.flow(
             "wake_backend_circuit_closed",
@@ -1135,6 +1149,8 @@ private final class SpeechAnalyzerWakeSession {
     private var cleanupCompletions: [() -> Void] = []
     private var failureReported = false
     private var usesExternalAudioSource = false
+    private var analyzerInputTimeline = WakeAnalyzerInputTimeline()
+    private var droppedAnalyzerInputCount = 0
 
     init(
         diagnosticGeneration: Int,
@@ -1177,7 +1193,10 @@ private final class SpeechAnalyzerWakeSession {
                         locale: $0,
                         contentHints: [.shortForm, .farField],
                         transcriptionOptions: [],
-                        reportingOptions: [.volatileResults],
+                        reportingOptions: [
+                            .volatileResults,
+                            .frequentFinalization,
+                        ],
                         attributeOptions: []
                     )
                 }
@@ -1247,7 +1266,9 @@ private final class SpeechAnalyzerWakeSession {
 
                 let (inputStream, continuation) =
                     AsyncStream<AnalyzerInput>.makeStream(
-                        bufferingPolicy: .bufferingNewest(64)
+                        bufferingPolicy: .bufferingNewest(
+                            WakeAnalyzerInputPolicy.bufferCapacity
+                        )
                 )
                 let analyzerResultTasks = transcribers.enumerated().map {
                     laneIndex, transcriber in
@@ -1350,8 +1371,9 @@ private final class SpeechAnalyzerWakeSession {
                         } else {
                             analyzerBuffer = buffer
                         }
-                        self.inputContinuation?.yield(
-                            AnalyzerInput(buffer: analyzerBuffer)
+                        self.yieldAnalyzerInput(
+                            analyzerBuffer,
+                            sampleRate: analysisFormat.sampleRate
                         )
                     }
                     let usesExternalAudioSource =
@@ -1645,6 +1667,79 @@ private final class SpeechAnalyzerWakeSession {
         onFailure(error)
     }
 
+    private func yieldAnalyzerInput(
+        _ buffer: AVAudioPCMBuffer,
+        sampleRate: Double
+    ) {
+        let inputState = stateLock.withLock {
+            () -> (
+                AsyncStream<AnalyzerInput>.Continuation,
+                AVAudioFramePosition
+            )? in
+            guard !stopped, let inputContinuation else { return nil }
+            let startFrame = analyzerInputTimeline.consume(
+                frameCount: Int(buffer.frameLength)
+            )
+            return (inputContinuation, startFrame)
+        }
+        guard let (continuation, startFrame) = inputState else { return }
+        let timeScale = CMTimeScale(
+            max(
+                1,
+                min(
+                    Double(Int32.max),
+                    sampleRate.rounded()
+                )
+            )
+        )
+        let result = continuation.yield(
+            AnalyzerInput(
+                buffer: buffer,
+                bufferStartTime: CMTime(
+                    value: CMTimeValue(startFrame),
+                    timescale: timeScale
+                )
+            )
+        )
+        switch result {
+        case .enqueued:
+            break
+        case .dropped:
+            let droppedCount = stateLock.withLock {
+                droppedAnalyzerInputCount += 1
+                return droppedAnalyzerInputCount
+            }
+            if droppedCount == 1
+                || droppedCount.isMultiple(of: 8) {
+                VoiceRelayDiagnostics.flow(
+                    "wake_analyzer_input_dropped",
+                    generation: diagnosticGeneration,
+                    fields: [
+                        "drop_count": String(droppedCount),
+                        "input_start_frame": String(startFrame),
+                    ]
+                )
+            }
+            if WakeAnalyzerInputPolicy.shouldRestart(
+                afterDroppedInputCount: droppedCount
+            ) {
+                reportFailure(
+                    WakeRecognitionError.analyzerInputBackpressure
+                )
+            }
+        case .terminated:
+            if !isStopped {
+                reportFailure(
+                    WakeRecognitionError.analyzerInputTerminated
+                )
+            }
+        @unknown default:
+            reportFailure(
+                WakeRecognitionError.analyzerInputTerminated
+            )
+        }
+    }
+
     private static func convert(
         _ buffer: AVAudioPCMBuffer,
         using converter: AVAudioConverter,
@@ -1691,6 +1786,8 @@ private enum WakeRecognitionError: LocalizedError {
     case noCompatibleAudioConverter
     case audioConversionFailed
     case audioConfigurationChanged
+    case analyzerInputBackpressure
+    case analyzerInputTerminated
 
     var errorDescription: String? {
         switch self {
@@ -1702,6 +1799,10 @@ private enum WakeRecognitionError: LocalizedError {
             "호출어 인식용 오디오를 변환하지 못했어"
         case .audioConfigurationChanged:
             "호출어 인식 중 오디오 장치 구성이 바뀌었어"
+        case .analyzerInputBackpressure:
+            "호출어 인식 입력 처리가 오디오 속도를 따라가지 못했어"
+        case .analyzerInputTerminated:
+            "호출어 인식 입력 스트림이 예기치 않게 종료됐어"
         }
     }
 }

@@ -2875,10 +2875,26 @@ require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'acceptUserTurn(prefill, true)' \
   "a wake command tail must become the first complete Realtime user turn"
-reject_text \
+require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
   '.frequentFinalization' \
-  "wake capture must not trade command-tail accuracy for phrase-sized finalization"
+  "short-form wake capture must regularly finalize old volatile recognition state"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'bufferStartTime: CMTime(' \
+  "analyzer input must preserve the audio timeline across any bounded-buffer gap"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'case .dropped:' \
+  "bounded analyzer input loss must be observed instead of silently compressing time"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'WakeAnalyzerRuntimeRecoveryPolicy.retryDelay(' \
+  "runtime analyzer failures must recover through the modern backend"
+reject_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'SpeechAnalyzer runtime failed, using legacy fallback' \
+  "a running modern analyzer must recover in place instead of switching recognition semantics"
 reject_text \
   "$ROOT/Sources/WakePhraseController.swift" \
   'format: analysisFormat' \

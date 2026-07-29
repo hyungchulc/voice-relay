@@ -170,12 +170,13 @@ creates and persists a new dedicated session during its first Remote warm-up.
 Local wake-phrase recognition is a first-class native feature. On macOS 26 or
 newer, Voice Relay can use Apple's latest SpeechAnalyzer with short-form and
 far-field content hints, per-language asset checks, contextual wake phrases,
-one bounded retry while the audio device is switching, and automatic fallback
-to the classic on-device recognizer. A runtime or startup failure opens a
-process-lifetime circuit breaker, so Voice Relay does not repeatedly reopen a
-failed SpeechAnalyzer after each Realtime handoff. SpeechAnalyzer is used only for local wake
-phrases; the main conversation still uses the selected Realtime voice and the
-paired Codex task.
+frequent finalization of old volatile state, sample-timed bounded input, and
+two-minute clean session rotation. A running analyzer recovers through the same
+modern backend with bounded backoff instead of changing recognition semantics.
+Startup incompatibility and older systems retain the classic on-device
+recognizer as a last-resort fallback. SpeechAnalyzer is used only for local
+wake phrases; the main conversation still uses the selected Realtime voice and
+the paired Codex task.
 
 Open Settings later with `⌘,`. Settings exposes product and assistant names,
 permissions, the optional editable Session ID, wake phrases, system or custom

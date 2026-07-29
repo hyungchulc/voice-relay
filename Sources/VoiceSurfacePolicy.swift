@@ -1093,13 +1093,49 @@ enum WakeTranscriptCandidatePolicy {
 }
 
 enum WakeAnalyzerSessionPolicy {
-    static let maximumContinuousDuration: TimeInterval = 10 * 60
+    static let maximumContinuousDuration: TimeInterval = 2 * 60
 
     static func shouldRotate(
         startedAt: TimeInterval,
         now: TimeInterval
     ) -> Bool {
         now - startedAt >= maximumContinuousDuration
+    }
+}
+
+enum WakeAnalyzerInputPolicy {
+    static let bufferCapacity = 256
+    static let droppedInputRestartThreshold = 8
+
+    static func shouldRestart(afterDroppedInputCount count: Int) -> Bool {
+        count >= droppedInputRestartThreshold
+    }
+}
+
+struct WakeAnalyzerInputTimeline {
+    private(set) var nextFramePosition: Int64 = 0
+
+    mutating func consume(frameCount: Int) -> Int64 {
+        let startFrame = nextFramePosition
+        nextFramePosition += Int64(max(0, frameCount))
+        return startFrame
+    }
+}
+
+enum WakeAnalyzerRuntimeRecoveryPolicy {
+    static let baseDelay: TimeInterval = 0.15
+    static let maximumDelay: TimeInterval = 2
+    static let maximumTrackedFailures = 8
+
+    static func retryDelay(consecutiveFailures: Int) -> TimeInterval {
+        let boundedFailures = min(
+            max(1, consecutiveFailures),
+            maximumTrackedFailures
+        )
+        return min(
+            maximumDelay,
+            baseDelay * pow(2, Double(boundedFailures - 1))
+        )
     }
 }
 

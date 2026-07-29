@@ -1836,7 +1836,7 @@ struct PolicyTests {
             "wake phrases embedded later in a transcript must stay rejected"
         )
         expect(
-            WakeAnalyzerSessionPolicy.maximumContinuousDuration == 600
+            WakeAnalyzerSessionPolicy.maximumContinuousDuration == 120
                 && !WakeAnalyzerSessionPolicy.shouldRotate(
                 startedAt: 100,
                 now: 100
@@ -1848,7 +1848,47 @@ struct PolicyTests {
                     now: 100
                         + WakeAnalyzerSessionPolicy.maximumContinuousDuration
                 ),
-            "modern wake sessions must rotate only at the bounded lifetime"
+            "modern wake sessions must rotate before observed late-session failures"
+        )
+        expect(
+            WakeAnalyzerInputPolicy.bufferCapacity == 256
+                && !WakeAnalyzerInputPolicy.shouldRestart(
+                    afterDroppedInputCount:
+                        WakeAnalyzerInputPolicy
+                            .droppedInputRestartThreshold - 1
+                )
+                && WakeAnalyzerInputPolicy.shouldRestart(
+                    afterDroppedInputCount:
+                        WakeAnalyzerInputPolicy
+                            .droppedInputRestartThreshold
+                ),
+            "modern wake input must absorb short stalls and restart after sustained backpressure"
+        )
+        var analyzerInputTimeline = WakeAnalyzerInputTimeline()
+        let analyzerInputStarts = [
+            analyzerInputTimeline.consume(frameCount: 1_024),
+            analyzerInputTimeline.consume(frameCount: 512),
+            analyzerInputTimeline.consume(frameCount: 256),
+        ]
+        expect(
+            analyzerInputStarts == [0, 1_024, 1_536]
+                && analyzerInputTimeline.nextFramePosition == 1_792,
+            "analyzer input start times must advance by every converted frame even when delivery is bounded"
+        )
+        expect(
+            WakeAnalyzerRuntimeRecoveryPolicy.retryDelay(
+                consecutiveFailures: 1
+            ) == 0.15
+                && WakeAnalyzerRuntimeRecoveryPolicy.retryDelay(
+                    consecutiveFailures: 2
+                ) == 0.3
+                && WakeAnalyzerRuntimeRecoveryPolicy.retryDelay(
+                    consecutiveFailures: 8
+                ) == 2
+                && WakeAnalyzerRuntimeRecoveryPolicy.retryDelay(
+                    consecutiveFailures: 99
+                ) == 2,
+            "runtime SpeechAnalyzer failures must retry the modern backend with bounded backoff"
         )
 
         var audioConfirmation = ExternalAudioOutputConfirmation()
