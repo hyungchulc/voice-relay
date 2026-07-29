@@ -1,5 +1,3 @@
-# Voice Relay 0.4.0-alpha.12
-
 This prerelease makes the delegated-work handoff sound like progress instead
 of a generic acknowledgement.
 

@@ -3020,8 +3020,16 @@ require_text \
   "release packaging must verify both architectures"
 require_text \
   "$ROOT/publish-github-release.sh" \
-  'COMMAND+=(--prerelease)' \
-  "alpha release publishing must be prerelease by default"
+  'COMMAND+=(--prerelease --latest=false)' \
+  "alpha release publishing must be prerelease and explicitly non-latest"
+require_text \
+  "$ROOT/publish-github-release.sh" \
+  "'^#{1,6}[[:space:]]'" \
+  "release publishing must detect a duplicate leading Markdown heading"
+require_text \
+  "$ROOT/publish-github-release.sh" \
+  'PUBLISH_NOTES_FILE="$SANITIZED_NOTES_FILE"' \
+  "release publishing must use sanitized notes after removing a duplicate heading"
 require_text \
   "$ROOT/publish-github-release.sh" \
   'VOICE_RELAY_STABLE_RELEASE_APPROVED' \

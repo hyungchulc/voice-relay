@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/voice-relay-release-policy.XXXXXX")"
 NOTES_FILE="$TEST_DIR/notes.md"
+HEADING_NOTES_FILE="$TEST_DIR/heading-notes.md"
+FAKE_GH="$TEST_DIR/gh"
+FAKE_GH_CAPTURE="$TEST_DIR/published-notes-first-line.txt"
 ASSET_FILE="$TEST_DIR/Voice-Relay-0.4.0-alpha.9-development-signed.dmg"
 CHECKSUM_FILE="$ASSET_FILE.sha256"
 UPDATE_ASSET_FILE="$TEST_DIR/Voice-Relay-0.4.0-alpha.9-update.zip"
@@ -14,6 +17,9 @@ WRONG_CHECKSUM_FILE="$WRONG_ASSET_FILE.sha256"
 
 cleanup() {
   /usr/bin/unlink "$NOTES_FILE" >/dev/null 2>&1 || true
+  /usr/bin/unlink "$HEADING_NOTES_FILE" >/dev/null 2>&1 || true
+  /usr/bin/unlink "$FAKE_GH" >/dev/null 2>&1 || true
+  /usr/bin/unlink "$FAKE_GH_CAPTURE" >/dev/null 2>&1 || true
   /usr/bin/unlink "$ASSET_FILE" >/dev/null 2>&1 || true
   /usr/bin/unlink "$CHECKSUM_FILE" >/dev/null 2>&1 || true
   /usr/bin/unlink "$UPDATE_ASSET_FILE" >/dev/null 2>&1 || true
@@ -26,6 +32,39 @@ cleanup() {
 trap cleanup EXIT
 
 printf 'Release notes\n' > "$NOTES_FILE"
+printf '# Voice Relay 0.4.0-alpha.9\n\nActual release body\n' \
+  > "$HEADING_NOTES_FILE"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'if [[ "$1" == "release" && "$2" == "view" ]]; then' \
+  '  exit 1' \
+  'fi' \
+  'if [[ "$1" == "release" && "$2" == "create" ]]; then' \
+  '  shift 2' \
+  '  while [[ "$#" -gt 0 ]]; do' \
+  '    if [[ "$1" == "--notes-file" ]]; then' \
+  '      /usr/bin/head -n 1 "$2" > "$VOICE_RELAY_FAKE_GH_CAPTURE"' \
+  '      exit 0' \
+  '    fi' \
+  '    shift' \
+  '  done' \
+  '  exit 4' \
+  'fi' \
+  'if [[ "$1" == "api" && "$*" == *"/releases/tags/"* ]]; then' \
+  "  printf 'false\\ttrue\\ttrue\\n'" \
+  '  exit 0' \
+  'fi' \
+  'if [[ "$1" == "api" && "$*" == *"/contents/appcast.xml?ref=main"* ]]; then' \
+  '  exit 1' \
+  'fi' \
+  'if [[ "$1" == "api" && "$*" == *"--method PUT"* ]]; then' \
+  "  printf 'fake-content-sha\\n'" \
+  '  exit 0' \
+  'fi' \
+  'exit 5' \
+  > "$FAKE_GH"
+/bin/chmod 700 "$FAKE_GH"
 printf 'test asset\n' > "$ASSET_FILE"
 (
   cd "$TEST_DIR"
@@ -63,8 +102,23 @@ if [[ "$ALPHA_OUTPUT" != *"--prerelease"* ]]; then
   echo "FAIL: alpha releases must be published with --prerelease" >&2
   exit 1
 fi
-if [[ "$ALPHA_OUTPUT" == *"--latest"* ]]; then
-  echo "FAIL: alpha releases must never be published with --latest" >&2
+if [[ "$ALPHA_OUTPUT" != *"--latest=false"* ]]; then
+  echo "FAIL: alpha releases must explicitly opt out of GitHub latest selection" >&2
+  exit 1
+fi
+
+VOICE_RELAY_FAKE_GH_CAPTURE="$FAKE_GH_CAPTURE" \
+VOICE_RELAY_GH_BIN="$FAKE_GH" \
+VOICE_RELAY_RELEASE_NOTES_FILE="$HEADING_NOTES_FILE" \
+"$ROOT/publish-github-release.sh" \
+  v0.4.0-alpha.9 \
+  "$ASSET_FILE" \
+  "$CHECKSUM_FILE" \
+  "$UPDATE_ASSET_FILE" \
+  "$UPDATE_CHECKSUM_FILE" \
+  "$APPCAST_FILE" >/dev/null
+if [[ "$(/usr/bin/head -n 1 "$FAKE_GH_CAPTURE")" != "Actual release body" ]]; then
+  echo "FAIL: a duplicate leading Markdown heading must be removed before publication" >&2
   exit 1
 fi
 if \
@@ -150,6 +204,18 @@ if ! /usr/bin/grep -q \
   'publish-sparkle-feed.sh' \
   "$ROOT/publish-github-release.sh"; then
   echo "FAIL: prerelease publication must publish the stable Sparkle feed" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -Eq \
+  '\^\#\{1,6\}\[\[:space:\]\]' \
+  "$ROOT/publish-github-release.sh"; then
+  echo "FAIL: release publication must detect a duplicate leading Markdown heading" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -Fq \
+  'PUBLISH_NOTES_FILE="$SANITIZED_NOTES_FILE"' \
+  "$ROOT/publish-github-release.sh"; then
+  echo "FAIL: release publication must use sanitized notes when a leading heading is present" >&2
   exit 1
 fi
 

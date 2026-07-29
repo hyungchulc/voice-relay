@@ -23,6 +23,32 @@ if [[ -z "$NOTES_FILE" || ! -s "$NOTES_FILE" ]]; then
   exit 2
 fi
 
+PUBLISH_NOTES_FILE="$NOTES_FILE"
+SANITIZED_NOTES_FILE=""
+cleanup() {
+  if [[ -n "$SANITIZED_NOTES_FILE" ]]; then
+    /usr/bin/unlink "$SANITIZED_NOTES_FILE" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+if /usr/bin/head -n 1 "$NOTES_FILE" \
+    | /usr/bin/grep -Eq '^#{1,6}[[:space:]]'; then
+  SANITIZED_NOTES_FILE="$(
+    /usr/bin/mktemp "${TMPDIR:-/tmp}/voice-relay-release-notes.XXXXXX"
+  )"
+  /usr/bin/awk '
+    NR == 1 { next }
+    NR == 2 && /^[[:space:]]*$/ { next }
+    { print }
+  ' "$NOTES_FILE" > "$SANITIZED_NOTES_FILE"
+  if [[ ! -s "$SANITIZED_NOTES_FILE" ]]; then
+    echo "Release notes contain only a duplicate Markdown heading." >&2
+    exit 2
+  fi
+  PUBLISH_NOTES_FILE="$SANITIZED_NOTES_FILE"
+fi
+
 for asset in "$@"; do
   if [[ ! -f "$asset" ]]; then
     echo "Release asset does not exist: $asset" >&2
@@ -115,13 +141,13 @@ COMMAND=(
   --title
   "$TITLE"
   --notes-file
-  "$NOTES_FILE"
+  "$PUBLISH_NOTES_FILE"
   --repo
   "$REPOSITORY"
 )
 
 if [[ "$RELEASE_KIND" == "prerelease" ]]; then
-  COMMAND+=(--prerelease)
+  COMMAND+=(--prerelease --latest=false)
 else
   COMMAND+=(--latest)
 fi
