@@ -941,45 +941,60 @@ private final class SpeechAnalyzerWakeSession {
                 let (inputStream, continuation) =
                     AsyncStream<AnalyzerInput>.makeStream(
                         bufferingPolicy: .bufferingNewest(64)
-                    )
+                )
                 let analyzerResultTasks = transcribers.enumerated().map {
                     laneIndex, transcriber in
                     Task { [weak self] in
-                        var segments: [ModernTranscriptSegment] = []
+                        var reducer =
+                            SpeechAnalyzerWakeTranscriptReducer()
                         do {
                             for try await result in transcriber.results {
                                 guard let self, !self.isStopped else { return }
-                                segments.removeAll {
-                                    Self.rangesOverlap(
-                                        $0.range,
-                                        result.range
-                                    )
-                                }
                                 let text = String(result.text.characters)
                                     .trimmingCharacters(
                                         in: .whitespacesAndNewlines
                                     )
-                                if !text.isEmpty {
-                                    segments.append(
-                                        ModernTranscriptSegment(
-                                            range: result.range,
-                                            text: text
-                                        )
-                                    )
-                                }
-                                segments.sort {
-                                    CMTimeCompare(
-                                        $0.range.start,
-                                        $1.range.start
-                                    ) < 0
-                                }
-                                let transcript = segments
-                                    .map(\.text)
-                                    .joined(separator: " ")
+                                let rangeStart = CMTimeGetSeconds(
+                                    result.range.start
+                                )
+                                let rangeEnd = CMTimeGetSeconds(
+                                    CMTimeRangeGetEnd(result.range)
+                                )
+                                let emission = reducer.ingest(
+                                    text: text,
+                                    start: rangeStart,
+                                    end: rangeEnd,
+                                    phrases: self.phrases
+                                )
+                                VoiceRelayDiagnostics.flow(
+                                    "wake_transcript_result",
+                                    generation: self.diagnosticGeneration,
+                                    fields: [
+                                        "candidate":
+                                            emission == nil
+                                                ? "false"
+                                                : "true",
+                                        "final": String(result.isFinal),
+                                        "lane": String(laneIndex),
+                                        "range_end_ms":
+                                            Self.milliseconds(rangeEnd),
+                                        "range_start_ms":
+                                            Self.milliseconds(rangeStart),
+                                        "scope":
+                                            emission == nil
+                                                ? "current_result"
+                                                : "wake_anchored",
+                                        "segment_count":
+                                            String(
+                                                emission?.segmentCount ?? 0
+                                            ),
+                                    ]
+                                )
+                                guard let emission else { continue }
                                 self.onTranscript(
                                     laneIndex,
-                                    transcript,
-                                    result.isFinal
+                                    emission.transcript,
+                                    false
                                 )
                             }
                         } catch {
@@ -1071,22 +1086,9 @@ private final class SpeechAnalyzerWakeSession {
         }
     }
 
-    private struct ModernTranscriptSegment {
-        let range: CMTimeRange
-        let text: String
-    }
-
-    private static func rangesOverlap(
-        _ lhs: CMTimeRange,
-        _ rhs: CMTimeRange
-    ) -> Bool {
-        if CMTimeCompare(lhs.start, rhs.start) == 0 {
-            return true
-        }
-        let lhsEnd = CMTimeRangeGetEnd(lhs)
-        let rhsEnd = CMTimeRangeGetEnd(rhs)
-        return CMTimeCompare(lhs.start, rhsEnd) < 0
-            && CMTimeCompare(rhs.start, lhsEnd) < 0
+    private static func milliseconds(_ seconds: TimeInterval) -> String {
+        guard seconds.isFinite else { return "unavailable" }
+        return String(Int(max(0, seconds * 1_000)))
     }
 
     func stop(completion: @escaping () -> Void = {}) {

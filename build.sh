@@ -11,6 +11,8 @@ if [[ "$#" -ne 0 ]]; then
   echo "usage: $0" >&2
   exit 2
 fi
+SPARKLE_ROOT="$("$ROOT/fetch-sparkle.sh")"
+SPARKLE_FRAMEWORK="$SPARKLE_ROOT/Sparkle.framework"
 
 bash "$ROOT/Tests/SourcePolicyTests.sh"
 node "$ROOT/Tests/RealtimeResponseQueueTests.mjs"
@@ -27,7 +29,10 @@ if [[ "$APP_DIR" != */"Voice Relay.app" ]]; then
   exit 2
 fi
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+mkdir -p \
+  "$APP_DIR/Contents/MacOS" \
+  "$APP_DIR/Contents/Resources" \
+  "$APP_DIR/Contents/Frameworks"
 
 SOURCES=(
   "$ROOT/Sources/AppLocalization.swift"
@@ -68,6 +73,10 @@ for arch in $ARCHS; do
     -framework Speech \
     -framework WebKit \
     -framework Security \
+    -F "$SPARKLE_ROOT" \
+    -framework Sparkle \
+    -Xlinker -rpath \
+    -Xlinker @executable_path/../Frameworks \
     -O
   ARCH_BINARIES+=("$arch_binary")
 done
@@ -77,7 +86,6 @@ if [[ "${#ARCH_BINARIES[@]}" -eq 1 ]]; then
 else
   xcrun lipo -create "${ARCH_BINARIES[@]}" -output "$BUILD_DIR/VoiceRelay"
 fi
-
 HOST_ARCH="$(uname -m)"
 xcrun swiftc \
   -parse-as-library \
@@ -89,7 +97,6 @@ xcrun swiftc \
   "$ROOT/Sources/OverlayPlacement.swift" \
   "$ROOT/Sources/PresenceMonitor.swift" \
   "$ROOT/Sources/SettingsStore.swift" \
-  "$ROOT/Sources/VoiceRelayUpdater.swift" \
   "$ROOT/Sources/VoiceSurfacePolicy.swift" \
   "$ROOT/Sources/RealtimeAudioAdmissionPolicy.swift" \
   "$ROOT/Sources/RealtimeEchoAdmissionPolicy.swift" \
@@ -101,6 +108,9 @@ xcrun swiftc \
 "$BUILD_DIR/VoiceRelayPolicyTests"
 
 cp "$BUILD_DIR/VoiceRelay" "$APP_DIR/Contents/MacOS/VoiceRelay"
+/usr/bin/ditto \
+  "$SPARKLE_FRAMEWORK" \
+  "$APP_DIR/Contents/Frameworks/Sparkle.framework"
 cp "$ROOT/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$ROOT/Resources/PrivacyInfo.xcprivacy" "$APP_DIR/Contents/Resources/PrivacyInfo.xcprivacy"
 cp "$ROOT/Resources/authority-pack.json" \
@@ -127,10 +137,33 @@ plutil -lint "$APP_DIR/Contents/Resources/PrivacyInfo.xcprivacy" >/dev/null
 node -e \
   'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' \
   "$APP_DIR/Contents/Resources/authority-pack.json"
+SPARKLE_BUNDLE="$APP_DIR/Contents/Frameworks/Sparkle.framework"
+SIGN_ARGS=(--force --sign "$SIGNING_IDENTITY")
+if [[ -z "$SIGNING_IDENTITY" || "$SIGNING_IDENTITY" == "-" ]]; then
+  SIGN_ARGS=(--force --sign -)
+else
+  SIGN_ARGS+=(--options runtime --timestamp=none)
+fi
+/usr/bin/codesign \
+  "${SIGN_ARGS[@]}" \
+  "$SPARKLE_BUNDLE/Versions/B/XPCServices/Installer.xpc" >/dev/null
+/usr/bin/codesign \
+  "${SIGN_ARGS[@]}" \
+  --preserve-metadata=entitlements \
+  "$SPARKLE_BUNDLE/Versions/B/XPCServices/Downloader.xpc" >/dev/null
+/usr/bin/codesign \
+  "${SIGN_ARGS[@]}" \
+  "$SPARKLE_BUNDLE/Versions/B/Autoupdate" >/dev/null
+/usr/bin/codesign \
+  "${SIGN_ARGS[@]}" \
+  "$SPARKLE_BUNDLE/Versions/B/Updater.app" >/dev/null
+/usr/bin/codesign \
+  "${SIGN_ARGS[@]}" \
+  "$SPARKLE_BUNDLE" >/dev/null
+
 if [[ -z "$SIGNING_IDENTITY" || "$SIGNING_IDENTITY" == "-" ]]; then
   /usr/bin/codesign \
     --force \
-    --deep \
     --sign - \
     --entitlements "$ROOT/Resources/VoiceRelay.entitlements" \
     --requirements '=designated => identifier "com.hyungchulc.voice-relay"' \
@@ -138,12 +171,12 @@ if [[ -z "$SIGNING_IDENTITY" || "$SIGNING_IDENTITY" == "-" ]]; then
 else
   /usr/bin/codesign \
     --force \
-    --deep \
     --options runtime \
     --timestamp=none \
     --sign "$SIGNING_IDENTITY" \
     --entitlements "$ROOT/Resources/VoiceRelay.entitlements" \
     "$APP_DIR" >/dev/null
 fi
+/usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 
 echo "$APP_DIR"

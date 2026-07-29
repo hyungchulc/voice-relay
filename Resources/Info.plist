@@ -21,11 +21,23 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.4.0</string>
 	<key>CFBundleVersion</key>
-	<string>21</string>
+	<string>22</string>
 	<key>VoiceRelayReleaseTag</key>
-	<string>v0.4.0-alpha.10</string>
+	<string>v0.4.0-alpha.11</string>
 	<key>VoiceRelayDistributionChannel</key>
 	<string>prerelease</string>
+	<key>SUFeedURL</key>
+	<string>https://raw.githubusercontent.com/hyungchulc/voice-relay/main/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>Z0x6meQ8AKenv9nETS4YbqqQEnWrYexmZ89OuhudKrw=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<false/>
+	<key>SUAllowsAutomaticUpdates</key>
+	<false/>
+	<key>SURequireSignedFeed</key>
+	<true/>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>

@@ -1310,8 +1310,28 @@ require_text \
   "About must provide an explicit manual update check"
 require_text \
   "$ROOT/Sources/VoiceRelayUpdater.swift" \
-  'api.github.com/repos/hyungchulc/voice-relay/releases?per_page=100' \
-  "prerelease updates must use the GitHub release list instead of latest"
+  'SPUStandardUpdaterController' \
+  "About updates must use Sparkle's standard secure updater"
+require_text \
+  "$ROOT/Resources/Info.plist" \
+  '<key>SUPublicEDKey</key>' \
+  "Sparkle updates must use a pinned EdDSA public key"
+require_text \
+  "$ROOT/Resources/Info.plist" \
+  '<key>SURequireSignedFeed</key>' \
+  "Sparkle updates must require a signed feed"
+require_text \
+  "$ROOT/build.sh" \
+  'Contents/Frameworks/Sparkle.framework' \
+  "the app bundle must embed the pinned Sparkle framework"
+reject_text \
+  "$ROOT/Sources/VoiceRelayUpdater.swift" \
+  'VoiceRelayUpdateInstaller' \
+  "the retired custom self-installer must not return"
+reject_text \
+  "$ROOT/build.sh" \
+  'VoiceRelayUpdateHelper' \
+  "the retired custom replacement helper must not ship"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'style.paragraphSpacing = 0' \
@@ -2495,8 +2515,16 @@ require_text \
   "wake recognition must use the shared command-tail stabilization policy"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
-  'ModernTranscriptSegment' \
-  "modern wake recognition must compose split analyzer ranges before activation"
+  'SpeechAnalyzerWakeTranscriptReducer' \
+  "modern wake recognition must compose only wake-anchored analyzer ranges"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  '"scope":' \
+  "modern wake diagnostics must identify the result scope"
+reject_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'var segments: [ModernTranscriptSegment]' \
+  "modern wake recognition must not prepend full-session transcription history"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'prefill: match.command,' \

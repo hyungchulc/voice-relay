@@ -59,6 +59,16 @@ and testing, but is not notarized.
 - Stable publication is locked until the user explicitly approves `v1.0.0`.
 - `publish-github-release.sh` enforces this policy and rejects other stable
   tags instead of guessing release intent.
+- Public prereleases carry a manual-install DMG, a Sparkle update ZIP, their
+  checksums, and a versioned signed appcast.
+- Sparkle 2.9.4 is checksum-pinned at build time. Its framework and nested
+  services are signed leaf-first; application signing never uses `--deep`.
+- `publish-sparkle-feed.sh` publishes the verified versioned appcast to the
+  stable public `appcast.xml` URL only after the matching prerelease archive is
+  visible.
+- The first Sparkle-enabled alpha still requires one manual installation.
+  Later prereleases can be downloaded, verified, installed, and relaunched
+  from About Voice Relay.
 - Each release must use an existing verified tag, non-empty release notes, and
   the matching package assets.
 

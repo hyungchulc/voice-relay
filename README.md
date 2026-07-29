@@ -191,9 +191,11 @@ restores the persisted appearance. The native toolbar keeps General, Voice,
 Connection, Permissions, and Advanced separate.
 
 Advanced includes an About Voice Relay section with the exact embedded release
-tag and build number. Its manual update check reads the public GitHub release
-list, includes prereleases, and opens only a validated release page. It never
-silently replaces or launches downloaded code.
+tag and build number. **Check for Updates…** uses pinned Sparkle 2 with an
+EdDSA-signed prerelease feed. Sparkle downloads, verifies, installs, and
+relaunches the selected update inside the app. Scheduled background checks and
+silent automatic installation remain disabled. The first Sparkle-enabled alpha
+must be installed manually once; later alphas can update in place.
 
 General settings also exposes `Open Voice Relay at login`. It uses the native
 macOS Login Items service and reflects the current system registration or
@@ -379,10 +381,17 @@ tags and never sets the GitHub `Latest` marker:
 ```bash
 VOICE_RELAY_RELEASE_NOTES_FILE="./release-notes.md" \
 ./publish-github-release.sh \
-  v0.4.0-alpha.10 \
-  releases/Voice-Relay-0.4.0-alpha.10-development-signed.dmg \
-  releases/Voice-Relay-0.4.0-alpha.10-development-signed.dmg.sha256
+  v0.4.0-alpha.11 \
+  releases/Voice-Relay-0.4.0-alpha.11-development-signed.dmg \
+  releases/Voice-Relay-0.4.0-alpha.11-development-signed.dmg.sha256 \
+  releases/Voice-Relay-0.4.0-alpha.11-update.zip \
+  releases/Voice-Relay-0.4.0-alpha.11-update.zip.sha256 \
+  releases/Voice-Relay-0.4.0-alpha.11-appcast.xml
 ```
+
+The release helper uploads the prerelease assets and then publishes the signed
+feed to the stable `appcast.xml` URL. If feed publication alone needs retrying,
+run `publish-sparkle-feed.sh` with the tag and versioned appcast.
 
 Only after explicit user approval for the first stable release may the same
 helper be invoked with `VOICE_RELAY_STABLE_RELEASE_APPROVED=true` and

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 if [[ "$#" -lt 2 ]]; then
   echo "usage: $0 <tag> <asset> [asset ...]" >&2
   exit 2
@@ -42,36 +44,62 @@ else
 fi
 
 if [[ "$RELEASE_KIND" == "prerelease" ]]; then
-  if [[ "$#" -ne 2 ]]; then
-    echo "Prereleases require exactly one DMG and its SHA-256 file." >&2
+  if [[ "$#" -ne 5 ]]; then
+    echo "Prereleases require DMG, Sparkle update ZIP, checksums, and appcast." >&2
     exit 2
   fi
   RELEASE_LABEL="${TAG#v}"
   DMG_ASSET=""
-  CHECKSUM_ASSET=""
+  DMG_CHECKSUM_ASSET=""
+  UPDATE_ASSET=""
+  UPDATE_CHECKSUM_ASSET=""
+  APPCAST_ASSET=""
   for asset in "$@"; do
     case "$(basename "$asset")" in
       Voice-Relay-"$RELEASE_LABEL"-*.dmg)
         DMG_ASSET="$asset"
         ;;
       Voice-Relay-"$RELEASE_LABEL"-*.dmg.sha256)
-        CHECKSUM_ASSET="$asset"
+        DMG_CHECKSUM_ASSET="$asset"
+        ;;
+      Voice-Relay-"$RELEASE_LABEL"-*.zip)
+        UPDATE_ASSET="$asset"
+        ;;
+      Voice-Relay-"$RELEASE_LABEL"-*.zip.sha256)
+        UPDATE_CHECKSUM_ASSET="$asset"
+        ;;
+      Voice-Relay-"$RELEASE_LABEL"-appcast.xml)
+        APPCAST_ASSET="$asset"
         ;;
     esac
   done
-  if [[ -z "$DMG_ASSET" || -z "$CHECKSUM_ASSET" \
-        || "$CHECKSUM_ASSET" != "${DMG_ASSET}.sha256" ]]; then
-    echo "Prerelease asset names must match the publication tag and each other." >&2
+  if [[ -z "$DMG_ASSET" || -z "$DMG_CHECKSUM_ASSET" \
+        || -z "$UPDATE_ASSET" || -z "$UPDATE_CHECKSUM_ASSET" \
+        || -z "$APPCAST_ASSET" \
+        || "$DMG_CHECKSUM_ASSET" != "${DMG_ASSET}.sha256" \
+        || "$UPDATE_CHECKSUM_ASSET" != "${UPDATE_ASSET}.sha256" ]]; then
+    echo "Prerelease DMG and updater asset names must match the tag." >&2
     exit 2
   fi
-  EXPECTED_CHECKSUM="$(
+  EXPECTED_DMG_CHECKSUM="$(
     /usr/bin/shasum -a 256 "$DMG_ASSET" | /usr/bin/awk '{print $1}'
   )"
-  RECORDED_CHECKSUM="$(
-    /usr/bin/awk 'NR == 1 {print $1}' "$CHECKSUM_ASSET"
+  RECORDED_DMG_CHECKSUM="$(
+    /usr/bin/awk 'NR == 1 {print $1}' "$DMG_CHECKSUM_ASSET"
   )"
-  if [[ "$EXPECTED_CHECKSUM" != "$RECORDED_CHECKSUM" ]]; then
-    echo "Prerelease checksum does not match the DMG." >&2
+  EXPECTED_UPDATE_CHECKSUM="$(
+    /usr/bin/shasum -a 256 "$UPDATE_ASSET" | /usr/bin/awk '{print $1}'
+  )"
+  RECORDED_UPDATE_CHECKSUM="$(
+    /usr/bin/awk 'NR == 1 {print $1}' "$UPDATE_CHECKSUM_ASSET"
+  )"
+  if [[ "$EXPECTED_DMG_CHECKSUM" != "$RECORDED_DMG_CHECKSUM" \
+        || "$EXPECTED_UPDATE_CHECKSUM" != "$RECORDED_UPDATE_CHECKSUM" ]]; then
+    echo "Prerelease checksums do not match the packaged assets." >&2
+    exit 2
+  fi
+  if ! /usr/bin/grep -q 'sparkle:edSignature=' "$APPCAST_ASSET"; then
+    echo "Prerelease appcast is missing a signed Sparkle enclosure." >&2
     exit 2
   fi
 fi
@@ -98,6 +126,10 @@ fi
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '%q ' "${COMMAND[@]}"
   printf '\n'
+  if [[ "$RELEASE_KIND" == "prerelease" ]]; then
+    printf '%q ' "$ROOT/publish-sparkle-feed.sh" "$TAG" "$APPCAST_ASSET"
+    printf '\n'
+  fi
   exit 0
 fi
 
@@ -107,3 +139,7 @@ if "$GH_BIN" release view "$TAG" >/dev/null 2>&1; then
 fi
 
 "${COMMAND[@]}"
+if [[ "$RELEASE_KIND" == "prerelease" ]]; then
+  VOICE_RELAY_GH_BIN="$GH_BIN" \
+    "$ROOT/publish-sparkle-feed.sh" "$TAG" "$APPCAST_ASSET"
+fi

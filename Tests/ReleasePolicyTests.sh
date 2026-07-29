@@ -6,6 +6,9 @@ TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/voice-relay-release-policy.XXXXXX")"
 NOTES_FILE="$TEST_DIR/notes.md"
 ASSET_FILE="$TEST_DIR/Voice-Relay-0.4.0-alpha.9-development-signed.dmg"
 CHECKSUM_FILE="$ASSET_FILE.sha256"
+UPDATE_ASSET_FILE="$TEST_DIR/Voice-Relay-0.4.0-alpha.9-update.zip"
+UPDATE_CHECKSUM_FILE="$UPDATE_ASSET_FILE.sha256"
+APPCAST_FILE="$TEST_DIR/Voice-Relay-0.4.0-alpha.9-appcast.xml"
 WRONG_ASSET_FILE="$TEST_DIR/Voice-Relay-0.4.0-alpha.8-development-signed.dmg"
 WRONG_CHECKSUM_FILE="$WRONG_ASSET_FILE.sha256"
 
@@ -13,6 +16,9 @@ cleanup() {
   /usr/bin/unlink "$NOTES_FILE" >/dev/null 2>&1 || true
   /usr/bin/unlink "$ASSET_FILE" >/dev/null 2>&1 || true
   /usr/bin/unlink "$CHECKSUM_FILE" >/dev/null 2>&1 || true
+  /usr/bin/unlink "$UPDATE_ASSET_FILE" >/dev/null 2>&1 || true
+  /usr/bin/unlink "$UPDATE_CHECKSUM_FILE" >/dev/null 2>&1 || true
+  /usr/bin/unlink "$APPCAST_FILE" >/dev/null 2>&1 || true
   /usr/bin/unlink "$WRONG_ASSET_FILE" >/dev/null 2>&1 || true
   /usr/bin/unlink "$WRONG_CHECKSUM_FILE" >/dev/null 2>&1 || true
   /bin/rmdir "$TEST_DIR" >/dev/null 2>&1 || true
@@ -26,6 +32,15 @@ printf 'test asset\n' > "$ASSET_FILE"
   /usr/bin/shasum -a 256 "$(basename "$ASSET_FILE")" \
     > "$(basename "$CHECKSUM_FILE")"
 )
+printf 'test updater asset\n' > "$UPDATE_ASSET_FILE"
+(
+  cd "$TEST_DIR"
+  /usr/bin/shasum -a 256 "$(basename "$UPDATE_ASSET_FILE")" \
+    > "$(basename "$UPDATE_CHECKSUM_FILE")"
+)
+printf '%s\n' \
+  '<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item><enclosure url="https://github.com/hyungchulc/voice-relay/releases/download/v0.4.0-alpha.9/Voice-Relay-0.4.0-alpha.9-update.zip" sparkle:edSignature="test"/></item></channel></rss>' \
+  > "$APPCAST_FILE"
 printf 'wrong release asset\n' > "$WRONG_ASSET_FILE"
 (
   cd "$TEST_DIR"
@@ -39,7 +54,10 @@ ALPHA_OUTPUT="$(
   "$ROOT/publish-github-release.sh" \
     v0.4.0-alpha.9 \
     "$ASSET_FILE" \
-    "$CHECKSUM_FILE"
+    "$CHECKSUM_FILE" \
+    "$UPDATE_ASSET_FILE" \
+    "$UPDATE_CHECKSUM_FILE" \
+    "$APPCAST_FILE"
 )"
 if [[ "$ALPHA_OUTPUT" != *"--prerelease"* ]]; then
   echo "FAIL: alpha releases must be published with --prerelease" >&2
@@ -55,7 +73,10 @@ if \
   "$ROOT/publish-github-release.sh" \
     v0.4.0-alpha.9 \
     "$WRONG_ASSET_FILE" \
-    "$WRONG_CHECKSUM_FILE" >/dev/null 2>&1
+    "$WRONG_CHECKSUM_FILE" \
+    "$UPDATE_ASSET_FILE" \
+    "$UPDATE_CHECKSUM_FILE" \
+    "$APPCAST_FILE" >/dev/null 2>&1
 then
   echo "FAIL: prerelease asset names must match the publication tag" >&2
   exit 1
@@ -111,6 +132,24 @@ if ! /usr/bin/grep -q \
   'Source archive SHA-256' \
   "$ROOT/package-alpha-dmg.sh"; then
   echo "FAIL: alpha packaging must record the public source archive digest" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -q \
+  'UPDATE_ARCHIVE' \
+  "$ROOT/package-alpha-dmg.sh"; then
+  echo "FAIL: alpha packaging must produce a Sparkle updater archive" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -q \
+  'generate_appcast' \
+  "$ROOT/package-alpha-dmg.sh"; then
+  echo "FAIL: alpha packaging must generate the signed Sparkle appcast" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -q \
+  'publish-sparkle-feed.sh' \
+  "$ROOT/publish-github-release.sh"; then
+  echo "FAIL: prerelease publication must publish the stable Sparkle feed" >&2
   exit 1
 fi
 

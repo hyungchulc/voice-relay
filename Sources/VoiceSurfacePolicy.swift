@@ -763,6 +763,127 @@ struct WakePhraseMatch: Equatable {
     let command: String
 }
 
+struct SpeechAnalyzerWakeTranscriptReducer {
+    struct Emission: Equatable {
+        let transcript: String
+        let segmentCount: Int
+    }
+
+    private struct Segment: Equatable {
+        let start: TimeInterval
+        let end: TimeInterval
+        let text: String
+    }
+
+    private var segments: [Segment] = []
+    private var fallbackPosition: TimeInterval = 0
+
+    mutating func ingest(
+        text rawText: String,
+        start rawStart: TimeInterval,
+        end rawEnd: TimeInterval,
+        phrases: [String]
+    ) -> Emission? {
+        let text = rawText.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let range = normalizedRange(start: rawStart, end: rawEnd)
+
+        if segments.isEmpty {
+            guard WakePhrasePolicy.match(
+                text,
+                phrases: phrases
+            ) != nil else {
+                return nil
+            }
+            segments = [
+                Segment(start: range.start, end: range.end, text: text)
+            ]
+            return emission()
+        }
+
+        segments.removeAll {
+            Self.rangesOverlap(
+                lhsStart: $0.start,
+                lhsEnd: $0.end,
+                rhsStart: range.start,
+                rhsEnd: range.end
+            )
+        }
+        if !text.isEmpty {
+            segments.append(
+                Segment(start: range.start, end: range.end, text: text)
+            )
+        }
+        segments.sort {
+            if $0.start == $1.start { return $0.end < $1.end }
+            return $0.start < $1.start
+        }
+
+        guard let current = emission(),
+              WakePhrasePolicy.match(
+                  current.transcript,
+                  phrases: phrases
+              ) != nil else {
+            segments.removeAll()
+            guard WakePhrasePolicy.match(
+                text,
+                phrases: phrases
+            ) != nil else {
+                return nil
+            }
+            segments = [
+                Segment(start: range.start, end: range.end, text: text)
+            ]
+            return emission()
+        }
+        return current
+    }
+
+    mutating func reset() {
+        segments.removeAll()
+        fallbackPosition = 0
+    }
+
+    private mutating func normalizedRange(
+        start rawStart: TimeInterval,
+        end rawEnd: TimeInterval
+    ) -> (start: TimeInterval, end: TimeInterval) {
+        if rawStart.isFinite,
+           rawEnd.isFinite,
+           rawStart >= 0,
+           rawEnd >= rawStart {
+            fallbackPosition = max(fallbackPosition, rawEnd)
+            return (rawStart, rawEnd)
+        }
+        let start = fallbackPosition
+        fallbackPosition += 0.001
+        return (start, fallbackPosition)
+    }
+
+    private func emission() -> Emission? {
+        let transcript = segments
+            .map(\.text)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !transcript.isEmpty else { return nil }
+        return Emission(
+            transcript: transcript,
+            segmentCount: segments.count
+        )
+    }
+
+    private static func rangesOverlap(
+        lhsStart: TimeInterval,
+        lhsEnd: TimeInterval,
+        rhsStart: TimeInterval,
+        rhsEnd: TimeInterval
+    ) -> Bool {
+        if lhsStart == rhsStart { return true }
+        return lhsStart < rhsEnd && rhsStart < lhsEnd
+    }
+}
+
 enum WakePhraseCapturePolicy {
     static let wakeOnlyGrace: TimeInterval = 0.55
     static let commandTailGrace: TimeInterval = 1.05

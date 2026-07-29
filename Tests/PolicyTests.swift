@@ -40,61 +40,6 @@ struct PolicyTests {
     }
 
     static func main() {
-        let alphaNine = VoiceRelaySemanticVersion(tag: "v0.4.0-alpha.9")
-        let alphaTen = VoiceRelaySemanticVersion(tag: "v0.4.0-alpha.10")
-        let releaseCandidate = VoiceRelaySemanticVersion(tag: "v1.0.0-rc.1")
-        let stableOne = VoiceRelaySemanticVersion(tag: "v1.0.0")
-        expect(
-            alphaNine != nil
-                && alphaTen != nil
-                && alphaNine! < alphaTen!
-                && alphaTen! < releaseCandidate!
-                && releaseCandidate! < stableOne!,
-            "update comparison must follow numeric prerelease precedence"
-        )
-        expect(
-            VoiceRelaySemanticVersion(tag: "v0.4-alpha.10") == nil
-                && VoiceRelaySemanticVersion(tag: "v0.4.0-preview.1") == nil,
-            "malformed or unsupported release tags must fail closed"
-        )
-        let updateReleases = [
-            VoiceRelayGitHubRelease(
-                tagName: "v0.4.0-alpha.10",
-                htmlURL:
-                    "https://github.com/hyungchulc/voice-relay/releases/tag/v0.4.0-alpha.10",
-                draft: false,
-                prerelease: true
-            ),
-            VoiceRelayGitHubRelease(
-                tagName: "v0.4.0-alpha.11",
-                htmlURL:
-                    "https://github.example.com/hyungchulc/voice-relay/releases/tag/v0.4.0-alpha.11",
-                draft: false,
-                prerelease: true
-            ),
-            VoiceRelayGitHubRelease(
-                tagName: "v1.0.0",
-                htmlURL:
-                    "https://github.com/hyungchulc/voice-relay/releases/tag/v1.0.0",
-                draft: true,
-                prerelease: false
-            ),
-        ]
-        expect(
-            VoiceRelayUpdatePolicy.selectCandidate(
-                currentTag: "v0.4.0-alpha.9",
-                releases: updateReleases
-            )?.tag == "v0.4.0-alpha.10",
-            "the updater must select the newest valid non-draft trusted release"
-        )
-        expect(
-            VoiceRelayUpdatePolicy.validatedReleasePageURL(
-                "https://github.com/hyungchulc/voice-relay/releases/tag/v0.4.0-alpha.10%2Fevil",
-                tag: "v0.4.0-alpha.10"
-            ) == nil,
-            "encoded path separators must not escape the trusted release path"
-        )
-
         let hiddenTranscriptLog = VoiceRelayDiagnostics.rendered(
             "diagnostic_test",
             generation: 7,
@@ -1212,6 +1157,66 @@ struct PolicyTests {
                 phrases: configuredAriaPhrases
             ) == nil,
             "configured wake phrases must remain leading"
+        )
+        var modernWakeReducer = SpeechAnalyzerWakeTranscriptReducer()
+        expect(
+            modernWakeReducer.ingest(
+                text: "이름을 제거했구나",
+                start: 0,
+                end: 1,
+                phrases: configuredAriaPhrases
+            ) == nil,
+            "unrelated SpeechAnalyzer results must not become wake prefixes"
+        )
+        expect(
+            modernWakeReducer.ingest(
+                text: "아리아야",
+                start: 10,
+                end: 10.5,
+                phrases: configuredAriaPhrases
+            )?.transcript == "아리아야",
+            "a later current result should arm a configured custom wake phrase"
+        )
+        expect(
+            modernWakeReducer.ingest(
+                text: "아리아야 오늘",
+                start: 10,
+                end: 10.8,
+                phrases: configuredAriaPhrases
+            )?.transcript == "아리아야 오늘",
+            "an overlapping volatile revision should replace the wake result"
+        )
+        let splitCommand = modernWakeReducer.ingest(
+            text: "날씨 알려줘",
+            start: 10.8,
+            end: 11.5,
+            phrases: configuredAriaPhrases
+        )
+        expect(
+            splitCommand?.transcript == "아리아야 오늘 날씨 알려줘"
+                && WakePhrasePolicy.match(
+                    splitCommand?.transcript ?? "",
+                    phrases: configuredAriaPhrases
+                ) == WakePhraseMatch(command: "오늘 날씨 알려줘"),
+            "subsequent result ranges should extend only the wake-anchored command"
+        )
+        expect(
+            modernWakeReducer.ingest(
+                text: "이름을 잘못 들었어",
+                start: 10,
+                end: 10.8,
+                phrases: configuredAriaPhrases
+            ) == nil,
+            "a volatile revision that retracts the wake phrase must clear the candidate"
+        )
+        expect(
+            modernWakeReducer.ingest(
+                text: "오늘 Aria 일정",
+                start: 20,
+                end: 21,
+                phrases: configuredAriaPhrases
+            ) == nil,
+            "a configured wake phrase inside unrelated speech must stay rejected"
         )
         let wakeOnlyMatch = WakePhraseMatch(command: "")
         let wakeCommandMatch = WakePhraseMatch(command: "들리니?")

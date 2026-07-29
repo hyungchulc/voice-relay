@@ -62,6 +62,7 @@ if ! /usr/bin/diff \
   -x .DS_Store \
   -x build \
   -x releases \
+  -x appcast.xml \
   -x experimental-build \
   "$ROOT" \
   "$SOURCE_ROOT" >/dev/null; then
@@ -82,19 +83,12 @@ SOURCE_ARCHIVE_SHA256="$(
 
 VOICE_RELAY_ARCHS="arm64 x86_64" \
   VOICE_RELAY_OUT="$STAGE_DIR/build" \
+  VOICE_RELAY_SIGNING_IDENTITY="$SIGNING_IDENTITY" \
   "$ROOT/build.sh" >/dev/null
 
 APP="$STAGE_DIR/build/Voice Relay.app"
 BINARY="$APP/Contents/MacOS/VoiceRelay"
 /usr/bin/lipo "$BINARY" -verify_arch arm64 x86_64
-/usr/bin/codesign \
-  --force \
-  --deep \
-  --options runtime \
-  --timestamp=none \
-  --entitlements "$ROOT/Resources/VoiceRelay.entitlements" \
-  --sign "$SIGNING_IDENTITY" \
-  "$APP"
 if [[ "$SIGNING_IDENTITY" == "Developer ID Application:"* ]]; then
   SIGNING_KIND="developer-id-signed-unnotarized"
   SIGNING_NOTE="This alpha is Developer ID signed but is not notarized."
@@ -156,10 +150,15 @@ fi
 BASE_NAME="Voice-Relay-${RELEASE_LABEL}-${SIGNING_KIND}"
 DMG="$RELEASE_DIR/${BASE_NAME}.dmg"
 CHECKSUM="$DMG.sha256"
+UPDATE_ARCHIVE="$RELEASE_DIR/Voice-Relay-${RELEASE_LABEL}-update.zip"
+UPDATE_CHECKSUM="$UPDATE_ARCHIVE.sha256"
+APPCAST="$RELEASE_DIR/Voice-Relay-${RELEASE_LABEL}-appcast.xml"
 DIST_DIR="$STAGE_DIR/Voice Relay"
 
 mkdir -p "$RELEASE_DIR"
-if [[ -e "$DMG" || -e "$CHECKSUM" ]]; then
+if [[ -e "$DMG" || -e "$CHECKSUM" \
+      || -e "$UPDATE_ARCHIVE" || -e "$UPDATE_CHECKSUM" \
+      || -e "$APPCAST" ]]; then
   echo "Release artifact already exists: $DMG" >&2
   exit 3
 fi
@@ -227,13 +226,75 @@ test -f "$MOUNT_DIR/ASSETS.md"
 /usr/bin/hdiutil detach "$MOUNT_DIR" -quiet
 MOUNT_DIR=""
 
+/usr/bin/ditto \
+  -c \
+  -k \
+  --sequesterRsrc \
+  --keepParent \
+  "$APP" \
+  "$UPDATE_ARCHIVE"
+UPDATE_VERIFY_DIR="$STAGE_DIR/update-verify"
+mkdir -p "$UPDATE_VERIFY_DIR"
+/usr/bin/ditto \
+  -x \
+  -k \
+  "$UPDATE_ARCHIVE" \
+  "$UPDATE_VERIFY_DIR"
+test -d "$UPDATE_VERIFY_DIR/Voice Relay.app"
+/usr/bin/codesign \
+  --verify \
+  --deep \
+  --strict \
+  --verbose=2 \
+  "$UPDATE_VERIFY_DIR/Voice Relay.app"
+/usr/bin/lipo \
+  "$UPDATE_VERIFY_DIR/Voice Relay.app/Contents/MacOS/VoiceRelay" \
+  -verify_arch arm64 x86_64
+
+SPARKLE_ROOT="$("$ROOT/fetch-sparkle.sh")"
+APPCAST_DIR="$STAGE_DIR/appcast"
+mkdir -p "$APPCAST_DIR"
+/usr/bin/ditto "$UPDATE_ARCHIVE" \
+  "$APPCAST_DIR/$(basename "$UPDATE_ARCHIVE")"
+"$SPARKLE_ROOT/bin/generate_appcast" \
+  --account voice-relay \
+  --download-url-prefix \
+  "https://github.com/hyungchulc/voice-relay/releases/download/${SOURCE_TAG}/" \
+  --link \
+  "https://github.com/hyungchulc/voice-relay/releases/tag/${SOURCE_TAG}" \
+  --maximum-versions 1 \
+  --maximum-deltas 0 \
+  -o "$APPCAST_DIR/appcast.xml" \
+  "$APPCAST_DIR" >/dev/null
+if [[ ! -s "$APPCAST_DIR/appcast.xml" ]]; then
+  echo "Sparkle did not generate an appcast." >&2
+  exit 3
+fi
+if ! /usr/bin/grep -q 'sparkle:edSignature=' \
+  "$APPCAST_DIR/appcast.xml"; then
+  echo "Sparkle appcast is missing the signed update enclosure." >&2
+  exit 3
+fi
+if ! /usr/bin/grep -q 'sparkle-signatures:' \
+  "$APPCAST_DIR/appcast.xml"; then
+  echo "Sparkle appcast is missing its signed-feed signature." >&2
+  exit 3
+fi
+/usr/bin/ditto "$APPCAST_DIR/appcast.xml" "$APPCAST"
+
 (
   cd "$RELEASE_DIR"
   /usr/bin/shasum -a 256 "$(basename "$DMG")" > "$(basename "$CHECKSUM")"
+  /usr/bin/shasum -a 256 "$(basename "$UPDATE_ARCHIVE")" \
+    > "$(basename "$UPDATE_CHECKSUM")"
 )
-if /usr/bin/grep -q '/' "$CHECKSUM"; then
+if /usr/bin/grep -q '/' "$CHECKSUM" \
+  || /usr/bin/grep -q '/' "$UPDATE_CHECKSUM"; then
   echo "Checksum must contain only the release filename." >&2
   exit 3
 fi
 echo "$DMG"
 echo "$CHECKSUM"
+echo "$UPDATE_ARCHIVE"
+echo "$UPDATE_CHECKSUM"
+echo "$APPCAST"

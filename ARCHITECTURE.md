@@ -213,8 +213,12 @@ Codex task. Quit terminates the app through AppKit.
 
 The Advanced pane also contains About Voice Relay. Release builds embed the
 exact GitHub prerelease tag, numeric bundle version, build number, and channel.
-The manual checker reads the public release list and opens only the validated
-repository release page; it does not self-replace an unnotarized alpha.
+The explicit update action is backed by pinned Sparkle 2. Its stable signed
+appcast points to prerelease update archives, and its embedded EdDSA public key
+authenticates both the feed and enclosure before extraction. Sparkle owns
+download, replacement, authorization, and relaunch. Background checks and
+silent automatic installation are disabled. The first updater-enabled alpha is
+a one-time manual bootstrap installation.
 
 ## Distribution boundary
 
