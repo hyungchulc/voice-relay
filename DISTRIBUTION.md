@@ -54,21 +54,25 @@ and testing, but is not notarized.
 
 ## GitHub release policy
 
-- Every alpha, beta, and release candidate is a GitHub prerelease.
-- No prerelease may carry the GitHub `Latest` marker.
+- Every alpha, beta, release candidate, and approved stable build is published
+  as an ordinary GitHub release.
+- The publisher passes neither `--prerelease` nor a `--latest` option. GitHub
+  chooses the `Latest` marker automatically from its normal release policy.
 - Stable publication is locked until the user explicitly approves `v1.0.0`.
 - `publish-github-release.sh` enforces this policy and rejects other stable
   tags instead of guessing release intent.
-- Public prereleases carry a manual-install DMG, a Sparkle update ZIP, their
-  checksums, and a versioned signed appcast.
+- Public preview-channel releases carry a manual-install DMG, a Sparkle update
+  ZIP, their checksums, and a versioned signed appcast.
 - Sparkle 2.9.4 is checksum-pinned at build time. Its framework and nested
   services are signed leaf-first; application signing never uses `--deep`.
 - `publish-sparkle-feed.sh` publishes the verified versioned appcast to the
-  stable public `appcast.xml` URL only after the matching prerelease archive is
-  visible.
+  stable public `appcast.xml` URL only after the matching ordinary GitHub
+  release and archive are visible.
 - The first Sparkle-enabled alpha still requires one manual installation.
-  Later prereleases can be downloaded, verified, installed, and relaunched
-  from About Voice Relay.
+  Later preview-channel builds can be downloaded, verified, installed, and
+  relaunched from About Voice Relay.
+- The internal `VoiceRelayDistributionChannel=prerelease` value and signed
+  Sparkle preview feed remain separate from GitHub release metadata.
 - Each release must use an existing verified tag, non-empty release notes, and
   the matching package assets.
 
@@ -77,9 +81,12 @@ Example:
 ```bash
 VOICE_RELAY_RELEASE_NOTES_FILE="./release-notes.md" \
 ./publish-github-release.sh \
-  v0.4.0-alpha.8 \
-  releases/Voice-Relay-0.4.0-alpha.8-development-signed.dmg \
-  releases/Voice-Relay-0.4.0-alpha.8-development-signed.dmg.sha256
+  v0.4.0-alpha.12 \
+  releases/Voice-Relay-0.4.0-alpha.12-development-signed.dmg \
+  releases/Voice-Relay-0.4.0-alpha.12-development-signed.dmg.sha256 \
+  releases/Voice-Relay-0.4.0-alpha.12-update.zip \
+  releases/Voice-Relay-0.4.0-alpha.12-update.zip.sha256 \
+  releases/Voice-Relay-0.4.0-alpha.12-appcast.xml
 ```
 
 After explicit approval of the first stable release, set

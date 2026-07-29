@@ -58,7 +58,7 @@ done
 
 RELEASE_KIND=""
 if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta|rc)(\.[0-9]+)?$ ]]; then
-  RELEASE_KIND="prerelease"
+  RELEASE_KIND="preview"
 elif [[ "$TAG" == "v1.0.0" ]]; then
   if [[ "$STABLE_APPROVED" != "true" ]]; then
     echo "v1.0.0 requires explicit user approval through VOICE_RELAY_STABLE_RELEASE_APPROVED=true." >&2
@@ -70,9 +70,9 @@ else
   exit 2
 fi
 
-if [[ "$RELEASE_KIND" == "prerelease" ]]; then
+if [[ "$RELEASE_KIND" == "preview" ]]; then
   if [[ "$#" -ne 5 ]]; then
-    echo "Prereleases require DMG, Sparkle update ZIP, checksums, and appcast." >&2
+    echo "Preview-channel releases require DMG, Sparkle update ZIP, checksums, and appcast." >&2
     exit 2
   fi
   RELEASE_LABEL="${TAG#v}"
@@ -105,7 +105,7 @@ if [[ "$RELEASE_KIND" == "prerelease" ]]; then
         || -z "$APPCAST_ASSET" \
         || "$DMG_CHECKSUM_ASSET" != "${DMG_ASSET}.sha256" \
         || "$UPDATE_CHECKSUM_ASSET" != "${UPDATE_ASSET}.sha256" ]]; then
-    echo "Prerelease DMG and updater asset names must match the tag." >&2
+    echo "Preview-channel DMG and updater asset names must match the tag." >&2
     exit 2
   fi
   EXPECTED_DMG_CHECKSUM="$(
@@ -122,11 +122,11 @@ if [[ "$RELEASE_KIND" == "prerelease" ]]; then
   )"
   if [[ "$EXPECTED_DMG_CHECKSUM" != "$RECORDED_DMG_CHECKSUM" \
         || "$EXPECTED_UPDATE_CHECKSUM" != "$RECORDED_UPDATE_CHECKSUM" ]]; then
-    echo "Prerelease checksums do not match the packaged assets." >&2
+    echo "Preview-channel checksums do not match the packaged assets." >&2
     exit 2
   fi
   if ! /usr/bin/grep -q 'sparkle:edSignature=' "$APPCAST_ASSET"; then
-    echo "Prerelease appcast is missing a signed Sparkle enclosure." >&2
+    echo "Preview-channel appcast is missing a signed Sparkle enclosure." >&2
     exit 2
   fi
 fi
@@ -146,16 +146,10 @@ COMMAND=(
   "$REPOSITORY"
 )
 
-if [[ "$RELEASE_KIND" == "prerelease" ]]; then
-  COMMAND+=(--prerelease --latest=false)
-else
-  COMMAND+=(--latest)
-fi
-
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '%q ' "${COMMAND[@]}"
   printf '\n'
-  if [[ "$RELEASE_KIND" == "prerelease" ]]; then
+  if [[ "$RELEASE_KIND" == "preview" ]]; then
     printf '%q ' "$ROOT/publish-sparkle-feed.sh" "$TAG" "$APPCAST_ASSET"
     printf '\n'
   fi
@@ -168,7 +162,7 @@ if "$GH_BIN" release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
 fi
 
 "${COMMAND[@]}"
-if [[ "$RELEASE_KIND" == "prerelease" ]]; then
+if [[ "$RELEASE_KIND" == "preview" ]]; then
   VOICE_RELAY_GH_BIN="$GH_BIN" \
     "$ROOT/publish-sparkle-feed.sh" "$TAG" "$APPCAST_ASSET"
 fi

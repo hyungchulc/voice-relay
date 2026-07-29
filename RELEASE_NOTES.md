@@ -1,8 +1,7 @@
-This prerelease makes the delegated-work handoff sound like progress instead of a generic acknowledgement.
+This alpha validates the signed in-app update path and simplifies GitHub release metadata.
 
-- Handoff speech now conveys that Voice Relay needs a moment because checking has started, instead of merely acknowledging receipt.
-- The route classifier passes only the spoken language's BCP 47 tag to the isolated progress response. There is no language-specific phrase table.
-- Realtime chooses fresh, idiomatic wording in the user's actual language.
-- Handoff speech stays outside the Realtime conversation and never receives the original request, preventing it from inventing an answer.
-- Codex is not mentioned in spoken handoff progress.
-- The wake-anchored SpeechAnalyzer fix and Sparkle updater from alpha.11 remain included.
+- Alpha, beta, and release-candidate builds are published as ordinary GitHub releases.
+- The release publisher leaves GitHub's `Latest` selection automatic instead of forcing or suppressing the marker.
+- Sparkle feed publication requires the matching ordinary GitHub release and signed update archive.
+- The internal preview channel, signed update feed, and explicit `v1.0.0` approval gate remain unchanged.
+- Build 24 provides the next signed update target for installed alpha.12 builds.

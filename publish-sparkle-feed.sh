@@ -20,7 +20,7 @@ EXPECTED_DOWNLOAD_URL="https://github.com/${REPOSITORY}/releases/download/${TAG}
 if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta|rc)(\.[0-9]+)?$ \
       || "$(basename "$APPCAST")" != "$EXPECTED_APPCAST" \
       || ! -s "$APPCAST" ]]; then
-  echo "The Sparkle feed input must match the prerelease tag." >&2
+  echo "The Sparkle feed input must match the preview-channel tag." >&2
   exit 2
 fi
 if ! /usr/bin/grep -Fq "url=\"${EXPECTED_DOWNLOAD_URL}\"" "$APPCAST" \
@@ -33,8 +33,8 @@ RELEASE_STATE="$(
   "$GH_BIN" api "repos/${REPOSITORY}/releases/tags/${TAG}" \
     --jq '[.draft, .prerelease, ([.assets[].name] | index("'"$EXPECTED_ARCHIVE"'") != null)] | @tsv'
 )"
-if [[ "$RELEASE_STATE" != $'false\ttrue\ttrue' ]]; then
-  echo "Publish the matching GitHub prerelease and update archive first." >&2
+if [[ "$RELEASE_STATE" != $'false\tfalse\ttrue' ]]; then
+  echo "Publish the matching ordinary GitHub release and update archive first." >&2
   exit 3
 fi
 

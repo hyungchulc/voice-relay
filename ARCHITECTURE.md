@@ -212,13 +212,15 @@ marker, and local Remote enrollment state. It never deletes the corresponding
 Codex task. Quit terminates the app through AppKit.
 
 The Advanced pane also contains About Voice Relay. Release builds embed the
-exact GitHub prerelease tag, numeric bundle version, build number, and channel.
-The explicit update action is backed by pinned Sparkle 2. Its stable signed
-appcast points to prerelease update archives, and its embedded EdDSA public key
-authenticates both the feed and enclosure before extraction. Sparkle owns
-download, replacement, authorization, and relaunch. Background checks and
-silent automatic installation are disabled. The first updater-enabled alpha is
-a one-time manual bootstrap installation.
+exact public alpha, beta, or release-candidate tag, numeric bundle version,
+build number, and internal preview channel. GitHub records these builds as
+ordinary releases and selects `Latest` automatically. The explicit update
+action is backed by pinned Sparkle 2. Its stable signed appcast points to
+preview-channel update archives, and its embedded EdDSA public key authenticates
+both the feed and enclosure before extraction. Sparkle owns download,
+replacement, authorization, and relaunch. Background checks and silent
+automatic installation are disabled. The first updater-enabled alpha is a
+one-time manual bootstrap installation.
 
 ## Distribution boundary
 

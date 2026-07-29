@@ -52,7 +52,7 @@ printf '%s\n' \
   '  exit 4' \
   'fi' \
   'if [[ "$1" == "api" && "$*" == *"/releases/tags/"* ]]; then' \
-  "  printf 'false\\ttrue\\ttrue\\n'" \
+  "  printf 'false\\tfalse\\ttrue\\n'" \
   '  exit 0' \
   'fi' \
   'if [[ "$1" == "api" && "$*" == *"/contents/appcast.xml?ref=main"* ]]; then' \
@@ -98,12 +98,12 @@ ALPHA_OUTPUT="$(
     "$UPDATE_CHECKSUM_FILE" \
     "$APPCAST_FILE"
 )"
-if [[ "$ALPHA_OUTPUT" != *"--prerelease"* ]]; then
-  echo "FAIL: alpha releases must be published with --prerelease" >&2
+if [[ "$ALPHA_OUTPUT" == *"--prerelease"* ]]; then
+  echo "FAIL: preview-channel releases must be ordinary GitHub releases" >&2
   exit 1
 fi
-if [[ "$ALPHA_OUTPUT" != *"--latest=false"* ]]; then
-  echo "FAIL: alpha releases must explicitly opt out of GitHub latest selection" >&2
+if [[ "$ALPHA_OUTPUT" == *"--latest"* ]]; then
+  echo "FAIL: GitHub must choose Latest automatically for preview-channel releases" >&2
   exit 1
 fi
 
@@ -147,7 +147,7 @@ if \
     "$UPDATE_CHECKSUM_FILE" \
     "$APPCAST_FILE" >/dev/null 2>&1
 then
-  echo "FAIL: prerelease asset names must match the publication tag" >&2
+  echo "FAIL: preview-channel asset names must match the publication tag" >&2
   exit 1
 fi
 
@@ -170,8 +170,8 @@ STABLE_OUTPUT="$(
     v1.0.0 \
     "$ASSET_FILE"
 )"
-if [[ "$STABLE_OUTPUT" != *"--latest"* ]]; then
-  echo "FAIL: an explicitly approved v1.0.0 must be published with --latest" >&2
+if [[ "$STABLE_OUTPUT" == *"--latest"* ]]; then
+  echo "FAIL: GitHub must choose Latest automatically for an approved v1.0.0" >&2
   exit 1
 fi
 if [[ "$STABLE_OUTPUT" == *"--prerelease"* ]]; then
@@ -218,7 +218,7 @@ fi
 if ! /usr/bin/grep -q \
   'publish-sparkle-feed.sh' \
   "$ROOT/publish-github-release.sh"; then
-  echo "FAIL: prerelease publication must publish the stable Sparkle feed" >&2
+  echo "FAIL: preview-channel publication must publish the stable Sparkle feed" >&2
   exit 1
 fi
 if ! /usr/bin/grep -Eq \

@@ -374,9 +374,10 @@ installation instructions, distribution notes, and the exact corresponding
 source URL. Because this path is not notarized, macOS may require
 **System Settings → Privacy & Security → Open Anyway**.
 
-Publish every alpha, beta, and release-candidate tag as a GitHub prerelease.
-Until the user explicitly approves `v1.0.0`, the release helper rejects stable
-tags and never sets the GitHub `Latest` marker:
+Publish every alpha, beta, and release-candidate tag as an ordinary GitHub
+release. The helper passes neither `--prerelease` nor a `--latest` option, so
+GitHub chooses the `Latest` marker automatically. Until the user explicitly
+approves `v1.0.0`, the release helper still rejects stable tags:
 
 ```bash
 VOICE_RELAY_RELEASE_NOTES_FILE="./release-notes.md" \
@@ -389,13 +390,17 @@ VOICE_RELAY_RELEASE_NOTES_FILE="./release-notes.md" \
   releases/Voice-Relay-0.4.0-alpha.12-appcast.xml
 ```
 
-The release helper uploads the prerelease assets and then publishes the signed
-feed to the stable `appcast.xml` URL. If feed publication alone needs retrying,
-run `publish-sparkle-feed.sh` with the tag and versioned appcast.
+The release helper uploads the preview-channel assets as an ordinary GitHub
+release and then publishes the signed feed to the stable `appcast.xml` URL. If
+feed publication alone needs retrying, run `publish-sparkle-feed.sh` with the
+tag and versioned appcast. The internal
+`VoiceRelayDistributionChannel=prerelease` value and Sparkle preview feed are
+separate from GitHub release metadata.
 
 Only after explicit user approval for the first stable release may the same
 helper be invoked with `VOICE_RELAY_STABLE_RELEASE_APPROVED=true` and
-`v1.0.0`. The helper then marks that release as `Latest`.
+`v1.0.0`. GitHub also chooses the `Latest` marker for that ordinary release
+automatically.
 
 For a normal trusted public build, a Developer ID Application certificate is
 required:

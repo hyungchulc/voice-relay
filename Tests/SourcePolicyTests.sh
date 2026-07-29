@@ -3018,10 +3018,14 @@ require_text \
   "$ROOT/package-release.sh" \
   '/usr/bin/lipo "$BINARY" -verify_arch arm64 x86_64' \
   "release packaging must verify both architectures"
-require_text \
+reject_text \
   "$ROOT/publish-github-release.sh" \
-  'COMMAND+=(--prerelease --latest=false)' \
-  "alpha release publishing must be prerelease and explicitly non-latest"
+  '--prerelease' \
+  "preview-channel publishing must create an ordinary GitHub release"
+reject_text \
+  "$ROOT/publish-github-release.sh" \
+  '--latest' \
+  "release publishing must leave GitHub Latest selection automatic"
 require_text \
   "$ROOT/publish-github-release.sh" \
   "'^#{1,6}[[:space:]]'" \
@@ -3040,8 +3044,12 @@ require_text \
   "the first stable release gate must be limited to v1.0.0"
 reject_text \
   "$ROOT/publish-github-release.sh" \
-  'make_latest=legacy' \
-  "release publishing must not delegate latest selection to GitHub heuristics"
+  'make_latest=' \
+  "release publishing must not override GitHub automatic Latest selection"
+require_text \
+  "$ROOT/publish-sparkle-feed.sh" \
+  "\$'false\\tfalse\\ttrue'" \
+  "Sparkle feed publication must require an ordinary GitHub release"
 
 "$ROOT/Tests/ReleasePolicyTests.sh"
 
