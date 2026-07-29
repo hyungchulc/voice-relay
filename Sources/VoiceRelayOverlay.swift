@@ -2517,7 +2517,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             guard let text = event["text"] as? String else { return }
             realtimeUserDraft = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !realtimeUserDraft.isEmpty else { return }
-            userActivityGeneration = generation
+            beginExternalAudioUserTurn(generation: generation)
             if resolvedAnchor == .notch {
                 isReplyPreviewVisible = true
                 showConversationHistory(
@@ -2528,7 +2528,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             guard let text = event["text"] as? String else { return }
             SettingsStore.shared.completedFirstVoiceGreeting = true
             scheduleVoiceIdleTimeout()
-            userActivityGeneration = generation
+            beginExternalAudioUserTurn(generation: generation)
             realtimeUserDraft = ""
             appendConversation(.user, text: text)
             if resolvedAnchor == .notch {
@@ -2883,14 +2883,34 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             finalPlaybackDrained: finalPlaybackDrainedGeneration == generation,
             userActivityObserved: userActivityGeneration == generation,
             assistantFinalObserved: assistantFinalGeneration == generation,
+            backendWorkActive: activeCodexGeneration == generation,
             phase: voiceState.phase
         ) else {
             return
         }
         requestVoiceSessionStop(
             generation: generation,
-            reason: "external_audio_yield"
+            reason: "external_audio_yield",
+            interruptsCodex: false
         )
+    }
+
+    private func beginExternalAudioUserTurn(generation: Int) {
+        let beginsNewTurn = ExternalMediaTurnBoundaryPolicy.beginsNewUserTurn(
+            userActivityObserved: userActivityGeneration == generation,
+            assistantFinalObserved: assistantFinalGeneration == generation,
+            finalPlaybackDrained: finalPlaybackDrainedGeneration == generation,
+            mediaConfirmed: mediaDetectedGeneration == generation,
+            assistantOutputActive: assistantOutputLifecycle.isActive
+        )
+        userActivityGeneration = generation
+        guard beginsNewTurn else { return }
+        assistantOutputLifecycle.cancelAll(generation: generation)
+        externalAudioConfirmation.reset()
+        mediaDetectedGeneration = nil
+        assistantFinalGeneration = nil
+        finalPlaybackDrainedGeneration = nil
+        scheduleExternalAudioCheck(generation: generation)
     }
 
     private func resetExternalAudioMonitoring() {
@@ -2905,7 +2925,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
     private func requestVoiceSessionStop(
         generation: Int,
-        reason: String = "user_request"
+        reason: String = "user_request",
+        interruptsCodex: Bool = true
     ) {
         guard voiceState.generation == generation,
               voiceState.phase.isSessionActive else {
@@ -2916,7 +2937,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         mediaDetectionWorkItem?.cancel()
         mediaDetectionWorkItem = nil
         assistantOutputLifecycle.cancelAll(generation: generation)
-        if activeCodexGeneration == generation {
+        if interruptsCodex, activeCodexGeneration == generation {
             cancelActiveCodexRequest(
                 generation: generation,
                 reason: reason
@@ -2925,7 +2946,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         VoiceRelayDiagnostics.flow(
             "voice_session_stop_requested",
             generation: generation,
-            fields: ["reason": reason]
+            fields: [
+                "interruptsCodex": interruptsCodex ? "true" : "false",
+                "reason": reason,
+            ]
         )
         voiceState.requestStop()
         updateVoiceSurface()

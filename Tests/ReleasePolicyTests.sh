@@ -20,7 +20,7 @@ ALPHA_OUTPUT="$(
   VOICE_RELAY_RELEASE_DRY_RUN=1 \
   VOICE_RELAY_RELEASE_NOTES_FILE="$NOTES_FILE" \
   "$ROOT/publish-github-release.sh" \
-    v0.4.0-alpha.8 \
+    v0.4.0-alpha.9 \
     "$ASSET_FILE"
 )"
 if [[ "$ALPHA_OUTPUT" != *"--prerelease"* ]]; then
@@ -57,6 +57,25 @@ if [[ "$STABLE_OUTPUT" != *"--latest"* ]]; then
 fi
 if [[ "$STABLE_OUTPUT" == *"--prerelease"* ]]; then
   echo "FAIL: an explicitly approved v1.0.0 must not be a prerelease" >&2
+  exit 1
+fi
+
+if ! /usr/bin/grep -q \
+  'The maintained Voice Relay source differs from the public source archive' \
+  "$ROOT/package-alpha-dmg.sh"; then
+  echo "FAIL: alpha packaging must reject source that differs from the public tag" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -q \
+  'Release label must match the exact public source tag' \
+  "$ROOT/package-alpha-dmg.sh"; then
+  echo "FAIL: alpha packaging must bind the release label to the public tag" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -q \
+  'Source archive SHA-256' \
+  "$ROOT/package-alpha-dmg.sh"; then
+  echo "FAIL: alpha packaging must record the public source archive digest" >&2
   exit 1
 fi
 

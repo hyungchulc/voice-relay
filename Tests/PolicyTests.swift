@@ -1401,9 +1401,15 @@ struct PolicyTests {
             !audioConfirmation.observe(browserAudio),
             "one external output sample must not stop Voice"
         )
+        for sample in 2..<ExternalAudioOutputConfirmation.sustainedSampleRequirement {
+            expect(
+                !audioConfirmation.observe(browserAudio),
+                "\(sample) short external output samples must not confirm media"
+            )
+        }
         expect(
             audioConfirmation.observe(browserAudio),
-            "two sustained samples from the same output process must confirm media"
+            "sustained samples from the same output process must confirm media"
         )
         audioConfirmation.reset()
         expect(
@@ -1428,6 +1434,7 @@ struct PolicyTests {
                 finalPlaybackDrained: true,
                 userActivityObserved: false,
                 assistantFinalObserved: true,
+                backendWorkActive: false,
                 phase: .listening
             ),
             "ordinary wake sessions must stay open without confirmed media"
@@ -1438,6 +1445,7 @@ struct PolicyTests {
                 finalPlaybackDrained: true,
                 userActivityObserved: true,
                 assistantFinalObserved: true,
+                backendWorkActive: false,
                 phase: .speaking
             ),
             "confirmed media should yield after final playback drains"
@@ -1448,6 +1456,7 @@ struct PolicyTests {
                 finalPlaybackDrained: false,
                 userActivityObserved: false,
                 assistantFinalObserved: false,
+                backendWorkActive: false,
                 phase: .listening
             ),
             "confirmed media should release an otherwise idle microphone"
@@ -1458,9 +1467,41 @@ struct PolicyTests {
                 finalPlaybackDrained: false,
                 userActivityObserved: true,
                 assistantFinalObserved: false,
+                backendWorkActive: false,
                 phase: .listening
             ),
             "media detection must not interrupt an active user turn"
+        )
+        expect(
+            !ExternalMediaVoiceYieldPolicy.shouldStop(
+                mediaConfirmed: true,
+                finalPlaybackDrained: true,
+                userActivityObserved: true,
+                assistantFinalObserved: true,
+                backendWorkActive: true,
+                phase: .speaking
+            ),
+            "external audio must never interrupt active backend work"
+        )
+        expect(
+            ExternalMediaTurnBoundaryPolicy.beginsNewUserTurn(
+                userActivityObserved: true,
+                assistantFinalObserved: true,
+                finalPlaybackDrained: true,
+                mediaConfirmed: false,
+                assistantOutputActive: false
+            ),
+            "a user turn after completed wake playback must start a fresh media boundary"
+        )
+        expect(
+            !ExternalMediaTurnBoundaryPolicy.beginsNewUserTurn(
+                userActivityObserved: true,
+                assistantFinalObserved: false,
+                finalPlaybackDrained: false,
+                mediaConfirmed: false,
+                assistantOutputActive: false
+            ),
+            "partial transcripts from the same active turn must share one media boundary"
         )
 
         expect(

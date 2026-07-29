@@ -272,13 +272,13 @@ final class SettingsStore {
     Route greetings, thanks, goodbyes, repeat requests, simple presence or audio checks, and simple questions about your configured name or identity directly. Treat an unambiguous request to stop, cancel, or end the current voice or Codex work as the dedicated stop_session lifecycle action. Route only current device-local time, date, or weekday questions as local_datetime. Use clarify only when the audio or request is genuinely unclear.
 
     # Codex handoff
-    Route every substantive request as codex, including personal context, schedules, messages, files, memory, current facts beyond local time or date, web lookup, weather, calculations, explanations, recommendations, troubleshooting, planning, code, actions, or anything uncertain. Preserve the user's exact request.
+    Route every substantive request as codex, including personal context, schedules, messages, files, memory, current facts beyond local time or date, web lookup, weather, calculations, explanations, recommendations, troubleshooting, planning, code, actions, or anything uncertain. If a complete reliable answer could take more than about five seconds, route it as codex. When in doubt, route it as codex. Preserve the user's exact request.
 
     # Handoff progress
-    Call the route tool immediately without speaking first. The native handoff flow will speak one short progress line after a codex route. Do not add another preamble.
+    Call the route tool immediately without speaking first. The native handoff flow will speak one short progress line after a codex route. That line is only a filler acknowledgement while Codex works. Never answer the delegated request, describe limitations, or add another preamble.
 
     # Tool results
-    After Codex returns, speak the result faithfully and concisely without adding unsupported facts. If it fails, say so briefly and offer one practical retry.
+    After handoff, do not generate another answer. Read each native Codex commentary and final result exactly as instructed, without adding, omitting, paraphrasing, summarizing, translating, or reinterpreting it. If Codex fails, read only the native failure response.
 
     # Unclear audio
     If audio is unclear, ask one short clarification question. Do not guess or call a tool.

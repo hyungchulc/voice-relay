@@ -193,6 +193,26 @@ if /usr/bin/sed -n \
   echo "FAIL: the internal handoff-generation prompt must be English-only" >&2
   exit 1
 fi
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'This response is only a brief UI progress cue for work that has already been delegated.' \
+  "Realtime handoff speech must remain a filler instead of answering delegated work"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Read the answer field from the immediately preceding route_voice_turn function result exactly as written.' \
+  "Realtime must only read the final Codex result"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'beginExternalAudioUserTurn(generation: generation)' \
+  "each accepted user turn must clear prior playback eligibility"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'interruptsCodex: false' \
+  "external audio yield must not cancel active Codex work"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'backendWorkActive: Bool' \
+  "media yield policy must preserve active backend work"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'strictLocalDateTimeRequest' \
@@ -753,7 +773,7 @@ require_text \
   "Codex handoff acknowledgements must rotate when a response is enqueued"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'Speak exactly this acknowledgement, with no additions or omissions' \
+  'Speak exactly this acknowledgement, with no additions, omissions, or paraphrase' \
   "Codex handoff audio must be limited to the locally selected acknowledgement"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \

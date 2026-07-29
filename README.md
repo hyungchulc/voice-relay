@@ -372,9 +372,9 @@ tags and never sets the GitHub `Latest` marker:
 ```bash
 VOICE_RELAY_RELEASE_NOTES_FILE="./release-notes.md" \
 ./publish-github-release.sh \
-  v0.4.0-alpha.8 \
-  releases/Voice-Relay-0.4.0-alpha.8-development-signed.dmg \
-  releases/Voice-Relay-0.4.0-alpha.8-development-signed.dmg.sha256
+  v0.4.0-alpha.9 \
+  releases/Voice-Relay-0.4.0-alpha.9-development-signed.dmg \
+  releases/Voice-Relay-0.4.0-alpha.9-development-signed.dmg.sha256
 ```
 
 Only after explicit user approval for the first stable release may the same

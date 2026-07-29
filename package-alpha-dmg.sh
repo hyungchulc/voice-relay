@@ -40,6 +40,46 @@ cleanup() {
 }
 trap cleanup EXIT
 
+SOURCE_ARCHIVE="$STAGE_DIR/source.tar.gz"
+SOURCE_EXTRACT_DIR="$STAGE_DIR/source"
+/usr/bin/curl \
+  --fail \
+  --silent \
+  --show-error \
+  --location \
+  --output "$SOURCE_ARCHIVE" \
+  "$SOURCE_URL"
+mkdir -p "$SOURCE_EXTRACT_DIR"
+/usr/bin/tar -xzf "$SOURCE_ARCHIVE" -C "$SOURCE_EXTRACT_DIR"
+SOURCE_ROOTS=("$SOURCE_EXTRACT_DIR"/*)
+if [[ "${#SOURCE_ROOTS[@]}" -ne 1 || ! -d "${SOURCE_ROOTS[0]}" ]]; then
+  echo "The corresponding-source archive must contain one project root." >&2
+  exit 2
+fi
+SOURCE_ROOT="${SOURCE_ROOTS[0]}"
+if ! /usr/bin/diff \
+  -qr \
+  -x .DS_Store \
+  -x build \
+  -x releases \
+  -x experimental-build \
+  "$ROOT" \
+  "$SOURCE_ROOT" >/dev/null; then
+  echo "The maintained Voice Relay source differs from the public source archive." >&2
+  /usr/bin/diff \
+    -qr \
+    -x .DS_Store \
+    -x build \
+    -x releases \
+    -x experimental-build \
+    "$ROOT" \
+    "$SOURCE_ROOT" >&2 || true
+  exit 2
+fi
+SOURCE_ARCHIVE_SHA256="$(
+  /usr/bin/shasum -a 256 "$SOURCE_ARCHIVE" | /usr/bin/awk '{print $1}'
+)"
+
 VOICE_RELAY_ARCHS="arm64 x86_64" \
   VOICE_RELAY_OUT="$STAGE_DIR/build" \
   "$ROOT/build.sh" >/dev/null
@@ -75,6 +115,12 @@ VERSION="$(
 if [[ -z "$RELEASE_LABEL" ]]; then
   RELEASE_LABEL="${VERSION}-alpha"
 fi
+SOURCE_TAG="${SOURCE_URL##*/refs/tags/}"
+SOURCE_TAG="${SOURCE_TAG%.tar.gz}"
+if [[ "$SOURCE_TAG" == "$SOURCE_URL" || "$SOURCE_TAG" != "v${RELEASE_LABEL}" ]]; then
+  echo "Release label must match the exact public source tag." >&2
+  exit 2
+fi
 BASE_NAME="Voice-Relay-${RELEASE_LABEL}-${SIGNING_KIND}"
 DMG="$RELEASE_DIR/${BASE_NAME}.dmg"
 CHECKSUM="$DMG.sha256"
@@ -96,6 +142,7 @@ cp "$ROOT/DISTRIBUTION.md" "$DIST_DIR/DISTRIBUTION.md"
 {
   echo "Corresponding source for Voice Relay ${RELEASE_LABEL}:"
   echo "$SOURCE_URL"
+  echo "Source archive SHA-256: $SOURCE_ARCHIVE_SHA256"
 } > "$DIST_DIR/SOURCE.md"
 cat > "$DIST_DIR/INSTALL.md" <<'EOF'
 # Install Voice Relay

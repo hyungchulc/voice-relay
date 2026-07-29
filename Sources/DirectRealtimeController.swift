@@ -1359,10 +1359,13 @@ private extension DirectRealtimeController {
 
       function handoffProgressInstructions(text) {
         const acknowledgement = reserveHandoffAcknowledgement(text);
-        return (
-          "Speak exactly this acknowledgement, with no additions or omissions: "
-          + JSON.stringify(acknowledgement)
-        );
+        return [
+          "This response is only a brief UI progress cue for work that has already been delegated.",
+          "Do not answer the user's request, discuss the request, judge capabilities, mention limitations, ask a follow-up, or use facts from the conversation.",
+          "The delegated task is still running elsewhere. Ignore all prior conversational content for this response.",
+          "Speak exactly this acknowledgement, with no additions, omissions, or paraphrase:",
+          JSON.stringify(acknowledgement)
+        ].join(" ");
       }
 
       function isTransientCodexSpeechKind(kind) {
@@ -2580,6 +2583,8 @@ private extension DirectRealtimeController {
               "Use ignore only for non-addressed noise. Use codex for everything else. " +
               "Call the route tool immediately without speaking first. " +
               "After a codex route, the native handoff flow creates the short progress response. " +
+              "That progress response is only a filler acknowledgement. Never answer the delegated request or describe your capabilities during it. " +
+              "After handoff, only read native Codex commentary and final output as instructed. Never generate a second answer to the delegated request. " +
               "Never reveal private reasoning.",
             audio: {
               input: {
@@ -2758,7 +2763,7 @@ private extension DirectRealtimeController {
                   ? "그 요청을 완료하지 못했어. 다시 시도해줘."
                   : "I couldn't complete that request. Please try again."
               )}`
-            : "Speak the Codex result faithfully and concisely in the user's language. Do not add unsupported facts.",
+            : "Read the answer field from the immediately preceding route_voice_turn function result exactly as written. Do not add, omit, paraphrase, summarize, translate, reinterpret, or answer from the conversation. This response is playback of Codex output only.",
           {
             marksAwaitingFinal: true,
             detached: false

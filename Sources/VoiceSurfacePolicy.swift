@@ -494,12 +494,13 @@ struct ExternalAudioPlaybackSnapshot: Equatable {
 }
 
 struct ExternalAudioOutputConfirmation {
+    static let sustainedSampleRequirement = 6
     private(set) var consecutiveSamples = 0
     private var previous = ExternalAudioPlaybackSnapshot(processLabels: [])
 
     mutating func observe(
         _ snapshot: ExternalAudioPlaybackSnapshot,
-        requiredSamples: Int = 2
+        requiredSamples: Int = Self.sustainedSampleRequirement
     ) -> Bool {
         guard snapshot.isPlaying else {
             reset()
@@ -524,15 +525,32 @@ enum ExternalMediaVoiceYieldPolicy {
         finalPlaybackDrained: Bool,
         userActivityObserved: Bool,
         assistantFinalObserved: Bool,
+        backendWorkActive: Bool,
         phase: VoiceSurfacePhase
     ) -> Bool {
-        guard mediaConfirmed else { return false }
+        guard mediaConfirmed, !backendWorkActive else { return false }
         if finalPlaybackDrained {
             return true
         }
         return !userActivityObserved
             && !assistantFinalObserved
             && phase == .listening
+    }
+}
+
+enum ExternalMediaTurnBoundaryPolicy {
+    static func beginsNewUserTurn(
+        userActivityObserved: Bool,
+        assistantFinalObserved: Bool,
+        finalPlaybackDrained: Bool,
+        mediaConfirmed: Bool,
+        assistantOutputActive: Bool
+    ) -> Bool {
+        !userActivityObserved
+            || assistantFinalObserved
+            || finalPlaybackDrained
+            || mediaConfirmed
+            || assistantOutputActive
     }
 }
 

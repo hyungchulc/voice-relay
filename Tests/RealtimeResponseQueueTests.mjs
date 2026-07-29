@@ -196,8 +196,18 @@ assert.doesNotMatch(
 );
 assert.match(
   progressInstructions,
-  /Speak exactly this acknowledgement, with no additions or omissions/,
+  /Speak exactly this acknowledgement, with no additions, omissions, or paraphrase/,
   "handoff speech must request one exact locally selected acknowledgement",
+);
+assert.match(
+  progressInstructions,
+  /Do not answer the user's request/,
+  "handoff speech must remain a progress cue instead of answering delegated work",
+);
+assert.match(
+  progressInstructions,
+  /Ignore all prior conversational content for this response/,
+  "handoff speech must not infer an answer from the Realtime conversation",
 );
 assert.doesNotMatch(
   progressInstructions,
@@ -360,6 +370,11 @@ assert.equal(responseCreates().length, 5, "final follows all commentary");
 assert.equal(
   responseCreates().at(-1).response.metadata.voice_relay_kind,
   "codex_final"
+);
+assert.match(
+  responseCreates().at(-1).response.instructions,
+  /Read the answer field .* exactly as written/,
+  "final speech must read Codex output instead of generating another answer",
 );
 
 receive({
