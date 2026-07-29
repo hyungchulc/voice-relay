@@ -74,6 +74,13 @@ reserved assets, removed its tap, and stopped its engine. Realtime audio starts
 only after the server session is ready. It uses the current macOS default input
 and output without selecting, pinning, or changing an audio device.
 
+Every wake-capture entry path uses one media-aware admission gate. CoreAudio
+query failures remain unknown rather than becoming false idle, previously
+confirmed external playback stays latched across Realtime teardown, and wake
+capture resumes only after time-separated idle samples. A failed modern
+SpeechAnalyzer also stays behind a process-lifetime circuit breaker while the
+classic on-device recognizer remains available.
+
 Realtime keeps Apple Voice Processing active only for the bounded conversation
 lease. On macOS 14 or newer it enables advanced other-audio ducking at Apple's
 minimum level. The public API minimizes attenuation but cannot guarantee zero
@@ -203,6 +210,11 @@ recognition session instead of silently dropping languages. Reset clears only
 the app's local preferences, task binding, onboarding marker, first-greeting
 marker, and local Remote enrollment state. It never deletes the corresponding
 Codex task. Quit terminates the app through AppKit.
+
+The Advanced pane also contains About Voice Relay. Release builds embed the
+exact GitHub prerelease tag, numeric bundle version, build number, and channel.
+The manual checker reads the public release list and opens only the validated
+repository release page; it does not self-replace an unnotarized alpha.
 
 ## Distribution boundary
 

@@ -878,7 +878,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private lazy var wakePhrase = WakePhraseController(
         localeIdentifiers: [config.speechLocale] + config.additionalSpeechLocales,
         phrases: config.wakePhrases,
-        preferModernSpeechAnalyzer: config.preferModernSpeechAnalyzer
+        preferModernSpeechAnalyzer: config.preferModernSpeechAnalyzer,
+        captureAdmission: { [weak self] reason in
+            self?.wakeCaptureDecision(reason: reason) == .start
+        }
     )
     private let codexClient: CodexAppRemoteClient
     private lazy var realtimeController = DirectRealtimeController(
@@ -939,6 +942,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private var globalEscapeMonitor: Any?
     private var assistantOutputLifecycle = AssistantOutputLifecycle()
     private var externalAudioConfirmation = ExternalAudioOutputConfirmation()
+    private var wakeCaptureAdmission = WakeCaptureAdmission()
     private var mediaDetectedGeneration: Int?
     private var assistantFinalGeneration: Int?
     private var finalPlaybackDrainedGeneration: Int?
@@ -1098,7 +1102,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
               !voiceState.phase.isSessionActive else {
             return
         }
-        wakePhrase.startMonitoring(reason: "app_launch")
+        resumeWakePhraseSoon(reason: "app_launch")
     }
 
     func startWakePhraseAfterSettingsSave() {
@@ -1106,7 +1110,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
               !voiceState.phase.isSessionActive else {
             return
         }
-        resumeWakePhraseSoon()
+        resumeWakePhraseSoon(reason: "settings_save")
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -2456,6 +2460,9 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             guard let self else { return }
             self.showToast(message, color: NSColor.systemOrange, autoHideAfter: 3.0)
         }
+        wakePhrase.onCaptureDeferred = { [weak self] in
+            self?.scheduleWakePhraseResumeCheck()
+        }
     }
 
     private func handleRealtimeVoiceEvent(_ event: [String: Any]) {
@@ -2755,39 +2762,62 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         )
     }
 
-    private func resumeWakePhraseSoon() {
+    private func wakeCaptureDecision(
+        reason: String
+    ) -> WakeCaptureAdmissionDecision {
+        let snapshot = mediaPlaybackDetector.snapshot()
+        let decision = wakeCaptureAdmission.observe(snapshot)
+        VoiceRelayDiagnostics.flow(
+            "wake_capture_admission",
+            generation: voiceState.generation,
+            fields: [
+                "decision": String(describing: decision),
+                "detector_available": snapshot.isAvailable ? "true" : "false",
+                "media_latched":
+                    wakeCaptureAdmission.mediaLatched ? "true" : "false",
+                "process_count": String(snapshot.processLabels.count),
+                "reason": reason,
+                "stable_idle_samples":
+                    String(wakeCaptureAdmission.stableIdleSamples),
+            ]
+        )
+        return decision
+    }
+
+    private func resumeWakePhraseSoon(
+        reason: String = "voice_session_completed",
+        delay: TimeInterval = WakeMonitoringResumePolicy.activationDelay
+    ) {
         guard config.wakePhraseEnabled else { return }
         wakeResumeWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.wakeResumeWorkItem = nil
-            let externalAudioPlaying =
-                self.mediaPlaybackDetector.snapshot().isPlaying
+            let captureDecision = self.wakeCaptureDecision(reason: reason)
+            let captureBlocked = captureDecision != .start
             guard WakeMonitoringResumePolicy.shouldStart(
                 voiceSessionActive: self.voiceState.phase.isSessionActive,
-                externalAudioPlaying: externalAudioPlaying,
+                externalAudioPlaying: captureBlocked,
                 assistantOutputActive: self.assistantOutputLifecycle.isActive
             ) else {
                 self.wakePhrase.pause(
-                    reason: externalAudioPlaying
-                        ? "external_audio_active"
+                    reason: captureBlocked
+                        ? "capture_admission_wait"
                         : "voice_or_assistant_output_active"
                 )
                 if !self.voiceState.phase.isSessionActive,
-                   externalAudioPlaying {
+                   captureBlocked {
                     self.scheduleWakePhraseResumeCheck()
                 }
                 return
             }
             self.wakePhrase.startMonitoring(
-                reason: "voice_session_completed"
+                reason: reason
             )
         }
         wakeResumeWorkItem = workItem
         DispatchQueue.main.asyncAfter(
-            deadline:
-                .now()
-                + WakeMonitoringResumePolicy.activationDelay,
+            deadline: .now() + delay,
             execute: workItem
         )
     }
@@ -2800,7 +2830,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.wakeResumeWorkItem = nil
-            self.resumeWakePhraseSoon()
+            self.resumeWakePhraseSoon(
+                reason: "media_admission_recheck",
+                delay: 0
+            )
         }
         wakeResumeWorkItem = workItem
         DispatchQueue.main.asyncAfter(
@@ -2848,6 +2881,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 return
             }
             let snapshot = self.mediaPlaybackDetector.snapshot()
+            _ = self.wakeCaptureAdmission.observe(snapshot)
             if self.externalAudioConfirmation.observe(snapshot) {
                 self.mediaDetectedGeneration = generation
                 VoiceRelayDiagnostics.flow(
@@ -3501,7 +3535,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private func answerParagraphStyle() -> NSMutableParagraphStyle {
         let style = NSMutableParagraphStyle()
         style.lineSpacing = 2.2
-        style.paragraphSpacing = 7
+        style.paragraphSpacing = 0
         style.lineBreakMode = .byWordWrapping
         return style
     }

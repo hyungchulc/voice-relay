@@ -773,6 +773,14 @@ require_text \
   "Codex handoff acknowledgements must rotate when a response is enqueued"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
+  '...(command.emptyInputContext ? { input: [] } : {})' \
+  "context-free Codex speech must explicitly remove prior Realtime input"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '{ emptyInputContext: true }' \
+  "handoff and exact commentary speech must request an empty inference context"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
   'Speak exactly this acknowledgement, with no additions, omissions, or paraphrase' \
   "Codex handoff audio must be limited to the locally selected acknowledgement"
 reject_text \
@@ -1287,7 +1295,27 @@ require_text \
 require_text \
   "$ROOT/Resources/Info.plist" \
   '<key>VoiceRelayDistributionChannel</key>' \
-  "public builds must declare the alpha distribution channel"
+  "public builds must declare the prerelease distribution channel"
+require_text \
+  "$ROOT/Resources/Info.plist" \
+  '<key>VoiceRelayReleaseTag</key>' \
+  "public builds must embed the exact GitHub release tag"
+require_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  'About Voice Relay' \
+  "Settings must expose the exact installed release in an About section"
+require_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  'Check for Updates' \
+  "About must provide an explicit manual update check"
+require_text \
+  "$ROOT/Sources/VoiceRelayUpdater.swift" \
+  'api.github.com/repos/hyungchulc/voice-relay/releases?per_page=100' \
+  "prerelease updates must use the GitHub release list instead of latest"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'style.paragraphSpacing = 0' \
+  "literal blank lines must not receive compounded paragraph spacing"
 reject_text \
   "$ROOT/launch-voice-relay.sh" \
   'PROCESS_NAME="VoiceRelayOverlay"' \
@@ -2435,6 +2463,30 @@ require_text \
   "the modern analyzer retry must be explicitly bounded"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
+  'wake_backend_circuit_opened' \
+  "a failed SpeechAnalyzer backend must remain disabled for the current app run"
+reject_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'preferLegacyUntilPause' \
+  "SpeechAnalyzer failure state must not reset on every Realtime handoff"
+require_text \
+  "$ROOT/Sources/SystemMediaPlaybackDetector.swift" \
+  'isAvailable: false' \
+  "CoreAudio detector failures must remain unknown instead of becoming false idle"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'wake_capture_admission' \
+  "every wake capture opening must leave a media-aware admission decision"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'captureAdmission("legacy_speech_start")' \
+  "legacy fallback must recheck media admission before opening the microphone"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'captureAdmission("speech_analyzer_start")' \
+  "SpeechAnalyzer must recheck media admission immediately before capture"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
   'pendingWakeWorkItem' \
   "wake recognition must allow partial transcripts to capture the command tail"
 require_text \
@@ -2507,8 +2559,8 @@ require_text \
   "wake monitoring must wait for CoreAudio device handoff before reopening the microphone"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  'mediaPlaybackDetector.snapshot().isPlaying' \
-  "wake monitoring must stay paused while external output is active"
+  'wakeCaptureDecision(reason: reason)' \
+  "wake monitoring must stay paused until media-aware capture admission succeeds"
 require_text \
   "$ROOT/Sources/LaunchAtLoginManager.swift" \
   'SMAppService.mainApp' \

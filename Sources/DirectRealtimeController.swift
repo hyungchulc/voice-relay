@@ -1439,6 +1439,7 @@ private extension DirectRealtimeController {
           event_id: command.eventId,
           response: {
             ...(command.detached ? { conversation: "none" } : {}),
+            ...(command.emptyInputContext ? { input: [] } : {}),
             output_modalities: ["audio"],
             tool_choice: "none",
             metadata: {
@@ -1464,6 +1465,7 @@ private extension DirectRealtimeController {
           instructions: String(instructions || "").trim(),
           marksAwaitingFinal: Boolean(options.marksAwaitingFinal),
           detached: options.detached !== false,
+          emptyInputContext: Boolean(options.emptyInputContext),
           sequence: ++session.codexSpeechSequence,
           eventId: nextClientEventId("codex-speech")
         };
@@ -2218,7 +2220,8 @@ private extension DirectRealtimeController {
             session.codexInFlight = true;
             enqueueCodexSpeech(
               "codex_progress",
-              handoffProgressInstructions(text)
+              handoffProgressInstructions(text),
+              { emptyInputContext: true }
             );
             send({
               type: "codexRequest",
@@ -2793,7 +2796,8 @@ private extension DirectRealtimeController {
         });
         enqueueCodexSpeech(
           "codex_commentary",
-          `Say exactly this and nothing else: ${JSON.stringify(speechText)}`
+          `Say exactly this and nothing else: ${JSON.stringify(speechText)}`,
+          { emptyInputContext: true }
         );
       }
 

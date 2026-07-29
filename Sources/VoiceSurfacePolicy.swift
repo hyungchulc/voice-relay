@@ -483,13 +483,37 @@ struct RealtimeStartupRetryState {
 
 struct ExternalAudioPlaybackSnapshot: Equatable {
     let processLabels: Set<String>
+    let isAvailable: Bool
+
+    init(
+        processLabels: Set<String>,
+        isAvailable: Bool = true
+    ) {
+        self.processLabels = processLabels
+        self.isAvailable = isAvailable
+    }
 
     var isPlaying: Bool {
-        !processLabels.isEmpty
+        isAvailable && !processLabels.isEmpty
     }
 
     func sharesOutputProcess(with other: Self) -> Bool {
         !processLabels.isDisjoint(with: other.processLabels)
+    }
+}
+
+struct WakeAnalyzerCircuitBreaker {
+    private(set) var isOpen = false
+    private(set) var failureStage = ""
+
+    @discardableResult
+    mutating func open(stage: String) -> Bool {
+        let changed = !isOpen
+        isOpen = true
+        if failureStage.isEmpty {
+            failureStage = stage
+        }
+        return changed
     }
 }
 
@@ -502,6 +526,9 @@ struct ExternalAudioOutputConfirmation {
         _ snapshot: ExternalAudioPlaybackSnapshot,
         requiredSamples: Int = Self.sustainedSampleRequirement
     ) -> Bool {
+        guard snapshot.isAvailable else {
+            return false
+        }
         guard snapshot.isPlaying else {
             reset()
             return false
@@ -516,6 +543,57 @@ struct ExternalAudioOutputConfirmation {
     mutating func reset() {
         consecutiveSamples = 0
         previous = ExternalAudioPlaybackSnapshot(processLabels: [])
+    }
+}
+
+enum WakeCaptureAdmissionDecision: Equatable {
+    case start
+    case waitForMedia
+    case waitForDetector
+    case waitForStableIdle
+}
+
+struct WakeCaptureAdmission {
+    static let stableIdleSampleRequirement = 3
+    static let minimumIdleSampleInterval: TimeInterval = 0.25
+    private(set) var mediaLatched = false
+    private(set) var stableIdleSamples = 0
+    private var lastIdleSampleTime: TimeInterval?
+
+    mutating func observe(
+        _ snapshot: ExternalAudioPlaybackSnapshot,
+        requiredIdleSamples: Int = Self.stableIdleSampleRequirement,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> WakeCaptureAdmissionDecision {
+        guard snapshot.isAvailable else {
+            stableIdleSamples = 0
+            lastIdleSampleTime = nil
+            return .waitForDetector
+        }
+        if snapshot.isPlaying {
+            mediaLatched = true
+            stableIdleSamples = 0
+            lastIdleSampleTime = nil
+            return .waitForMedia
+        }
+        guard mediaLatched else {
+            stableIdleSamples = 0
+            lastIdleSampleTime = nil
+            return .start
+        }
+        if lastIdleSampleTime == nil
+            || now - (lastIdleSampleTime ?? now)
+                >= Self.minimumIdleSampleInterval {
+            stableIdleSamples += 1
+            lastIdleSampleTime = now
+        }
+        guard stableIdleSamples >= max(1, requiredIdleSamples) else {
+            return .waitForStableIdle
+        }
+        mediaLatched = false
+        stableIdleSamples = 0
+        lastIdleSampleTime = nil
+        return .start
     }
 }
 

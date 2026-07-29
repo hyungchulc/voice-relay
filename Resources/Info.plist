@@ -21,9 +21,11 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.4.0</string>
 	<key>CFBundleVersion</key>
-	<string>20</string>
+	<string>21</string>
+	<key>VoiceRelayReleaseTag</key>
+	<string>v0.4.0-alpha.10</string>
 	<key>VoiceRelayDistributionChannel</key>
-	<string>alpha</string>
+	<string>prerelease</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>

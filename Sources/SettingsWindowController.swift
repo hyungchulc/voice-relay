@@ -238,6 +238,13 @@ final class SettingsWindowController:
     )
     private let launchAtLoginStatus = NSTextField(labelWithString: "")
     private let launchAtLoginSettingsButton = NSButton()
+    private let aboutVersionStatus = NSTextField(labelWithString: "")
+    private let aboutChannelStatus = NSTextField(labelWithString: "")
+    private let updateStatus = NSTextField(wrappingLabelWithString: "")
+    private let checkForUpdatesButton = NSButton()
+    private let viewUpdateButton = NSButton()
+    private let updateChecker = VoiceRelayUpdateChecker()
+    private var availableUpdateURL: URL?
     private let saveButton = NSButton()
     private let resetButton = NSButton()
     private let quitButton = NSButton()
@@ -311,10 +318,12 @@ final class SettingsWindowController:
 
     func shutdown() {
         stopProbe()
+        updateChecker.cancel()
     }
 
     func shutdownSynchronously() {
         stopProbe()
+        updateChecker.cancel()
     }
 
     private func rebuildModernUI(using nextCopy: AppCopy) {
@@ -695,6 +704,55 @@ final class SettingsWindowController:
         quitButton.target = self
         quitButton.action = #selector(quitApp)
 
+        aboutVersionStatus.font =
+            .monospacedSystemFont(ofSize: 12.5, weight: .medium)
+        aboutChannelStatus.textColor = .secondaryLabelColor
+        updateStatus.textColor = .secondaryLabelColor
+        updateStatus.maximumNumberOfLines = 2
+        checkForUpdatesButton.title = localizedCopy.text(
+            "Check for Updates",
+            "업데이트 확인"
+        )
+        checkForUpdatesButton.bezelStyle = .rounded
+        checkForUpdatesButton.target = self
+        checkForUpdatesButton.action = #selector(checkForUpdates)
+        viewUpdateButton.title = localizedCopy.text(
+            "View Update…",
+            "업데이트 보기…"
+        )
+        viewUpdateButton.bezelStyle = .rounded
+        viewUpdateButton.target = self
+        viewUpdateButton.action = #selector(viewAvailableUpdate)
+        viewUpdateButton.isHidden = true
+
+        let aboutCard = card(
+            icon: "info.circle",
+            title: localizedCopy.text(
+                "About Voice Relay",
+                "Voice Relay 정보"
+            ),
+            subtitle: localizedCopy.text(
+                "See the exact installed release and check GitHub prereleases manually.",
+                "설치된 정확한 릴리스를 확인하고 GitHub prerelease 업데이트를 직접 확인합니다."
+            ),
+            views: [
+                settingsRow(
+                    localizedCopy.text("Version", "버전"),
+                    aboutVersionStatus
+                ),
+                settingsRow(
+                    localizedCopy.text("Channel", "채널"),
+                    aboutChannelStatus
+                ),
+                updateStatus,
+                rowStack([
+                    checkForUpdatesButton,
+                    viewUpdateButton,
+                    NSView(),
+                ]),
+            ]
+        )
+
         let advancedCard = card(
             icon: "gearshape.2",
             title: localizedCopy.text("App Management", "앱 관리"),
@@ -749,10 +807,11 @@ final class SettingsWindowController:
             ]
         )
 
-        let advancedPage = NSStackView(views: [advancedCard])
+        let advancedPage = NSStackView(views: [aboutCard, advancedCard])
         advancedPage.orientation = .vertical
         advancedPage.alignment = .leading
         advancedPage.spacing = 16
+        aboutCard.widthAnchor.constraint(equalTo: advancedPage.widthAnchor).isActive = true
         advancedCard.widthAnchor.constraint(equalTo: advancedPage.widthAnchor).isActive = true
 
         let pages: [(Pane, String, String, NSView)] = [
@@ -1307,6 +1366,7 @@ final class SettingsWindowController:
                 "This dedicated session is connected.",
                 "현재 전용 session에 연결되어 있습니다."
             )
+        refreshAboutStatus()
     }
 
     @objc private func refreshPermissions() {
@@ -1326,6 +1386,84 @@ final class SettingsWindowController:
                 ? (localizedCopy.text("Allowed", "허용됨"), true)
                 : (localizedCopy.text("Not allowed", "허용되지 않음"), false)
         )
+    }
+
+    private func refreshAboutStatus() {
+        let identity = VoiceRelayReleaseIdentity()
+        aboutVersionStatus.stringValue =
+            "\(identity.displayVersion) (Build \(identity.build))"
+        aboutChannelStatus.stringValue =
+            identity.channel == "prerelease"
+                ? localizedCopy.text(
+                    "Public Alpha · Prerelease",
+                    "Public Alpha · Prerelease"
+                )
+                : localizedCopy.text(
+                    "Development build",
+                    "개발 빌드"
+                )
+        availableUpdateURL = nil
+        viewUpdateButton.isHidden = true
+        checkForUpdatesButton.isEnabled = identity.canCheckForUpdates
+        updateStatus.stringValue = identity.canCheckForUpdates
+            ? localizedCopy.text(
+                "Updates are checked only when you choose the button.",
+                "버튼을 눌렀을 때만 업데이트를 확인합니다."
+            )
+            : localizedCopy.text(
+                "Update checking is unavailable because this build has no release tag.",
+                "이 빌드에는 릴리스 태그가 없어 업데이트를 확인할 수 없습니다."
+            )
+    }
+
+    @objc private func checkForUpdates() {
+        let identity = VoiceRelayReleaseIdentity()
+        guard identity.canCheckForUpdates else {
+            refreshAboutStatus()
+            return
+        }
+        updateChecker.cancel()
+        availableUpdateURL = nil
+        viewUpdateButton.isHidden = true
+        checkForUpdatesButton.isEnabled = false
+        updateStatus.stringValue = localizedCopy.text(
+            "Checking GitHub prereleases…",
+            "GitHub prerelease를 확인하는 중…"
+        )
+        updateChecker.check(currentTag: identity.releaseTag) {
+            [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.checkForUpdatesButton.isEnabled = true
+                switch result {
+                case .success(.upToDate):
+                    self.updateStatus.stringValue =
+                        self.localizedCopy.text(
+                            "This is the newest available release.",
+                            "현재 설치된 버전이 최신 릴리스입니다."
+                        )
+                case let .success(.available(candidate)):
+                    self.availableUpdateURL = candidate.pageURL
+                    self.viewUpdateButton.isHidden = false
+                    self.updateStatus.stringValue =
+                        self.localizedCopy.text(
+                            "\(candidate.tag) is available. Open the verified GitHub release to download it.",
+                            "\(candidate.tag) 업데이트가 있습니다. 검증된 GitHub 릴리스를 열어 다운로드할 수 있습니다."
+                        )
+                case .failure:
+                    self.updateStatus.stringValue =
+                        self.localizedCopy.text(
+                            "Update checking failed. Try again later.",
+                            "업데이트 확인에 실패했습니다. 잠시 후 다시 시도해 주세요."
+                        )
+                }
+            }
+        }
+    }
+
+    @objc private func viewAvailableUpdate() {
+        guard let availableUpdateURL else { return }
+        NSWorkspace.shared.open(availableUpdateURL)
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -1813,6 +1951,7 @@ final class SettingsWindowController:
     @objc private func cancel() {
         finishConnectionRecovery()
         stopProbe()
+        updateChecker.cancel()
         displayedAppearanceMode = AppAppearanceMode.parse(
             store.load().appearanceMode
         )
@@ -1823,6 +1962,7 @@ final class SettingsWindowController:
     func windowWillClose(_ notification: Notification) {
         finishConnectionRecovery()
         stopProbe()
+        updateChecker.cancel()
     }
 
     func windowDidBecomeKey(_ notification: Notification) {

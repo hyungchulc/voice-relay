@@ -187,6 +187,16 @@ assert.equal(
   responseCreates().at(-1).response.metadata.voice_relay_kind,
   "codex_progress"
 );
+assert.equal(
+  responseCreates().at(-1).response.conversation,
+  "none",
+  "handoff progress must stay outside the default conversation",
+);
+assert.deepEqual(
+  responseCreates().at(-1).response.input,
+  [],
+  "handoff progress must not read prior Realtime conversation context",
+);
 const progressInstructions =
   responseCreates().at(-1).response.instructions;
 assert.doesNotMatch(
@@ -275,6 +285,16 @@ assert.equal(responseCreates().length, 3, "commentary follows progress");
 assert.equal(
   responseCreates().at(-1).response.metadata.voice_relay_kind,
   "codex_commentary"
+);
+assert.equal(
+  responseCreates().at(-1).response.conversation,
+  "none",
+  "Codex commentary playback must stay outside the default conversation",
+);
+assert.deepEqual(
+  responseCreates().at(-1).response.input,
+  [],
+  "Codex commentary playback must not read prior Realtime conversation context",
 );
 
 receive({
@@ -370,6 +390,11 @@ assert.equal(responseCreates().length, 5, "final follows all commentary");
 assert.equal(
   responseCreates().at(-1).response.metadata.voice_relay_kind,
   "codex_final"
+);
+assert.equal(
+  Object.hasOwn(responseCreates().at(-1).response, "input"),
+  false,
+  "the final playback response must retain the preceding function-result context",
 );
 assert.match(
   responseCreates().at(-1).response.instructions,

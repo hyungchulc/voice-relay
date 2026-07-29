@@ -41,6 +41,41 @@ else
   exit 2
 fi
 
+if [[ "$RELEASE_KIND" == "prerelease" ]]; then
+  if [[ "$#" -ne 2 ]]; then
+    echo "Prereleases require exactly one DMG and its SHA-256 file." >&2
+    exit 2
+  fi
+  RELEASE_LABEL="${TAG#v}"
+  DMG_ASSET=""
+  CHECKSUM_ASSET=""
+  for asset in "$@"; do
+    case "$(basename "$asset")" in
+      Voice-Relay-"$RELEASE_LABEL"-*.dmg)
+        DMG_ASSET="$asset"
+        ;;
+      Voice-Relay-"$RELEASE_LABEL"-*.dmg.sha256)
+        CHECKSUM_ASSET="$asset"
+        ;;
+    esac
+  done
+  if [[ -z "$DMG_ASSET" || -z "$CHECKSUM_ASSET" \
+        || "$CHECKSUM_ASSET" != "${DMG_ASSET}.sha256" ]]; then
+    echo "Prerelease asset names must match the publication tag and each other." >&2
+    exit 2
+  fi
+  EXPECTED_CHECKSUM="$(
+    /usr/bin/shasum -a 256 "$DMG_ASSET" | /usr/bin/awk '{print $1}'
+  )"
+  RECORDED_CHECKSUM="$(
+    /usr/bin/awk 'NR == 1 {print $1}' "$CHECKSUM_ASSET"
+  )"
+  if [[ "$EXPECTED_CHECKSUM" != "$RECORDED_CHECKSUM" ]]; then
+    echo "Prerelease checksum does not match the DMG." >&2
+    exit 2
+  fi
+fi
+
 COMMAND=(
   "$GH_BIN"
   release

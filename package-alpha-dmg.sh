@@ -112,6 +112,21 @@ VERSION="$(
     -c 'Print :CFBundleShortVersionString' \
     "$APP/Contents/Info.plist"
 )"
+BUILD="$(
+  /usr/libexec/PlistBuddy \
+    -c 'Print :CFBundleVersion' \
+    "$APP/Contents/Info.plist"
+)"
+EMBEDDED_RELEASE_TAG="$(
+  /usr/libexec/PlistBuddy \
+    -c 'Print :VoiceRelayReleaseTag' \
+    "$APP/Contents/Info.plist"
+)"
+EMBEDDED_CHANNEL="$(
+  /usr/libexec/PlistBuddy \
+    -c 'Print :VoiceRelayDistributionChannel' \
+    "$APP/Contents/Info.plist"
+)"
 if [[ -z "$RELEASE_LABEL" ]]; then
   RELEASE_LABEL="${VERSION}-alpha"
 fi
@@ -119,6 +134,23 @@ SOURCE_TAG="${SOURCE_URL##*/refs/tags/}"
 SOURCE_TAG="${SOURCE_TAG%.tar.gz}"
 if [[ "$SOURCE_TAG" == "$SOURCE_URL" || "$SOURCE_TAG" != "v${RELEASE_LABEL}" ]]; then
   echo "Release label must match the exact public source tag." >&2
+  exit 2
+fi
+if [[ "$EMBEDDED_RELEASE_TAG" != "$SOURCE_TAG" ]]; then
+  echo "The embedded VoiceRelayReleaseTag must match the exact public source tag." >&2
+  exit 2
+fi
+if [[ "$EMBEDDED_CHANNEL" != "prerelease" ]]; then
+  echo "Alpha packaging requires VoiceRelayDistributionChannel=prerelease." >&2
+  exit 2
+fi
+if [[ ! "$BUILD" =~ ^[0-9]+$ ]]; then
+  echo "CFBundleVersion must be an integer build number." >&2
+  exit 2
+fi
+if [[ "$RELEASE_LABEL" != "${EMBEDDED_RELEASE_TAG#v}" \
+      || "$RELEASE_LABEL" != "${VERSION}-"* ]]; then
+  echo "Embedded version, release tag, and release label do not agree." >&2
   exit 2
 fi
 BASE_NAME="Voice-Relay-${RELEASE_LABEL}-${SIGNING_KIND}"

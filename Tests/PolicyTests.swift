@@ -40,6 +40,61 @@ struct PolicyTests {
     }
 
     static func main() {
+        let alphaNine = VoiceRelaySemanticVersion(tag: "v0.4.0-alpha.9")
+        let alphaTen = VoiceRelaySemanticVersion(tag: "v0.4.0-alpha.10")
+        let releaseCandidate = VoiceRelaySemanticVersion(tag: "v1.0.0-rc.1")
+        let stableOne = VoiceRelaySemanticVersion(tag: "v1.0.0")
+        expect(
+            alphaNine != nil
+                && alphaTen != nil
+                && alphaNine! < alphaTen!
+                && alphaTen! < releaseCandidate!
+                && releaseCandidate! < stableOne!,
+            "update comparison must follow numeric prerelease precedence"
+        )
+        expect(
+            VoiceRelaySemanticVersion(tag: "v0.4-alpha.10") == nil
+                && VoiceRelaySemanticVersion(tag: "v0.4.0-preview.1") == nil,
+            "malformed or unsupported release tags must fail closed"
+        )
+        let updateReleases = [
+            VoiceRelayGitHubRelease(
+                tagName: "v0.4.0-alpha.10",
+                htmlURL:
+                    "https://github.com/hyungchulc/voice-relay/releases/tag/v0.4.0-alpha.10",
+                draft: false,
+                prerelease: true
+            ),
+            VoiceRelayGitHubRelease(
+                tagName: "v0.4.0-alpha.11",
+                htmlURL:
+                    "https://github.example.com/hyungchulc/voice-relay/releases/tag/v0.4.0-alpha.11",
+                draft: false,
+                prerelease: true
+            ),
+            VoiceRelayGitHubRelease(
+                tagName: "v1.0.0",
+                htmlURL:
+                    "https://github.com/hyungchulc/voice-relay/releases/tag/v1.0.0",
+                draft: true,
+                prerelease: false
+            ),
+        ]
+        expect(
+            VoiceRelayUpdatePolicy.selectCandidate(
+                currentTag: "v0.4.0-alpha.9",
+                releases: updateReleases
+            )?.tag == "v0.4.0-alpha.10",
+            "the updater must select the newest valid non-draft trusted release"
+        )
+        expect(
+            VoiceRelayUpdatePolicy.validatedReleasePageURL(
+                "https://github.com/hyungchulc/voice-relay/releases/tag/v0.4.0-alpha.10%2Fevil",
+                tag: "v0.4.0-alpha.10"
+            ) == nil,
+            "encoded path separators must not escape the trusted release path"
+        )
+
         let hiddenTranscriptLog = VoiceRelayDiagnostics.rendered(
             "diagnostic_test",
             generation: 7,
@@ -1371,6 +1426,37 @@ struct PolicyTests {
             WakeMonitoringResumePolicy.activationDelay >= 1.5,
             "wake monitoring must wait for the Realtime aggregate audio device to settle"
         )
+        var wakeAdmission = WakeCaptureAdmission()
+        let playingSnapshot = ExternalAudioPlaybackSnapshot(
+            processLabels: ["com.apple.Safari"]
+        )
+        let idleSnapshot = ExternalAudioPlaybackSnapshot(processLabels: [])
+        let unavailableSnapshot = ExternalAudioPlaybackSnapshot(
+            processLabels: [],
+            isAvailable: false
+        )
+        expect(
+            wakeAdmission.observe(playingSnapshot, now: 1.0) == .waitForMedia,
+            "external playback must latch wake capture closed"
+        )
+        expect(
+            wakeAdmission.observe(unavailableSnapshot, now: 2.0)
+                == .waitForDetector,
+            "a CoreAudio query failure must never be treated as idle"
+        )
+        expect(
+            wakeAdmission.observe(idleSnapshot, now: 3.0)
+                == .waitForStableIdle
+                && wakeAdmission.observe(idleSnapshot, now: 3.1)
+                    == .waitForStableIdle,
+            "duplicate idle checks inside one transition must not clear the media latch"
+        )
+        expect(
+            wakeAdmission.observe(idleSnapshot, now: 3.3)
+                == .waitForStableIdle
+                && wakeAdmission.observe(idleSnapshot, now: 3.6) == .start,
+            "wake capture must reopen only after stable, time-separated idle samples"
+        )
         expect(
             WakeAnalyzerRetryPolicy.shouldRetry(
                 stage: .audioEngineStart,
@@ -1391,6 +1477,23 @@ struct PolicyTests {
                 priorAttempts: 0
             ),
             "non-device analyzer failures should fall back without a blind retry"
+        )
+
+        var analyzerCircuit = WakeAnalyzerCircuitBreaker()
+        expect(
+            !analyzerCircuit.isOpen && analyzerCircuit.failureStage.isEmpty,
+            "the modern wake analyzer circuit must begin closed"
+        )
+        expect(
+            analyzerCircuit.open(stage: "runtime")
+                && analyzerCircuit.isOpen
+                && analyzerCircuit.failureStage == "runtime",
+            "a SpeechAnalyzer runtime failure must open the process-lifetime circuit"
+        )
+        expect(
+            !analyzerCircuit.open(stage: "startup")
+                && analyzerCircuit.failureStage == "runtime",
+            "the first SpeechAnalyzer failure stage must remain stable after the circuit opens"
         )
 
         var audioConfirmation = ExternalAudioOutputConfirmation()

@@ -171,7 +171,9 @@ Local wake-phrase recognition is a first-class native feature. On macOS 26 or
 newer, Voice Relay can use Apple's latest SpeechAnalyzer with short-form and
 far-field content hints, per-language asset checks, contextual wake phrases,
 one bounded retry while the audio device is switching, and automatic fallback
-to the classic on-device recognizer. SpeechAnalyzer is used only for local wake
+to the classic on-device recognizer. A runtime or startup failure opens a
+process-lifetime circuit breaker, so Voice Relay does not repeatedly reopen a
+failed SpeechAnalyzer after each Realtime handoff. SpeechAnalyzer is used only for local wake
 phrases; the main conversation still uses the selected Realtime voice and the
 paired Codex task.
 
@@ -187,6 +189,11 @@ falls back to the classic on-device recognizer. System, Light, and Dark
 appearance previews refresh every Settings surface immediately, while Cancel
 restores the persisted appearance. The native toolbar keeps General, Voice,
 Connection, Permissions, and Advanced separate.
+
+Advanced includes an About Voice Relay section with the exact embedded release
+tag and build number. Its manual update check reads the public GitHub release
+list, includes prereleases, and opens only a validated release page. It never
+silently replaces or launches downloaded code.
 
 General settings also exposes `Open Voice Relay at login`. It uses the native
 macOS Login Items service and reflects the current system registration or
@@ -372,9 +379,9 @@ tags and never sets the GitHub `Latest` marker:
 ```bash
 VOICE_RELAY_RELEASE_NOTES_FILE="./release-notes.md" \
 ./publish-github-release.sh \
-  v0.4.0-alpha.9 \
-  releases/Voice-Relay-0.4.0-alpha.9-development-signed.dmg \
-  releases/Voice-Relay-0.4.0-alpha.9-development-signed.dmg.sha256
+  v0.4.0-alpha.10 \
+  releases/Voice-Relay-0.4.0-alpha.10-development-signed.dmg \
+  releases/Voice-Relay-0.4.0-alpha.10-development-signed.dmg.sha256
 ```
 
 Only after explicit user approval for the first stable release may the same

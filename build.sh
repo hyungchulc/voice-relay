@@ -40,6 +40,7 @@ SOURCES=(
   "$ROOT/Sources/OnboardingWindowController.swift"
   "$ROOT/Sources/PresenceMonitor.swift"
   "$ROOT/Sources/SettingsStore.swift"
+  "$ROOT/Sources/VoiceRelayUpdater.swift"
   "$ROOT/Sources/SettingsWindowController.swift"
   "$ROOT/Sources/SystemMediaPlaybackDetector.swift"
   "$ROOT/Sources/VoiceSurfacePolicy.swift"
@@ -88,6 +89,7 @@ xcrun swiftc \
   "$ROOT/Sources/OverlayPlacement.swift" \
   "$ROOT/Sources/PresenceMonitor.swift" \
   "$ROOT/Sources/SettingsStore.swift" \
+  "$ROOT/Sources/VoiceRelayUpdater.swift" \
   "$ROOT/Sources/VoiceSurfacePolicy.swift" \
   "$ROOT/Sources/RealtimeAudioAdmissionPolicy.swift" \
   "$ROOT/Sources/RealtimeEchoAdmissionPolicy.swift" \

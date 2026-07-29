@@ -4,8 +4,14 @@ import Foundation
 
 final class SystemMediaPlaybackDetector {
     func snapshot() -> ExternalAudioPlaybackSnapshot {
-        ExternalAudioPlaybackSnapshot(
-            processLabels: Set(runningOutputAudioProcesses() ?? [])
+        guard let processes = runningOutputAudioProcesses() else {
+            return ExternalAudioPlaybackSnapshot(
+                processLabels: [],
+                isAvailable: false
+            )
+        }
+        return ExternalAudioPlaybackSnapshot(
+            processLabels: Set(processes)
         )
     }
 
