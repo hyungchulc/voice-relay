@@ -1,6 +1,12 @@
 import Cocoa
 import Foundation
 
+private final class EphemeralPolicyUserDefaults: UserDefaults {
+    override func synchronize() -> Bool {
+        true
+    }
+}
+
 private final class FakeLaunchAtLoginService: LaunchAtLoginServicing {
     var status: LaunchAtLoginStatus
     var registerError: Error?
@@ -2755,7 +2761,8 @@ struct PolicyTests {
         )
 
         let defaultsSuite = "VoiceRelay.PolicyTests.\(UUID().uuidString)"
-        let isolatedDefaults = UserDefaults(suiteName: defaultsSuite)!
+        let isolatedDefaults =
+            EphemeralPolicyUserDefaults(suiteName: defaultsSuite)!
         isolatedDefaults.removePersistentDomain(forName: defaultsSuite)
         defer { isolatedDefaults.removePersistentDomain(forName: defaultsSuite) }
         let isolatedStore = SettingsStore(
@@ -2881,6 +2888,24 @@ struct PolicyTests {
             "the public default Realtime prompt must remain English-only"
         )
         expect(
+            SettingsStore.realtimeInstructionsFingerprint(
+                SettingsStore.defaultRealtimeInstructions
+            ) == 0xa9c081cb8ac66070,
+            "the current common semantic Realtime prompt fingerprint must stay explicit"
+        )
+        expect(
+            SettingsStore.isLegacyDefaultRealtimeInstructionsFingerprint(
+                0x01a7718371a87c1c
+            )
+                && SettingsStore.isLegacyDefaultRealtimeInstructionsFingerprint(
+                    0x054d9a4fca5b5e96
+                )
+                && !SettingsStore.isLegacyDefaultRealtimeInstructionsFingerprint(
+                    0xa9c081cb8ac66070
+                ),
+            "known generated legacy Realtime prompts must migrate without overwriting a custom prompt"
+        )
+        expect(
             savedVoiceSettings.realtimeInstructions == "Use a short custom greeting.",
             "the user-editable Realtime prompt must round-trip"
         )
@@ -2942,7 +2967,8 @@ struct PolicyTests {
             )
         }
         let authoritySuite = "VoiceRelay.AuthorityTests.\(UUID().uuidString)"
-        let authorityDefaults = UserDefaults(suiteName: authoritySuite)!
+        let authorityDefaults =
+            EphemeralPolicyUserDefaults(suiteName: authoritySuite)!
         authorityDefaults.removePersistentDomain(forName: authoritySuite)
         defer {
             authorityDefaults.removePersistentDomain(forName: authoritySuite)
@@ -3068,7 +3094,8 @@ struct PolicyTests {
 
         let migrationSuite =
             "VoiceRelay.AuthorityMigrationTests.\(UUID().uuidString)"
-        let migrationDefaults = UserDefaults(suiteName: migrationSuite)!
+        let migrationDefaults =
+            EphemeralPolicyUserDefaults(suiteName: migrationSuite)!
         migrationDefaults.removePersistentDomain(forName: migrationSuite)
         defer {
             migrationDefaults.removePersistentDomain(forName: migrationSuite)
