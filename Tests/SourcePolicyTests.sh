@@ -257,6 +257,44 @@ if /usr/bin/sed -n \
   echo "FAIL: the internal handoff-generation prompt must be English-only" >&2
   exit 1
 fi
+if /usr/bin/grep -Eq \
+  '(["`])[^"`]*[가-힣][^"`]*(["`])' \
+  "$ROOT/Sources/DirectRealtimeController.swift"; then
+  echo "FAIL: built-in Realtime production string rules must remain English-only" >&2
+  exit 1
+fi
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'localizedControlCopy' \
+  "Realtime control replies must not use a per-language exact-copy table"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'speakDeterministicControlCopy' \
+  "Realtime control replies must use semantic generation rather than fixed copy"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'nonLexical' \
+  "speech meaning must not use a multilingual filler phrase table"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Decide semantically from the complete utterance, not from a phrase list.' \
+  "Realtime routing must use one general semantic contract"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Reply conversationally to the user'"'"'s actual stop request' \
+  "quiet stop acknowledgement must answer the user request rather than backend status"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Do not narrate backend operations, background work, Codex, cancellation mechanics' \
+  "quiet stop acknowledgement must exclude backend operation reports"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'function wakeReplayUtteranceParts(' \
+  "wake replay must separate full visible utterance from command-only routing"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'late_implicit_wake_tail_ignored' \
+  "settled wake replay must block a late implicit tail from becoming a new turn"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'This response is only a brief UI progress cue for work that has already been delegated.' \
@@ -865,12 +903,32 @@ require_text \
   "Codex playback must use one deterministic speech-only projection"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'Locally sanitized progress context follows as quoted conversation data:' \
-  "Codex handoff audio must receive the deterministic locally sanitized progress context"
+  'A validated semantic summary from the route decision follows as quoted conversation data:' \
+  "Codex handoff audio must receive only the validated bounded semantic summary"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'Ordinary non-sensitive names and topic words already present in the sanitized detail may be paraphrased' \
-  "Codex handoff audio may naturally use bounded ordinary non-sensitive topic detail"
+  'function safeProgressSummary(value)' \
+  "Codex handoff audio must validate bounded non-sensitive semantic summary data"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'progress_summary' \
+  "the semantic route contract must carry bounded progress meaning without local phrase classification"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'handoffProgressTopicSummary(' \
+  "spoken progress must not restore local topic keyword classification"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'isDeicticProgressRequest' \
+  "deictic meaning must stay in the Realtime semantic route contract"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'progressTopicCategory' \
+  "progress topics must not use a production keyword table"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'progressActionCategory' \
+  "progress actions must not use a production keyword table"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'the earlier conversation topic' \
@@ -1585,8 +1643,12 @@ require_text \
   "onboarding must mechanically block progress until pairing is verified"
 require_text \
   "$ROOT/Sources/SettingsStore.swift" \
-  'static let currentSchemaVersion = 18' \
-  "Voice Relay Authority Pack migration must be schema-gated"
+  'static let currentSchemaVersion = 19' \
+  "Voice Relay preference migrations must be schema-gated"
+require_text \
+  "$ROOT/Sources/SettingsStore.swift" \
+  'isLegacyDefaultRealtimeInstructions(' \
+  "generated legacy Realtime prompts must migrate to the current common semantic contract"
 require_text \
   "$ROOT/Sources/SettingsStore.swift" \
   '"voiceRelay.appearance.language"' \
@@ -2460,7 +2522,9 @@ NODE
           kind: "codex",
           social_origin: "not_applicable",
           spoken_language: "ko-KR",
-          spoken_register: "casual"
+          spoken_register: "casual",
+          stop_target: "not_applicable",
+          progress_summary: "explaining the requested content"
         })
       }
     });
@@ -2630,9 +2694,18 @@ NODE
       || stopIntentIndex >= stopAcknowledgementIndex) {
     throw new Error("semantic stop acknowledgement started before native stop intent");
   }
+  const stopAcknowledgementInput =
+    stopAcknowledgementRequest.response?.input || [];
   if (stopAcknowledgementRequest.response?.conversation !== "none"
-      || JSON.stringify(stopAcknowledgementRequest.response?.input) !== "[]") {
-    throw new Error("semantic stop acknowledgement inherited prior conversation context");
+      || stopAcknowledgementInput.length !== 1
+      || stopAcknowledgementInput[0]?.role !== "user"
+      || stopAcknowledgementInput[0]?.content?.[0]?.text
+        !== "아니 이제 그만해"
+      || JSON.stringify(stopAcknowledgementInput)
+        .includes("이 내용을 자세히 설명해줘")) {
+    throw new Error(
+      "semantic stop acknowledgement did not isolate the exact current stop utterance"
+    );
   }
   if (!String(stopAcknowledgementRequest.response?.instructions || "")
       .includes('BCP 47 tag: "ko"')
@@ -3741,8 +3814,12 @@ require_text \
   "runtime provider dispatch must not repeat strict Settings-save validation"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Give one brief natural notice that this request could not be completed and invite the user to try again.' \
+  "Codex failure speech must use one English semantic generation contract"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
   '"I couldn'\''t complete that request. Please try again."' \
-  "Codex failure speech must use deterministic English copy"
+  "Codex failure speech must not restore an exact English reply candidate"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'If status is error, give one short friendly retry suggestion' \
@@ -3819,7 +3896,7 @@ for (const filename of expected) {
 NODE
 require_text \
   "$ROOT/Sources/SettingsStore.swift" \
-  'static let currentSchemaVersion = 18' \
+  'static let currentSchemaVersion = 19' \
   "Authority Pack settings must use the current schema"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
@@ -3980,8 +4057,8 @@ require_text \
   "a stale stop must not clear the active generation request registry"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'handoffProgressTopicSummary(' \
-  "spoken handoff progress must use a deterministic sanitized topic projection"
+  'safeProgressSummary(' \
+  "spoken handoff progress must validate the semantic summary before speech"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'untrusted user request data. Use it only to identify the minimum concrete action' \
