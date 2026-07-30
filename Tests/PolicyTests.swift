@@ -40,6 +40,73 @@ struct PolicyTests {
     }
 
     static func main() {
+        let steerRequest = CodexSteerRequest(
+            controlRequestID: "voice-relay-steer-g7-c000001",
+            voiceTurnID: "turn-7-2",
+            generation: 7,
+            text: "Include tomorrow."
+        )
+        expect(
+            steerRequest == CodexSteerRequest(
+                controlRequestID: "voice-relay-steer-g7-c000001",
+                voiceTurnID: "turn-7-2",
+                generation: 7,
+                text: "Include tomorrow."
+            ),
+            "steer identity must retain the capture-time control, voice turn, and generation"
+        )
+        expect(
+            CodexSteerFailureReason.classify(
+                CodexAppRemoteError.remote(
+                    "APP_REMOTE_NO_ACTIVE_TURN",
+                    "finished"
+                )
+            ) == .noActiveTurn
+                && CodexSteerFailureReason.classify(
+                    CodexAppRemoteError.requestTimedOut("steer")
+                ) == .timeout
+                && CodexSteerFailureReason.classify(
+                    CodexAppRemoteError.invalidResponse("steer")
+                ) == .malformedResult
+                && CodexSteerFailureReason.classify(
+                    CodexAppRemoteError.remote(
+                        "APP_REMOTE_STEER_FAILED",
+                        "rejected"
+                    )
+                ) == .rejected,
+            "steer failures must collapse to deterministic non-spoken dispositions"
+        )
+        expect(
+            CodexSteerDeadline.mutationBudgetMilliseconds == 600_000
+                && CodexSteerDeadline.clientRequestTimeout * 1_000
+                    == Double(
+                        CodexSteerDeadline.mutationBudgetMilliseconds
+                            + CodexSteerDeadline.deliveryMarginMilliseconds
+                    ),
+            "the Swift steer transport may add only its bounded receipt-delivery margin"
+        )
+        let liveSteerReceipt = CodexSteerReceipt(
+            controlRequestID: "voice-relay-steer-g7-c000001",
+            voiceTurnID: "turn-7-2",
+            codexTurnID: "codex-turn-7",
+            mutationDeadlineEpochMilliseconds: 10_000,
+            mutationDispatched: true
+        )
+        expect(
+            liveSteerReceipt.isAcceptable(nowEpochMilliseconds: 9_999)
+                && !liveSteerReceipt.isAcceptable(
+                    nowEpochMilliseconds: 10_000
+                )
+                && !CodexSteerReceipt(
+                    controlRequestID: "voice-relay-steer-g7-c000002",
+                    voiceTurnID: "turn-7-3",
+                    codexTurnID: "codex-turn-7",
+                    mutationDeadlineEpochMilliseconds: 10_000,
+                    mutationDispatched: false
+                ).isAcceptable(nowEpochMilliseconds: 9_999),
+            "Swift must accept a correlated steer only before the exact receipt deadline with positive dispatch evidence"
+        )
+
         let hiddenTranscriptLog = VoiceRelayDiagnostics.rendered(
             "diagnostic_test",
             generation: 7,
@@ -385,21 +452,28 @@ struct PolicyTests {
             pausedBargeIn.classification == .uncertainSpeech,
             "barge-in confirmation must not interrupt playback on first suspicion"
         )
+        let continuingBargeIn = bargeInAdmission.filterCapture(
+            humanOverlay,
+            startTime: 20.24,
+            playbackActive: true,
+            playbackProvisionallyPaused: false
+        )
         let decayedBargeIn = bargeInAdmission.filterCapture(
             humanOverlay,
-            startTime: 20.30,
+            startTime: 20.40,
             playbackActive: true,
             playbackProvisionallyPaused: false
         )
         expect(
-            decayedBargeIn.classification == .residualSpeech,
-            "speech that survives system echo cancellation must interrupt promptly without a provisional playback pause"
+            continuingBargeIn.classification == .uncertainSpeech
+                && decayedBargeIn.classification == .residualSpeech,
+            "only sustained multi-sample speech may interrupt playback without a provisional pause"
         )
         expect(
             !bargeInAdmission.shouldForwardServerEvent(
                 type: "conversation.item.input_audio_transcription.completed",
                 playbackActive: true,
-                now: 20.63
+                now: 20.43
             ),
             "the server turn rejected before local confirmation must stay quarantined through completion"
         )
@@ -407,12 +481,12 @@ struct PolicyTests {
             bargeInAdmission.shouldForwardServerEvent(
                 type: "input_audio_buffer.speech_started",
                 playbackActive: true,
-                now: 20.64
+                now: 20.44
             )
                 && bargeInAdmission.shouldForwardServerEvent(
                     type: "conversation.item.input_audio_transcription.completed",
                     playbackActive: true,
-                    now: 20.65
+                    now: 20.45
                 ),
             "confirmed speech must be admitted as a fresh server turn"
         )
@@ -472,14 +546,21 @@ struct PolicyTests {
             pausedSpeech.classification == .uncertainSpeech,
             "one short residual burst must not interrupt assistant playback"
         )
+        let continuingSpeech = uncertainAdmission.filterCapture(
+            decorrelatedSpeech,
+            startTime: 25.24,
+            playbackActive: true,
+            playbackProvisionallyPaused: false
+        )
         let decayedSpeech = uncertainAdmission.filterCapture(
             decorrelatedSpeech,
-            startTime: 25.30,
+            startTime: 25.40,
             playbackActive: true,
             playbackProvisionallyPaused: false
         )
         expect(
-            decayedSpeech.classification == .residualSpeech,
+            continuingSpeech.classification == .uncertainSpeech
+                && decayedSpeech.classification == .residualSpeech,
             "sustained residual speech must be admitted without first muting assistant playback"
         )
         var gapTolerantAdmission = RealtimeEchoAdmissionPolicy()
@@ -507,23 +588,103 @@ struct PolicyTests {
             playbackActive: true,
             playbackProvisionallyPaused: false
         )
+        let confirmedCommandTail = gapTolerantAdmission.filterCapture(
+            decorrelatedSpeech,
+            startTime: 26.34,
+            playbackActive: true,
+            playbackProvisionallyPaused: false
+        )
         expect(
             gapCandidate.classification == .uncertainSpeech
                 && gapPauseStarted.classification == .uncertainSpeech
                 && quietGap.classification == .echoOnly
-                && shortCommandTail.classification == .residualSpeech
+                && shortCommandTail.classification == .uncertainSpeech
+                && confirmedCommandTail.classification == .residualSpeech
                 && gapTolerantAdmission.shouldForwardServerEvent(
                     type: "input_audio_buffer.speech_started",
                     playbackActive: true,
-                    now: 26.23
+                    now: 26.35
                 ),
-            "a short barge-in must survive a brief quiet or echo gap and interrupt promptly"
+            "a real barge-in must survive a brief quiet gap and interrupt after bounded sustained evidence"
         )
         expect(
             !gapTolerantAdmission.shouldRetainPendingSpeechCandidate(
-                at: 26.23
+                at: 26.35
             ),
             "committed residual speech must not leave stale preroll behind"
+        )
+        var weakTransientAdmission = RealtimeEchoAdmissionPolicy()
+        weakTransientAdmission.appendPlaybackReference(
+            echoReference,
+            startTime: 40
+        )
+        weakTransientAdmission.markPlaybackActive(at: 40)
+        let weakFirst = weakTransientAdmission.filterCapture(
+            decorrelatedSpeech,
+            startTime: 40.04,
+            playbackActive: true
+        )
+        let weakSecond = weakTransientAdmission.filterCapture(
+            decorrelatedSpeech,
+            startTime: 40.14,
+            playbackActive: true
+        )
+        let weakServerStart =
+            weakTransientAdmission.shouldForwardServerEvent(
+                type: "input_audio_buffer.speech_started",
+                playbackActive: true,
+                now: 40.15
+            )
+        let emptyWeakTranscript =
+            weakTransientAdmission.shouldForwardServerEvent(
+                type:
+                    "conversation.item.input_audio_transcription.completed",
+                playbackActive: true,
+                now: 40.16
+            )
+        expect(
+            weakFirst.classification == .uncertainSpeech
+                && weakSecond.classification == .uncertainSpeech
+                && abs(weakFirst.correlation) < 0.1
+                && abs(weakSecond.correlation) < 0.1
+                && !weakServerStart
+                && !emptyWeakTranscript,
+            "weak low-correlation playback noise with no transcript must never authorize destructive barge-in"
+        )
+        let sustainedWeakSequence = [
+            weakTransientAdmission.filterCapture(
+                decorrelatedSpeech,
+                startTime: 41.00,
+                playbackActive: true
+            ),
+            weakTransientAdmission.filterCapture(
+                decorrelatedSpeech,
+                startTime: 41.10,
+                playbackActive: true
+            ),
+            weakTransientAdmission.filterCapture(
+                decorrelatedSpeech,
+                startTime: 41.20,
+                playbackActive: true
+            ),
+            weakTransientAdmission.filterCapture(
+                decorrelatedSpeech,
+                startTime: 41.31,
+                playbackActive: true
+            ),
+        ]
+        expect(
+            sustainedWeakSequence.dropLast().allSatisfy {
+                $0.classification == .uncertainSpeech
+            }
+                && sustainedWeakSequence.last?.classification
+                    == .residualSpeech
+                && weakTransientAdmission.shouldForwardServerEvent(
+                    type: "input_audio_buffer.speech_started",
+                    playbackActive: true,
+                    now: 41.32
+                ),
+            "confirmed sustained user speech must still barge in within the bounded confirmation window"
         )
         var playbackTailAdmission = RealtimeEchoAdmissionPolicy()
         playbackTailAdmission.appendPlaybackReference(
@@ -1849,9 +2010,23 @@ struct PolicyTests {
             "local speech must continue blocking collapse after native playback drains"
         )
         expect(
-            assistantOutput.finishLocalSpeech(generation: generation)
-                && !assistantOutput.isActive,
-            "the surface may collapse only after every output path finishes"
+            !assistantOutput.setRealtimeQueueLease(
+                generation: generation,
+                active: true
+            ) && assistantOutput.isActive,
+            "a queued Realtime commentary sequence must hold one queue-wide surface lease"
+        )
+        expect(
+            !assistantOutput.finishLocalSpeech(generation: generation)
+                && assistantOutput.isActive,
+            "finishing one output path must not collapse while queued commentary remains"
+        )
+        expect(
+            assistantOutput.setRealtimeQueueLease(
+                generation: generation,
+                active: false
+            ) && !assistantOutput.isActive,
+            "the surface may collapse only after every output path and queue lease finishes"
         )
         expect(
             VoiceIdleTimeoutPolicy.shouldArm(
@@ -1940,6 +2115,43 @@ struct PolicyTests {
                 && !wakeAdmission.mediaLatched
                 && wakeAdmission.stableIdleSamples == 0,
             "wake capture admission must stay media-independent"
+        )
+        var playbackOverlap = AssistantPlaybackOverlapPolicy()
+        let persistentMedia = ExternalAudioPlaybackSnapshot(
+            processLabels: ["persistent.output"]
+        )
+        playbackOverlap.begin(with: persistentMedia)
+        expect(
+            playbackOverlap.observe(persistentMedia) == .none
+                && !playbackOverlap.isPaused,
+            "external media already active when speech starts must remain uninterrupted"
+        )
+        let alertOverlap = ExternalAudioPlaybackSnapshot(
+            processLabels: ["persistent.output", "transient.alert"]
+        )
+        expect(
+            playbackOverlap.observe(alertOverlap) == .pause
+                && playbackOverlap.isPaused
+                && playbackOverlap.observe(alertOverlap) == .none,
+            "a newly appearing system-output overlap must pause playback only once"
+        )
+        expect(
+            playbackOverlap.observe(persistentMedia) == .none
+                && playbackOverlap.isPaused
+                && playbackOverlap.observe(persistentMedia) == .resume
+                && !playbackOverlap.isPaused,
+            "speech must resume only after the transient output clears stably while persistent media remains"
+        )
+        playbackOverlap.begin(with: idleSnapshot)
+        expect(
+            playbackOverlap.observe(
+                ExternalAudioPlaybackSnapshot(
+                    processLabels: ["transient.alert"]
+                )
+            ) == .pause
+                && playbackOverlap.observe(unavailableSnapshot) == .resume
+                && !playbackOverlap.isPaused,
+            "detector loss must fail safe by releasing a paused playback queue"
         )
         expect(
             WakeAnalyzerRetryPolicy.shouldRetry(
@@ -2371,6 +2583,7 @@ struct PolicyTests {
         explicitSettings.additionalSpeechLocales = ["en-US", "sv-SE", "de-DE"]
         explicitSettings.preferModernSpeechAnalyzer = false
         explicitSettings.voiceIdleTimeoutMinutes = 15
+        explicitSettings.realtimeSpeechRate = 1.1
         explicitSettings.realtimeInstructions = "Use a short custom greeting."
         explicitSettings.productName = "  Orbit  "
         explicitSettings.assistantName = "  Nova  "
@@ -2404,8 +2617,17 @@ struct PolicyTests {
             "the user-facing SpeechAnalyzer preference must round-trip"
         )
         expect(
-            savedVoiceSettings.voiceIdleTimeoutMinutes == 15,
-            "the configurable voice inactivity timeout must round-trip"
+            savedVoiceSettings.voiceIdleTimeoutMinutes == 15
+                && abs(savedVoiceSettings.realtimeSpeechRate - 1.1)
+                    < 0.000_001,
+            "the configurable voice inactivity timeout and speech speed must round-trip"
+        )
+        expect(
+            SettingsStore.clampedRealtimeSpeechRate(0.1) == 0.25
+                && SettingsStore.clampedRealtimeSpeechRate(2) == 1.5
+                && SettingsStore.clampedRealtimeSpeechRate(.infinity)
+                    == AppSettings.defaults.realtimeSpeechRate,
+            "Realtime speech speed must stay inside the supported safe range and preserve the default for invalid values"
         )
         expect(
             SettingsStore.defaultRealtimeInstructions.range(
@@ -2641,6 +2863,260 @@ struct PolicyTests {
                 && migratedSettings.codexThreadSource == "app"
                 && migratedSettings.authorityPackFingerprint.count == 64,
             "Authority Pack fingerprint migration must seed context state without rotating the managed session"
+        )
+
+        let voiceContextBody: [String: Any] = [
+            "callId": "voice-call-1",
+            "currentTurnId": "voice-turn-2",
+            "currentUtterance": "그런 거 같지 않니?",
+            "recentFinalizedTurns": [
+                [
+                    "speaker": "user",
+                    "text": "Memory Forest 구조를 확인해줘",
+                ],
+                [
+                    "speaker": "assistant",
+                    "text": "Memory Forest 구조 확인이 끝났어.",
+                ],
+            ],
+        ]
+        let voiceContextEnvelope = VoiceCodexRequestEnvelope(
+            body: voiceContextBody
+        )
+        expect(
+            voiceContextEnvelope?.requestID == "voice-call-1"
+                && voiceContextEnvelope?.currentTurnID == "voice-turn-2"
+                && voiceContextEnvelope?.currentUtterance
+                    == "그런 거 같지 않니?"
+                && voiceContextEnvelope?.recentFinalizedTurns.map(
+                    \.speaker
+                ) == [.user, .assistant],
+            "Voice Codex handoff must validate stable request and turn IDs while preserving finalized context order"
+        )
+        let voiceCodexInput = voiceContextEnvelope?.codexInput ?? ""
+        expect(
+            voiceCodexInput.contains(
+                "recentFinalizedVoiceTurns="
+            )
+                && voiceCodexInput.contains(
+                    "currentVoiceUtterance="
+                )
+                && voiceCodexInput.components(
+                    separatedBy: "그런 거 같지 않니?"
+                ).count == 2
+                && !voiceCodexInput.contains("additionalContext")
+                && !voiceCodexInput.contains("Authority Pack"),
+            "Voice session context must remain a separate data envelope with the current utterance exactly once"
+        )
+        let tooManyVoiceContextTurns: [[String: Any]] = (0..<9).map {
+            [
+                "speaker": $0.isMultiple(of: 2)
+                    ? "user"
+                    : "assistant",
+                "text": "turn \($0)",
+            ]
+        }
+        expect(
+            VoiceCodexRequestEnvelope(
+                body: [
+                    "callId": "voice-call-count",
+                    "currentTurnId": "voice-turn-count",
+                    "currentUtterance": "continue",
+                    "recentFinalizedTurns": tooManyVoiceContextTurns,
+                ]
+            ) == nil,
+            "Voice session context must reject envelopes above the exact turn-count bound"
+        )
+        let oversizedMultibyteContext: [[String: Any]] = [
+            ["speaker": "user", "text": String(repeating: "가", count: 450)],
+            [
+                "speaker": "assistant",
+                "text": String(repeating: "나", count: 450),
+            ],
+        ]
+        expect(
+            VoiceCodexRequestEnvelope(
+                body: [
+                    "callId": "voice-call-bytes",
+                    "currentTurnId": "voice-turn-bytes",
+                    "currentUtterance": "continue",
+                    "recentFinalizedTurns": oversizedMultibyteContext,
+                ]
+            ) == nil,
+            "Voice session context must enforce the UTF-8 byte bound for multibyte finalized text"
+        )
+        expect(
+            VoiceCodexRequestEnvelope(
+                body: [
+                    "callId": "voice-call-speaker",
+                    "currentTurnId": "voice-turn-speaker",
+                    "currentUtterance": "continue",
+                    "recentFinalizedTurns": [
+                        ["speaker": "tool", "text": "private progress"],
+                    ],
+                ]
+            ) == nil,
+            "Voice session context must reject tool, progress, and other non-user or non-assistant speakers"
+        )
+        expect(
+            VoiceCodexRequestEnvelope(
+                body: [
+                    "callId": "voice-call-current",
+                    "currentTurnId": "voice-turn-current",
+                    "currentUtterance": String(
+                        repeating: "x",
+                        count:
+                            VoiceCodexRequestEnvelope
+                                .maximumCurrentUtteranceBytes + 1
+                    ),
+                    "recentFinalizedTurns": [],
+                ]
+            ) == nil,
+            "Voice Codex handoff must reject an unbounded current utterance before dispatch"
+        )
+
+        guard let firstDispatchRequest = VoiceCodexRequestEnvelope(
+            body: [
+                "callId": "voice-call-registry-1",
+                "currentTurnId": "voice-turn-registry-1",
+                "currentUtterance": "Check the current state.",
+                "recentFinalizedTurns": [],
+            ]
+        ), let conflictingDispatchRequest = VoiceCodexRequestEnvelope(
+            body: [
+                "callId": "voice-call-registry-1",
+                "currentTurnId": "voice-turn-registry-1",
+                "currentUtterance": "Use a conflicting payload.",
+                "recentFinalizedTurns": [],
+            ]
+        ) else {
+            fatalError("Voice Codex request registry fixtures must parse")
+        }
+        var dispatchRegistry = VoiceCodexRequestDispatchRegistry()
+        expect(
+            dispatchRegistry.register(
+                firstDispatchRequest,
+                generation: 41
+            ) == .inactiveGeneration,
+            "Voice Codex request identity must reject dispatch before a generation begins"
+        )
+        expect(
+            dispatchRegistry.beginGeneration(41)
+                && dispatchRegistry.register(
+                    firstDispatchRequest,
+                    generation: 41
+                ) == .dispatch
+                && dispatchRegistry.register(
+                    firstDispatchRequest,
+                    generation: 41
+                ) == .duplicate
+                && dispatchRegistry.register(
+                    conflictingDispatchRequest,
+                    generation: 41
+                ) == .conflict,
+            "Voice Codex request IDs must dispatch one matching envelope and reject conflicting reuse"
+        )
+        dispatchRegistry.beginGeneration(41)
+        expect(
+            dispatchRegistry.register(
+                firstDispatchRequest,
+                generation: 41
+            ) == .duplicate,
+            "restarting the same active generation must not clear request identity"
+        )
+        expect(
+            !dispatchRegistry.beginGeneration(42)
+                && dispatchRegistry.generation == 41
+                && dispatchRegistry.register(
+                    firstDispatchRequest,
+                    generation: 41
+                ) == .duplicate,
+            "a new generation must not erase request identities until the owning generation closes"
+        )
+        guard let contextConflictRequest = VoiceCodexRequestEnvelope(
+            body: [
+                "callId": "voice-call-registry-1",
+                "currentTurnId": "voice-turn-registry-1",
+                "currentUtterance": "Check the current state.",
+                "recentFinalizedTurns": [
+                    ["speaker": "user", "text": "Conflicting context"],
+                ],
+            ]
+        ), let turnConflictRequest = VoiceCodexRequestEnvelope(
+            body: [
+                "callId": "voice-call-registry-1",
+                "currentTurnId": "voice-turn-registry-conflict",
+                "currentUtterance": "Check the current state.",
+                "recentFinalizedTurns": [],
+            ]
+        ) else {
+            fatalError("Voice Codex conflict fixtures must parse")
+        }
+        expect(
+            dispatchRegistry.register(
+                contextConflictRequest,
+                generation: 41
+            ) == .conflict
+                && dispatchRegistry.register(
+                    turnConflictRequest,
+                    generation: 41
+                ) == .conflict
+                && dispatchRegistry.register(
+                    firstDispatchRequest,
+                    generation: 41
+                ) == .duplicate,
+            "turn or context conflicts must be rejected without replacing the first canonical envelope"
+        )
+        for index in 2...130 {
+            guard let request = VoiceCodexRequestEnvelope(
+                body: [
+                    "callId": "voice-call-registry-\(index)",
+                    "currentTurnId": "voice-turn-registry-\(index)",
+                    "currentUtterance": "Request \(index)",
+                    "recentFinalizedTurns": [],
+                ]
+            ) else {
+                fatalError("Voice Codex request registry fixture must parse")
+            }
+            expect(
+                dispatchRegistry.register(
+                    request,
+                    generation: 41
+                ) == .dispatch,
+                "each distinct Voice Codex request must dispatch once"
+            )
+        }
+        expect(
+            dispatchRegistry.requestsByID.count == 130
+                && dispatchRegistry.register(
+                    firstDispatchRequest,
+                    generation: 41
+                ) == .duplicate,
+            "generation-scoped at-most-once identity must retain more than 100 requests without early eviction"
+        )
+        dispatchRegistry.closeGeneration(42)
+        expect(
+            dispatchRegistry.register(
+                firstDispatchRequest,
+                generation: 41
+            ) == .duplicate,
+            "closing another generation must not clear the active request registry"
+        )
+        dispatchRegistry.closeGeneration(41)
+        expect(
+            dispatchRegistry.register(
+                firstDispatchRequest,
+                generation: 41
+            ) == .inactiveGeneration,
+            "closing the owning generation must retire every request identity"
+        )
+        dispatchRegistry.beginGeneration(42)
+        expect(
+            dispatchRegistry.register(
+                firstDispatchRequest,
+                generation: 42
+            ) == .dispatch,
+            "a new generation may reuse an old request ID only after synchronous closure"
         )
 
         print("Voice Relay policy tests passed")

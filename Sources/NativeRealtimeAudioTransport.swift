@@ -122,6 +122,12 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private var playbackToken = 0
     private var provisionalPauseToken = 0
     private var playbackProvisionallyPaused = false
+    private let systemMediaPlaybackDetector =
+        SystemMediaPlaybackDetector()
+    private var playbackOverlapPolicy =
+        AssistantPlaybackOverlapPolicy()
+    private var playbackOverlapWorkItem: DispatchWorkItem?
+    private var playbackExternallyPaused = false
     private var activePlaybackResponseID = ""
     private var activePlaybackItemID = ""
     private var activePlaybackContentIndex = 0
@@ -1668,6 +1674,20 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                     self.onInputLevel?(generation, inputLevel)
                 }
                 self.capturedChunks += 1
+                if self.playbackExternallyPaused {
+                    self.echoAdmissionPolicy.cancelProvisionalSpeech()
+                    self.pendingBargeInPCM.removeAll(
+                        keepingCapacity: true
+                    )
+                    self.suppressedEchoChunks += 1
+                    self.reportCaptureClassificationIfChanged(
+                        .echoOnly,
+                        correlation: 0,
+                        generation: generation
+                    )
+                    self.emitDiagnosticIfUseful()
+                    return
+                }
                 let filtered = self.echoAdmissionPolicy.filterCapture(
                     samples,
                     startTime: startTime,
@@ -1943,6 +1963,9 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         if !responseID.isEmpty {
             playbackBuffersByResponseID[responseID, default: 0] += 1
         }
+        if firstChunkForResponse {
+            beginPlaybackOverlapMonitoring()
+        }
         let token = playbackToken
         player.scheduleBuffer(
             buffer,
@@ -2004,6 +2027,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         completedAudioResponseIDs.remove(responseID)
         playbackBuffersByResponseID.removeValue(forKey: responseID)
         truncatableResponseIDs.remove(responseID)
+        if activePlaybackResponseID == responseID {
+            activePlaybackResponseID = ""
+        }
+        endPlaybackOverlapMonitoring()
         VoiceRelayDiagnostics.flow(
             "assistant_playback_drained_native",
             generation: generation,
@@ -2110,6 +2137,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         pendingBargeInPCM.removeAll(keepingCapacity: true)
         echoAdmissionPolicy.cancelProvisionalSpeech()
         guard scheduledPlaybackBuffers > 0,
+              !playbackExternallyPaused,
               let player = playerNode else {
             return
         }
@@ -2155,6 +2183,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         playbackToken += 1
         provisionalPauseToken &+= 1
         playbackProvisionallyPaused = false
+        endPlaybackOverlapMonitoring()
         pendingBargeInPCM.removeAll(keepingCapacity: true)
         playerNode?.stop()
         queuedPlaybackFrames = 0
@@ -2205,6 +2234,89 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         ])
         guard activeGeneration == generation else { return }
         emitDiagnostic("playback_truncated")
+    }
+
+    private func beginPlaybackOverlapMonitoring() {
+        playbackOverlapWorkItem?.cancel()
+        playbackOverlapWorkItem = nil
+        playbackOverlapPolicy.begin(
+            with: systemMediaPlaybackDetector.snapshot()
+        )
+        playbackExternallyPaused = false
+        schedulePlaybackOverlapSample()
+    }
+
+    private func schedulePlaybackOverlapSample() {
+        guard activeGeneration != nil,
+              !stopping,
+              !activePlaybackResponseID.isEmpty else {
+            return
+        }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.stateQueue.async {
+                guard self.playbackOverlapWorkItem != nil,
+                      self.activeGeneration != nil,
+                      !self.stopping,
+                      !self.activePlaybackResponseID.isEmpty else {
+                    return
+                }
+                self.playbackOverlapWorkItem = nil
+                let snapshot =
+                    self.systemMediaPlaybackDetector.snapshot()
+                switch self.playbackOverlapPolicy.observe(snapshot) {
+                case .pause:
+                    self.playbackExternallyPaused = true
+                    if self.playerNode?.isPlaying == true {
+                        self.playerNode?.pause()
+                    }
+                    VoiceRelayDiagnostics.flow(
+                        "assistant_playback_yielded",
+                        generation: self.activeGeneration,
+                        fields: [
+                            "process_count":
+                                String(snapshot.processLabels.count),
+                            "reason":
+                                "new_external_output_overlap",
+                            "responseID":
+                                self.activePlaybackResponseID,
+                        ]
+                    )
+                case .resume:
+                    self.playbackExternallyPaused = false
+                    if self.scheduledPlaybackBuffers > 0,
+                       !self.playbackProvisionallyPaused,
+                       self.playerNode?.isPlaying == false {
+                        self.playerNode?.play()
+                    }
+                    VoiceRelayDiagnostics.flow(
+                        "assistant_playback_resumed",
+                        generation: self.activeGeneration,
+                        fields: [
+                            "reason":
+                                "external_output_overlap_ended",
+                            "responseID":
+                                self.activePlaybackResponseID,
+                        ]
+                    )
+                case .none:
+                    break
+                }
+                self.schedulePlaybackOverlapSample()
+            }
+        }
+        playbackOverlapWorkItem = workItem
+        stateQueue.asyncAfter(
+            deadline: .now() + 0.10,
+            execute: workItem
+        )
+    }
+
+    private func endPlaybackOverlapMonitoring() {
+        playbackOverlapWorkItem?.cancel()
+        playbackOverlapWorkItem = nil
+        playbackOverlapPolicy.reset()
+        playbackExternallyPaused = false
     }
 
     private func enqueueControlEvent(_ event: JSONDictionary) {
@@ -2267,6 +2379,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         playbackToken += 1
         provisionalPauseToken &+= 1
         playbackProvisionallyPaused = false
+        endPlaybackOverlapMonitoring()
         let closeAfterAudioTransition = { [weak self] in
             guard let self,
                   emitClosed,

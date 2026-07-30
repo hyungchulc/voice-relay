@@ -200,6 +200,7 @@ final class SettingsWindowController:
         NSPopUpButton(),
     ]
     private let realtimeVoiceControl = NSPopUpButton()
+    private let realtimeSpeechRateControl = NSPopUpButton()
     private let voiceIdleTimeoutControl = NSPopUpButton()
     private let realtimePromptStatus = NSTextField(labelWithString: "")
     private let microphonePermissionStatus = NSTextField(labelWithString: "")
@@ -338,6 +339,7 @@ final class SettingsWindowController:
         appearanceControl.removeAllItems()
         returnMinutesControl.removeAllItems()
         realtimeVoiceControl.removeAllItems()
+        realtimeSpeechRateControl.removeAllItems()
         voiceIdleTimeoutControl.removeAllItems()
         window.toolbar = nil
         window.contentView = NSView(frame: oldContent.frame)
@@ -453,6 +455,7 @@ final class SettingsWindowController:
 
         populateLocales()
         populateRealtimeVoices()
+        populateRealtimeSpeechRates()
         populateAppLanguages()
         populateAppearances()
         appearanceControl.target = self
@@ -568,6 +571,10 @@ final class SettingsWindowController:
                 settingsRow(
                     localizedCopy.text("Realtime voice", "Realtime 보이스"),
                     realtimeVoiceControl
+                ),
+                settingsRow(
+                    localizedCopy.text("Speech speed", "말하기 속도"),
+                    realtimeSpeechRateControl
                 ),
                 note(localizedCopy.text(
                     "Marin and Cedar are recommended. A voice change applies when the next Realtime session starts.",
@@ -904,11 +911,16 @@ final class SettingsWindowController:
         stack.setCustomSpacing(22, after: subtitleLabel)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let document = FlippedSettingsDocumentView()
+        let initialPageFrame = NSRect(
+            origin: .zero,
+            size: window?.contentLayoutRect.size
+                ?? NSSize(width: 780, height: 560)
+        )
+        let document = FlippedSettingsDocumentView(frame: initialPageFrame)
         document.translatesAutoresizingMaskIntoConstraints = false
         document.addSubview(stack)
 
-        let scroll = SettingsScrollView()
+        let scroll = SettingsScrollView(frame: initialPageFrame)
         scroll.refreshSettingsAppearance()
         scroll.borderType = .noBorder
         scroll.hasVerticalScroller = true
@@ -1160,6 +1172,7 @@ final class SettingsWindowController:
                 settingsRow("추가 언어 2", additionalLocaleControls[1]),
                 settingsRow("추가 언어 3", additionalLocaleControls[2]),
                 settingsRow("Realtime 보이스", realtimeVoiceControl),
+                settingsRow("말하기 속도", realtimeSpeechRateControl),
                 note("Marin과 Cedar를 권장합니다. 변경한 보이스는 다음 Realtime 세션부터 적용됩니다."),
                 note("시스템 언어와 최대 3개 추가 언어를 함께 인식해. 로컬 웨이크워드는 이 Mac이 on-device 인식을 지원하는 언어만 사용해."),
                 divider(),
@@ -1327,6 +1340,7 @@ final class SettingsWindowController:
             selectLocale(control, identifier: identifier)
         }
         selectRealtimeVoice(settings.realtimeVoice)
+        selectRealtimeSpeechRate(settings.realtimeSpeechRate)
         for item in voiceIdleTimeoutControl.itemArray
         where item.representedObject as? Int == settings.voiceIdleTimeoutMinutes {
             voiceIdleTimeoutControl.select(item)
@@ -1816,6 +1830,12 @@ final class SettingsWindowController:
             realtimeVoiceControl.selectedItem?.representedObject as? String
                 ?? AppSettings.defaults.realtimeVoice
         )
+        settings.realtimeSpeechRate =
+            SettingsStore.clampedRealtimeSpeechRate(
+                realtimeSpeechRateControl.selectedItem?
+                    .representedObject as? Double
+                    ?? AppSettings.defaults.realtimeSpeechRate
+            )
         settings.realtimeInstructions = realtimePromptDraft
         settings.returnGreetingEnabled = returnControl.state == .on
         settings.returnGreetingMinutes = Int(returnMinutesControl.titleOfSelectedItem ?? "") ?? 30
@@ -2006,6 +2026,22 @@ final class SettingsWindowController:
         }
     }
 
+    private func populateRealtimeSpeechRates() {
+        realtimeSpeechRateControl.removeAllItems()
+        let rates: [Double] = [0.85, 0.95, 1.0, 1.1, 1.2]
+        for rate in rates {
+            let percent = Int((rate * 100).rounded())
+            let title = rate == 1
+                ? localizedCopy.text(
+                    "Normal (100%)",
+                    "기본 (100%)"
+                )
+                : "\(percent)%"
+            realtimeSpeechRateControl.addItem(withTitle: title)
+            realtimeSpeechRateControl.lastItem?.representedObject = rate
+        }
+    }
+
     private func selectRealtimeVoice(_ voice: String) {
         let normalized = SettingsStore.normalizedRealtimeVoice(voice)
         if let item = realtimeVoiceControl.itemArray.first(where: {
@@ -2014,6 +2050,19 @@ final class SettingsWindowController:
             realtimeVoiceControl.select(item)
         } else {
             realtimeVoiceControl.selectItem(at: 0)
+        }
+    }
+
+    private func selectRealtimeSpeechRate(_ rate: Double) {
+        let normalized = SettingsStore.clampedRealtimeSpeechRate(rate)
+        let item = realtimeSpeechRateControl.itemArray.min(by: {
+            abs(($0.representedObject as? Double ?? 1) - normalized)
+                < abs(($1.representedObject as? Double ?? 1) - normalized)
+        })
+        if let item {
+            realtimeSpeechRateControl.select(item)
+        } else {
+            realtimeSpeechRateControl.selectItem(at: 2)
         }
     }
 

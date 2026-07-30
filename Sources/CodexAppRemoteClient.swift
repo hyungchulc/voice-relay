@@ -56,6 +56,74 @@ struct CodexConnectionResetResult {
     let remoteRevocationSupported: Bool
 }
 
+struct CodexSteerRequest: Equatable {
+    let controlRequestID: String
+    let voiceTurnID: String
+    let generation: Int
+    let text: String
+}
+
+struct CodexSteerReceipt: Equatable {
+    let controlRequestID: String
+    let voiceTurnID: String
+    let codexTurnID: String
+    let mutationDeadlineEpochMilliseconds: Int64
+    let mutationDispatched: Bool
+
+    func isAcceptable(
+        nowEpochMilliseconds: Int64 = Int64(
+            Date().timeIntervalSince1970 * 1_000
+        )
+    ) -> Bool {
+        mutationDispatched
+            && mutationDeadlineEpochMilliseconds > nowEpochMilliseconds
+    }
+}
+
+struct CodexSteerDeadlineError: LocalizedError {
+    let mutationDispatched: Bool?
+    let failurePhase: String
+
+    var errorDescription: String? {
+        "The additional instruction deadline expired"
+    }
+}
+
+enum CodexSteerFailureReason: String {
+    case noActiveTurn = "no_active_turn"
+    case rejected
+    case timeout
+    case malformedResult = "malformed_result"
+
+    static func classify(_ error: Error) -> Self {
+        if let error = error as? CodexAppRemoteError {
+            switch error {
+            case .requestTimedOut:
+                return .timeout
+            case .invalidResponse:
+                return .malformedResult
+            case let .remote(code, _)
+                where code == "APP_REMOTE_NO_ACTIVE_TURN":
+                return .noActiveTurn
+            default:
+                return .rejected
+            }
+        }
+        if error is CodexSteerDeadlineError {
+            return .timeout
+        }
+        return .rejected
+    }
+}
+
+enum CodexSteerDeadline {
+    static let mutationBudgetMilliseconds = 10 * 60 * 1_000
+    static let deliveryMarginMilliseconds = 5_000
+    static let clientRequestTimeout: TimeInterval = Double(
+        mutationBudgetMilliseconds + deliveryMarginMilliseconds
+    ) / 1_000
+}
+
 enum RealtimeCredentialPolicy {
     static let minimumRemainingLifetime: TimeInterval = 30
 
@@ -276,25 +344,61 @@ final class CodexAppRemoteClient {
     }
 
     func steerActiveTurn(
-        _ text: String,
-        completion: @escaping (Result<Void, Error>) -> Void
+        _ steerRequest: CodexSteerRequest,
+        completion: @escaping (Result<CodexSteerReceipt, Error>) -> Void
     ) {
         request(
             command: "steer",
-            params: ["text": text],
-            timeout: 60
+            params: [
+                "text": steerRequest.text,
+                "controlRequestID": steerRequest.controlRequestID,
+                "voiceTurnID": steerRequest.voiceTurnID,
+                "generation": steerRequest.generation,
+                "terminalDeadlineMs":
+                    CodexSteerDeadline.mutationBudgetMilliseconds,
+            ],
+            timeout: CodexSteerDeadline.clientRequestTimeout
         ) { result in
             completion(result.flatMap { value in
                 let status = value["status"] as? String ?? ""
-                guard status == "steered"
-                        || status == "submitted_pending_ack" else {
+                let controlRequestID =
+                    value["requestId"] as? String ?? ""
+                let voiceTurnID =
+                    value["voiceTurnId"] as? String ?? ""
+                let codexTurnID =
+                    value["turnId"] as? String ?? ""
+                let mutationDeadlineEpochMilliseconds =
+                    (value["mutationDeadlineEpochMs"] as? NSNumber)?
+                        .int64Value ?? 0
+                let mutationDispatched =
+                    value["mutationDispatched"] as? Bool ?? false
+                guard status == "steered",
+                      controlRequestID == steerRequest.controlRequestID,
+                      voiceTurnID == steerRequest.voiceTurnID,
+                      !codexTurnID.isEmpty,
+                      mutationDeadlineEpochMilliseconds > 0,
+                      mutationDispatched else {
                     return .failure(
                         CodexAppRemoteError.invalidResponse(
                             "The additional instruction was not applied to the active Codex task"
                         )
                     )
                 }
-                return .success(())
+                let receipt = CodexSteerReceipt(
+                    controlRequestID: controlRequestID,
+                    voiceTurnID: voiceTurnID,
+                    codexTurnID: codexTurnID,
+                    mutationDeadlineEpochMilliseconds:
+                        mutationDeadlineEpochMilliseconds,
+                    mutationDispatched: mutationDispatched
+                )
+                guard receipt.isAcceptable() else {
+                    return .failure(CodexSteerDeadlineError(
+                        mutationDispatched: true,
+                        failurePhase: "swift_receipt_expired"
+                    ))
+                }
+                return .success(receipt)
             })
         }
     }
@@ -707,11 +811,25 @@ final class CodexAppRemoteClient {
             }
             request.timeout.cancel()
             if let error = object["error"] as? JSONDictionary {
-                request.completion(.failure(CodexAppRemoteError.remote(
-                    error["code"] as? String ?? "APP_REMOTE_FAILED",
-                    error["message"] as? String
-                        ?? "Codex/ChatGPT connection failed"
-                )))
+                let code =
+                    error["code"] as? String ?? "APP_REMOTE_FAILED"
+                if request.command == "steer",
+                   code == "APP_REMOTE_STEER_DEADLINE_EXPIRED" {
+                    request.completion(.failure(
+                        CodexSteerDeadlineError(
+                            mutationDispatched:
+                                error["mutationDispatched"] as? Bool,
+                            failurePhase:
+                                error["failurePhase"] as? String ?? ""
+                        )
+                    ))
+                } else {
+                    request.completion(.failure(CodexAppRemoteError.remote(
+                        code,
+                        error["message"] as? String
+                            ?? "Codex/ChatGPT connection failed"
+                    )))
+                }
             } else if let result = object["result"] as? JSONDictionary {
                 request.completion(.success(result))
             } else {

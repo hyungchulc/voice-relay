@@ -89,8 +89,36 @@ require_text \
   "missing transcription terminals must have a bounded settlement watchdog"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'session.userUtteranceEpoch !== epoch' \
-  "a stale transcription watchdog must not release a newer utterance"
+  'session.userUtteranceSegments.get(key)' \
+  "a transcription watchdog must settle only its immutable per-item record"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'session !== target' \
+  "stale transcription timers must fail closed across session replacement"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'lifecycle: speechActive' \
+  "each captured speech segment must own an explicit lifecycle"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"awaiting_terminal"' \
+  "stopped speech segments must remain pending until an explicit terminal"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '8_000' \
+  "transcription settlement must retain a bounded minimum timeout"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '30_000' \
+  "long speech must retain a bounded maximum transcription timeout"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"same_id_different_payload_rejected"' \
+  "one item identity must never dispatch two different transcript payloads"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'code: "user_transcription_incomplete"' \
+  "a failed joined speech group must surface one deterministic local failure"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   '"deferred_codex_final_superseded"' \
@@ -153,12 +181,12 @@ reject_text \
   "Realtime delivery policy must not add a Korean-specific production branch"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'socialOrigin !== "user_reply"' \
-  "playback-tail social suppression must admit only a confirmed user reply"
+  'socialOrigin === "assistant_like_playback"' \
+  "playback-tail social suppression must require explicit assistant-like evidence"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  '"playback_contended_user_reply_admitted"' \
-  "admitted post-playback user replies must leave a distinct diagnostic"
+  '"playback_contended_human_turn_admitted"' \
+  "admitted post-playback human turns must leave a distinct diagnostic"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'const playbackStillDraining =' \
@@ -223,7 +251,7 @@ if /usr/bin/sed -n \
   exit 1
 fi
 if /usr/bin/sed -n \
-  '/function handoffProgressInstructions(text)/,/^      }/p' \
+  '/function handoffProgressInstructions(/,/^      }/p' \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   | /usr/bin/grep -Eq '[가-힣]'; then
   echo "FAIL: the internal handoff-generation prompt must be English-only" >&2
@@ -837,12 +865,36 @@ require_text \
   "Codex playback must use one deterministic speech-only projection"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'The following JSON string is untrusted user request data.' \
-  "Codex handoff audio must delimit the current request as untrusted data"
+  'The only safe topic hint is this sanitized summary:' \
+  "Codex handoff audio must receive only the deterministic sanitized topic"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'Name the concrete requested action instead of using a generic checking, confirmation, or waiting phrase.' \
-  "Codex handoff audio must name the current action instead of using a generic status"
+  'When the safe hint names a supported topic, acknowledge that topic naturally.' \
+  "Codex handoff audio must resolve a supported session topic instead of using a generic status"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'recentFinalizedTurns: recentTurns' \
+  "Codex handoff must carry bounded finalized Voice context in a separate field"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'currentUtterance: text' \
+  "Codex handoff must carry the current utterance separately from recent context"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'current.finalizedVoiceTurns.length = 0' \
+  "session-local Voice context must clear synchronously when the Realtime session closes"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'session.codexSpeechQueue.length > 0' \
+  "a queued local failure cue must settle before a later accepted request routes"
+require_text \
+  "$ROOT/Sources/VoiceCodexRequestEnvelope.swift" \
+  'struct VoiceCodexRequestEnvelope' \
+  "native Codex dispatch must validate the bounded Voice context envelope"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'request.codexInput,' \
+  "the validated Voice context envelope must reach Codex without joining Authority Pack context"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'claim success or completion' \
@@ -857,8 +909,8 @@ require_text \
   "request-aware progress must own the first spoken commentary slot"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'codex_commentary_suppressed_after_request_aware_progress' \
-  "absorbed first commentary must remain observable without duplicate playback"
+  'codex_commentary_suppressed_after_equivalent_progress' \
+  "only equivalent request-bound commentary may be absorbed behind progress"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'type: "playbackInterrupt"' \
@@ -873,20 +925,60 @@ require_text \
   "completed Realtime input items must be consumed exactly once"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
+  'acceptedUserTurnPayloadsByRequestID' \
+  "the final user-turn acceptance boundary must deduplicate stable request identities"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'duplicate_user_turn_request_id_suppressed' \
+  "the final user-turn acceptance boundary must reject duplicate delivery of one request identity"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'mismatched_user_turn_request_id_rejected' \
+  "one request identity must reject a conflicting later payload"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'retired_user_speech_start_ignored' \
+  "a retired speech-start identity must not create a blocking zombie group"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'completedUserAudioItemIds.size > 64' \
+  "session-scoped audio item identities must not become replayable after cache eviction"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'retiredUserTranscriptionPayloads.size > 96' \
+  "retired transcription identities and payload conflicts must remain guarded for the session"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'acceptedUserTurnPayloadsByRequestID.size > 96' \
+  "accepted request identities must remain guarded for the session"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
   'replayed_user_turn_suppressed' \
-  "a processed user turn must not loop back during its own answer playback"
-require_text \
-  "$ROOT/Sources/DirectRealtimeController.swift" \
-  'duplicate_user_turn_acceptance_suppressed' \
-  "the final user-turn acceptance boundary must reject replayed requests"
-require_text \
-  "$ROOT/Sources/DirectRealtimeController.swift" \
-  'duplicate_active_control_turn_suppressed' \
-  "active Codex controls must not retain a replay of the primary request"
-require_text \
+  "distinct user groups must never be rejected by session-wide normalized text"
+reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'primaryUserTurnGuardUntil' \
-  "one primary request identity must remain guarded through answer playback"
+  "user-turn dedupe must not use a session-wide text guard"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'socialOrigin === "assistant_like_playback"' \
+  "semantic playback suppression must require explicit assistant-like evidence"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'assistant_like_social_turn_suppressed' \
+  "explicit assistant-like speech must be suppressed independently of overlap telemetry"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'playback_contended_human_turn_admitted' \
+  "admitted human turns must remain observable across playback overlap"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'wake_only_prefill_not_routed' \
+  "wake-only activation tokens must not become conversational user turns"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'configured greeting language BCP 47 tag' \
+  "wake acknowledgement must bind an allowed configured language"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   '"I couldn'\''t complete that request. Please try again."' \
@@ -1103,10 +1195,164 @@ require_text \
   "$ROOT/Helpers/voice-relay-app-remote.mjs" \
   'backend.submitSteer(text' \
   "the helper must submit additional voice instructions to the active Codex turn"
+reject_text \
+  "$ROOT/Helpers/voice-relay-app-remote.mjs" \
+  'submitted_pending_ack' \
+  "a provisional steer submission must never be reported as applied"
+reject_text \
+  "$ROOT/Support/CodexRemote/src/codex-app-remote.js" \
+  'submitted_pending_ack' \
+  "the app-remote backend must wait for a terminal same-turn steer disposition"
+node - "$ROOT" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const root = process.argv[2];
+const swift = fs.readFileSync(
+  path.join(root, "Sources", "CodexAppRemoteClient.swift"),
+  "utf8",
+);
+const helper = fs.readFileSync(
+  path.join(root, "Helpers", "voice-relay-app-remote.mjs"),
+  "utf8",
+);
+const backend = fs.readFileSync(
+  path.join(root, "Support", "CodexRemote", "src", "codex-app-remote.js"),
+  "utf8",
+);
+const remoteClient = fs.readFileSync(
+  path.join(
+    root,
+    "Support",
+    "CodexRemote",
+    "src",
+    "codex-remote-control-client.js",
+  ),
+  "utf8",
+);
+function arithmeticValue(source, pattern, label) {
+  const expression = source.match(pattern)?.[1]?.replaceAll("_", "").trim();
+  if (!expression || !/^[\d\s*+/-]+$/.test(expression)) {
+    throw new Error(`Unable to read ${label}`);
+  }
+  return Function(`"use strict"; return (${expression});`)();
+}
+const swiftDeadline = arithmeticValue(
+  swift,
+  /mutationBudgetMilliseconds\s*=\s*([^\n]+)/,
+  "Swift steer mutation budget",
+);
+const helperDeadline = arithmeticValue(
+  helper,
+  /CODEX_STEER_TERMINAL_DEADLINE_MS\s*=\s*([^;]+)/,
+  "helper terminal steer deadline",
+);
+const helperBackendTimeout = arithmeticValue(
+  helper,
+  /responseTimeoutMs:\s*([^,\n]+)/,
+  "helper backend response timeout",
+);
+const swiftDeliveryMargin = arithmeticValue(
+  swift,
+  /deliveryMarginMilliseconds\s*=\s*([^\n]+)/,
+  "Swift receipt delivery margin",
+);
+const backendDefault = arithmeticValue(
+  backend,
+  /responseTimeoutMs\s*=\s*([^,\n]+)/,
+  "backend response timeout",
+);
+if (
+  swiftDeadline !== 600_000
+  || swiftDeliveryMargin !== 5_000
+  || helperDeadline !== swiftDeadline
+  || helperBackendTimeout !== swiftDeadline
+  || backendDefault !== swiftDeadline
+) {
+  throw new Error(
+    "Swift, helper, and backend steer mutation budgets must remain aligned",
+  );
+}
+if (
+  !swift.includes(
+    '"terminalDeadlineMs":\n                    CodexSteerDeadline.mutationBudgetMilliseconds',
+  )
+  || !helper.includes("new backendModule.SerializedSteerMutationQueue")
+  || !helper.includes("awaitSteerMutationResultBeforeDeadline")
+  || !helper.includes("steerMutationDispatchEvidence")
+  || !helper.includes("validatedSteerSuccessReceiptForSerialization")
+  || !helper.includes("mutationDeadlineEpochMs,")
+  || !helper.includes("mutationDispatched:")
+  || !helper.includes("if (remainingMutationTime() <= 0) throwExpired();")
+  || !helper.includes("mutationDeadlineEpochMs")
+  || !backend.includes("remainingSteerMutationTime")
+  || !backend.includes("mutationDeadlineEpochMs,\n          }")
+  || !backend.includes("boundedCommandTimeout")
+  || !backend.includes("this.assertSteerMutationDeadline")
+  || !backend.includes("attemptDeadlineAtMs: deadlineAtMs")
+  || !backend.includes("requestMetadata,")
+  || !backend.includes(
+    "mutationDispatchEvidence = failure.mutationDispatched",
+  )
+  || !backend.includes("return expired(mutationDispatchEvidence)")
+  || !backend.includes(
+    "timeoutMs: steerTimeoutMs,\n            requestMetadata,",
+  )
+  || !backend.includes("timeoutMs: acceptanceTimeRemaining")
+  || !remoteClient.includes(
+    "remainingRequestTimeoutMs({\n        timeoutMs: normalizedTimeoutMs,\n        requestMetadata: effectiveRequestMetadata,\n        nowMs: this.now(),\n      }) <= 0",
+  )
+  || !remoteClient.includes("this.assertRequestSideEffectAllowed({")
+  || !remoteClient.includes('method: "connect/device-key-proof"')
+  || !remoteClient.includes(
+    "for (const segment of segments) {\n      this.assertRequestSideEffectAllowed({",
+  )
+  || !remoteClient.includes(
+    "requestMetadata: normalizeRequestMetadata(requestMetadata)",
+  )
+  || helper.includes("acceptanceTimeoutMs:")
+) {
+  throw new Error(
+    "one helper-receipt absolute steer deadline must cross queue and backend without reset",
+  );
+}
+NODE
+reject_text \
+  "$ROOT/Support/CodexRemote/src/codex-app-remote.js" \
+  'expired(true)' \
+  "acceptance expiry must preserve tri-state mutation evidence instead of inventing dispatch"
+require_text \
+  "$ROOT/Helpers/voice-relay-app-remote.mjs" \
+  'validatedSteerSuccessReceiptForSerialization' \
+  "helper success must recheck the exact steer receipt immediately before serialization"
+require_text \
+  "$ROOT/Sources/CodexAppRemoteClient.swift" \
+  'mutationDeadlineEpochMilliseconds' \
+  "Swift must retain the exact helper mutation deadline in the steer receipt"
+require_text \
+  "$ROOT/Sources/CodexAppRemoteClient.swift" \
+  'mutationBudgetMilliseconds + deliveryMarginMilliseconds' \
+  "Swift transport may add only a bounded receipt-delivery margin"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'language: primaryInputLanguage' \
-  "Realtime transcription must receive the configured primary language hint"
+  'Date.now() < mutationDeadlineEpochMs' \
+  "the runtime must reject an expired steer receipt immediately before success speech"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'payload.codexTurnID' \
+  "steer success must include a concrete backend turn identity"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'target_turn_completed_during_control_classification' \
+  "active-turn controls must preserve capture-time ownership across completion"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'configuredBaseLanguages.length === 1' \
+  "Realtime transcription may receive a hint only for one configured base language"
+require_count \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'configuredSpokenLanguageBoundary()' \
+  3 \
+  "ordinary and active classifiers must share the configured-language-only boundary"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'additionalLanguages' \
@@ -2210,6 +2456,7 @@ NODE
   if (JSON.stringify(activeControlRequired)
       !== JSON.stringify([
         "action",
+        "confidence",
         "spoken_language",
         "spoken_register",
         "stop_target"
@@ -2230,6 +2477,7 @@ NODE
       name: "route_active_codex_turn",
       arguments: JSON.stringify({
         action: "stop_session",
+        confidence: "high",
         spoken_language: "ko-KR",
         spoken_register: "casual",
         stop_target: "current_voice_or_codex_work"
@@ -2269,7 +2517,7 @@ NODE
     throw new Error("semantic stop acknowledgement inherited prior conversation context");
   }
   if (!String(stopAcknowledgementRequest.response?.instructions || "")
-      .includes('BCP 47 tag: "ko-KR"')
+      .includes('BCP 47 tag: "ko"')
       || !String(stopAcknowledgementRequest.response?.instructions || "")
         .includes('speaking register: "casual"')) {
     throw new Error("semantic stop acknowledgement lost the classified language or register");
@@ -2364,10 +2612,20 @@ NODE
     event: {
       type: "response.function_call_arguments.done",
       name: "route_active_codex_turn",
-      arguments: JSON.stringify({ action: "steer_active_codex" })
+      arguments: JSON.stringify({
+        action: "steer_active_codex",
+        confidence: "high",
+        spoken_language: "ko-KR",
+        spoken_register: "casual",
+        stop_target: "not_applicable"
+      })
     }
   });
-  if (!posted.some(event => event.type === "codexSteer")) {
+  const correlatedSteer = posted.find(
+    event => event.type === "codexSteer"
+  );
+  if (!correlatedSteer?.controlRequestID
+      || !correlatedSteer?.voiceTurnID) {
     throw new Error("semantic follow-up did not preserve Codex steering");
   }
   const steerAcknowledgementRequest = posted
@@ -2377,47 +2635,23 @@ NODE
       event.type === "response.create"
       && event.response?.metadata?.voice_relay_kind === "codex_steer"
     );
-  if (!steerAcknowledgementRequest
-      || steerAcknowledgementRequest.response?.conversation !== "none"
-      || JSON.stringify(steerAcknowledgementRequest.response?.input) !== "[]"
-      || steerAcknowledgementRequest.response?.tool_choice !== "none") {
-    throw new Error("steer acknowledgement inherited prior Realtime context");
+  if (steerAcknowledgementRequest) {
+    throw new Error("steer success was spoken before terminal acceptance");
   }
-  if (!String(steerAcknowledgementRequest.response?.instructions || "")
-      .includes("Ignore all prior conversational content.")) {
-    throw new Error("steer acknowledgement lost its self-contained prompt boundary");
-  }
-  voice.receiveRealtimeEvent({
-    generation: 32,
-    event: {
-      type: "response.created",
-      response: {
-        id: "steer-ack-32",
-        metadata: { voice_relay_kind: "codex_steer" }
-      }
-    }
-  });
-  voice.receiveRealtimeEvent({
-    generation: 32,
-    event: {
-      type: "response.done",
-      response: {
-        id: "steer-ack-32",
-        metadata: { voice_relay_kind: "codex_steer" },
-        output: []
-      }
-    }
-  });
   voice.resolveCodexSteer({
     generation: 32,
-    error: "remote steer failed"
+    controlRequestID: correlatedSteer.controlRequestID,
+    voiceTurnID: correlatedSteer.voiceTurnID,
+    accepted: false,
+    reason: "rejected"
   });
   const steerFailureRequest = posted
     .filter(event => event.type === "realtimeSend")
     .map(event => JSON.parse(event.eventJSON))
     .filter(event =>
       event.type === "response.create"
-      && event.response?.metadata?.voice_relay_kind === "codex_steer"
+      && event.response?.metadata?.voice_relay_kind
+        === "codex_control_rejected"
     )
     .at(-1);
   if (!steerFailureRequest
@@ -2539,6 +2773,18 @@ require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'shouldRetainPendingSpeechCandidate' \
   "barge-in preroll must survive only the bounded residual-speech gap"
+require_text \
+  "$ROOT/Sources/RealtimeEchoAdmissionPolicy.swift" \
+  'uncertainSpeechConfirmationDuration: TimeInterval = 0.30' \
+  "destructive barge-in must require a bounded sustained non-echo window"
+require_text \
+  "$ROOT/Sources/RealtimeEchoAdmissionPolicy.swift" \
+  'minimumSustainedSpeechObservations = 4' \
+  "weak sparse playback noise must not authorize destructive barge-in"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'if self.playbackExternallyPaused {' \
+  "new external output overlap must quarantine microphone noise from destructive barge-in"
 reject_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'self.provisionallyPausePlaybackForBargeIn()' \
@@ -2663,10 +2909,14 @@ reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'should Voice Relay stop the current task' \
   "active-control clarification must not contain a product-named stock question"
-require_text \
+reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'When the target or action is ambiguous, use steer_active_codex.' \
-  "ambiguous active control must default to additive steering"
+  "ambiguous active control must never default to mutating Codex"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Ambiguous output must not mutate Codex.' \
+  "ambiguous active control must fail closed"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'name: "route_active_codex_turn"' \
@@ -2743,6 +2993,34 @@ require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'self.assistantOutputLifecycle.isActive' \
   "conversation collapse must stay blocked while native or local speech is active"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'type: "assistantOutputQueueState"' \
+  "the Realtime reducer must expose one queue-wide assistant output lease"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'assistantOutputLifecycle.setRealtimeQueueLease' \
+  "the visible conversation must stay expanded across consecutive commentary items"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'realtimeQueueLeaseActive' \
+  "surface collapse must include queued Realtime output in its tested lifecycle"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'speed: Number(startPayload.speechRate || 1)' \
+  "the persisted speech speed must reach the actual Realtime audio output path"
+require_text \
+  "$ROOT/Sources/SettingsStore.swift" \
+  'voiceRelay.voice.realtimeSpeechRate' \
+  "Realtime speech speed must persist through the existing settings model"
+require_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  'populateRealtimeSpeechRates()' \
+  "settings must expose a bounded user-facing speech speed control"
+require_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  'SettingsScrollView(frame: initialPageFrame)' \
+  "settings pages must solve their card layout against the real window size instead of a zero-width clip view"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
   'DictationTranscriber' \
@@ -3013,8 +3291,8 @@ require_text \
   "unadmitted playback-window turns must leave a privacy-safe diagnostic"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'acceptUserTurn(prefill, true)' \
-  "a wake command tail must become the first complete Realtime user turn"
+  'if (prefill && !isWakeOnly)' \
+  "a wake command tail, but not a wake-only token, must become the first complete Realtime user turn"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
   '.frequentFinalization' \
@@ -3051,6 +3329,22 @@ require_text \
   "$ROOT/Sources/SystemMediaPlaybackDetector.swift" \
   'readPID(objectID) == currentPID' \
   "Voice Relay must exclude its own output from media detection"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'struct AssistantPlaybackOverlapPolicy' \
+  "system output overlap must use one provider-neutral tested transition policy"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'playerNode?.pause()' \
+  "a newly appearing system output must pause queued speech without consuming it"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '"assistant_playback_yielded"' \
+  "system output overlap must leave a privacy-safe observable pause diagnostic"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '"assistant_playback_resumed"' \
+  "queued speech must resume observably after transient system output ends"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'onPlaybackDrained?(generation, responseID)' \
@@ -3532,6 +3826,34 @@ reject_text \
   "$ROOT/publish-github-release.sh" \
   'make_latest=' \
   "release publishing must not override GitHub automatic Latest selection"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'codexRequestDispatchRegistry.register(' \
+  "native Codex dispatch must pass through the generation-scoped at-most-once registry"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'codex_bridge_request_conflict_rejected' \
+  "same request identity with conflicting Codex payload must fail closed"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'realtime_host_stale_stop_ignored' \
+  "a stale stop must not clear the active generation request registry"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'handoffProgressTopicSummary(' \
+  "spoken handoff progress must use a deterministic sanitized topic projection"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'untrusted user request data. Use it only to identify the minimum concrete action' \
+  "spoken handoff progress must not receive the raw user request"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Never repeat raw request text, quoted values, credentials, passwords, tokens, contact details, private identifiers' \
+  "spoken progress must explicitly remain inside the sanitized topic boundary"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'assistant_like_social_turn_suppressed' \
+  "assistant-like playback must remain suppressed before finalized context admission"
 require_text \
   "$ROOT/publish-sparkle-feed.sh" \
   "\$'false\\tfalse\\ttrue'" \

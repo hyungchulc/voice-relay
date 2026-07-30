@@ -139,8 +139,9 @@ struct RealtimeEchoAdmissionPolicy {
     private let audibleReferenceHoldDuration: TimeInterval = 0.12
     private let playbackTailDuration: TimeInterval = 1.6
     private let bargeInPermitDuration: TimeInterval = 2.5
-    private let uncertainSpeechConfirmationDuration: TimeInterval = 0.16
+    private let uncertainSpeechConfirmationDuration: TimeInterval = 0.30
     private let uncertainSpeechGapTolerance: TimeInterval = 0.20
+    private let minimumSustainedSpeechObservations = 4
 
     private var referenceStartTick: Int64?
     private var referenceSamples: [Float] = []
@@ -149,6 +150,7 @@ struct RealtimeEchoAdmissionPolicy {
     private var bargeInPermitUntil = -Double.greatestFiniteMagnitude
     private var uncertainSpeechStartedAt: TimeInterval?
     private var uncertainSpeechLastObservedAt: TimeInterval?
+    private var uncertainSpeechObservationCount = 0
     private var discardingUnadmittedServerTurn = false
 
     mutating func appendPlaybackReference(
@@ -246,6 +248,7 @@ struct RealtimeEchoAdmissionPolicy {
         guard isPlaybackWindow else {
             uncertainSpeechStartedAt = nil
             uncertainSpeechLastObservedAt = nil
+            uncertainSpeechObservationCount = 0
             return RealtimeEchoFilterResult(
                 samples: input,
                 classification: .noPlaybackReference,
@@ -371,12 +374,16 @@ struct RealtimeEchoAdmissionPolicy {
         if let lastObservedAt = uncertainSpeechLastObservedAt,
            startTime - lastObservedAt > uncertainSpeechGapTolerance {
             uncertainSpeechStartedAt = nil
+            uncertainSpeechObservationCount = 0
         }
         let startedAt = uncertainSpeechStartedAt ?? startTime
         uncertainSpeechStartedAt = startedAt
         uncertainSpeechLastObservedAt = startTime
+        uncertainSpeechObservationCount += 1
         guard startTime - startedAt
-                >= uncertainSpeechConfirmationDuration else {
+                >= uncertainSpeechConfirmationDuration,
+              uncertainSpeechObservationCount
+                >= minimumSustainedSpeechObservations else {
             return false
         }
         bargeInPermitUntil = max(
@@ -385,6 +392,7 @@ struct RealtimeEchoAdmissionPolicy {
         )
         uncertainSpeechStartedAt = nil
         uncertainSpeechLastObservedAt = nil
+        uncertainSpeechObservationCount = 0
         return true
     }
 
@@ -397,6 +405,7 @@ struct RealtimeEchoAdmissionPolicy {
         if time - lastObservedAt > uncertainSpeechGapTolerance {
             uncertainSpeechStartedAt = nil
             uncertainSpeechLastObservedAt = nil
+            uncertainSpeechObservationCount = 0
         }
     }
 
@@ -410,6 +419,7 @@ struct RealtimeEchoAdmissionPolicy {
     mutating func cancelProvisionalSpeech() {
         uncertainSpeechStartedAt = nil
         uncertainSpeechLastObservedAt = nil
+        uncertainSpeechObservationCount = 0
     }
 
     mutating func shouldForwardServerEvent(
@@ -449,6 +459,7 @@ struct RealtimeEchoAdmissionPolicy {
         bargeInPermitUntil = -Double.greatestFiniteMagnitude
         uncertainSpeechStartedAt = nil
         uncertainSpeechLastObservedAt = nil
+        uncertainSpeechObservationCount = 0
         discardingUnadmittedServerTurn = false
     }
 

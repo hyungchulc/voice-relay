@@ -466,12 +466,29 @@ export class CodexRemoteControlClient {
         streamId: this.streamId,
         streamGeneration: this.streamGeneration,
       });
-    await waitForOperationDeadline(this.ensureConnected(), {
-      deadlineAtMs: attemptDeadlineAtMs,
-      now: this.now,
-      signal,
-      timeoutError: createPreDispatchTimeout,
-    });
+    if (
+      remainingRequestTimeoutMs({
+        timeoutMs: normalizedTimeoutMs,
+        requestMetadata: effectiveRequestMetadata,
+        nowMs: this.now(),
+      }) <= 0
+    ) {
+      throw createPreDispatchTimeout();
+    }
+    await waitForOperationDeadline(
+      this.ensureConnected({
+        timeoutMs: normalizedTimeoutMs,
+        requestMetadata: effectiveRequestMetadata,
+        signal,
+        timeoutError: createPreDispatchTimeout,
+      }),
+      {
+        deadlineAtMs: attemptDeadlineAtMs,
+        now: this.now,
+        signal,
+        timeoutError: createPreDispatchTimeout,
+      },
+    );
     throwIfAborted(signal);
     const initializeTimeoutMs = remainingRequestTimeoutMs({
       timeoutMs: normalizedTimeoutMs,
@@ -482,7 +499,12 @@ export class CodexRemoteControlClient {
       throw createPreDispatchTimeout();
     }
     await waitForOperationDeadline(
-      this.ensureInitialized({ timeoutMs: initializeTimeoutMs }),
+      this.ensureInitialized({
+        timeoutMs: initializeTimeoutMs,
+        requestMetadata: effectiveRequestMetadata,
+        signal,
+        timeoutError: createPreDispatchTimeout,
+      }),
       {
         deadlineAtMs: attemptDeadlineAtMs,
         now: this.now,
@@ -535,10 +557,27 @@ export class CodexRemoteControlClient {
     return () => this.events.off("stream-initialized", listener);
   }
 
-  async ensureInitialized({ timeoutMs = this.requestTimeoutMs } = {}) {
+  async ensureInitialized({
+    timeoutMs = this.requestTimeoutMs,
+    requestMetadata = null,
+    signal = null,
+    timeoutError = null,
+  } = {}) {
     if (!this.initializePromise) {
       this.initializePromise = (async () => {
-        await this.ensureConnected();
+        this.assertRequestSideEffectAllowed({
+          method: "initialize",
+          timeoutMs,
+          requestMetadata,
+          signal,
+          timeoutError,
+        });
+        await this.ensureConnected({
+          timeoutMs,
+          requestMetadata,
+          signal,
+          timeoutError,
+        });
         await this.rawRequest(
           "initialize",
           {
@@ -552,9 +591,22 @@ export class CodexRemoteControlClient {
               requestAttestation: false,
             },
           },
-          { timeoutMs, resetStream: true },
+          {
+            timeoutMs,
+            resetStream: true,
+            requestMetadata,
+            signal,
+          },
         );
-        this.sendJsonRpc({ method: "initialized" });
+        this.sendJsonRpc(
+          { method: "initialized" },
+          {
+            timeoutMs,
+            requestMetadata,
+            signal,
+            timeoutError,
+          },
+        );
         this.emitStreamInitialized();
       })().catch((error) => {
         this.initializePromise = null;
@@ -641,13 +693,30 @@ export class CodexRemoteControlClient {
     };
   }
 
-  async ensureConnected() {
+  async ensureConnected({
+    timeoutMs = this.requestTimeoutMs,
+    requestMetadata = null,
+    signal = null,
+    timeoutError = null,
+  } = {}) {
     if (this.closed) {
       throw new Error("Remote control client is closed");
     }
+    this.assertRequestSideEffectAllowed({
+      method: "connect",
+      timeoutMs,
+      requestMetadata,
+      signal,
+      timeoutError,
+    });
     if (this.isConnected()) return;
     if (!this.connectPromise) {
-      this.connectPromise = this.connect().finally(() => {
+      this.connectPromise = this.connect({
+        timeoutMs,
+        requestMetadata,
+        signal,
+        timeoutError,
+      }).finally(() => {
         this.connectPromise = null;
       });
     }
@@ -671,7 +740,12 @@ export class CodexRemoteControlClient {
     };
   }
 
-  async connect() {
+  async connect({
+    timeoutMs = this.requestTimeoutMs,
+    requestMetadata = null,
+    signal = null,
+    timeoutError = null,
+  } = {}) {
     const enrollmentSession = await this.refreshEnrollment();
     const environments = await this.listEnvironments();
     const environmentId = await this.resolveEnvironmentId(environments);
@@ -696,6 +770,13 @@ export class CodexRemoteControlClient {
       headers["x-codex-subscribe-cursor"] = this.cursor;
     }
 
+    this.assertRequestSideEffectAllowed({
+      method: "connect",
+      timeoutMs,
+      requestMetadata,
+      signal,
+      timeoutError,
+    });
     const ws = new this.WebSocketImpl(this.webSocketUrl(), {
       headers,
       perMessageDeflate: false,
@@ -707,6 +788,10 @@ export class CodexRemoteControlClient {
       remoteControlToken: enrollmentSession.remoteControlToken,
       tokenExpiresAt: enrollmentSession.tokenExpiresAt,
       scopes: enrollmentSession.scopes,
+      timeoutMs,
+      requestMetadata,
+      signal,
+      timeoutError,
     });
 
     this.ws = ws;
@@ -727,6 +812,10 @@ export class CodexRemoteControlClient {
     remoteControlToken,
     tokenExpiresAt,
     scopes,
+    timeoutMs = this.requestTimeoutMs,
+    requestMetadata = null,
+    signal = null,
+    timeoutError = null,
     webSocketOpenTimeoutMs = WEBSOCKET_OPEN_TIMEOUT_MS,
     deviceKeyChallengeTimeoutMs = DEVICE_KEY_CHALLENGE_TIMEOUT_MS,
   }) {
@@ -773,6 +862,13 @@ export class CodexRemoteControlClient {
           scopes: challenge.scopes,
         },
       );
+      this.assertRequestSideEffectAllowed({
+        method: "connect/device-key-proof",
+        timeoutMs,
+        requestMetadata,
+        signal,
+        timeoutError,
+      });
       ws.send(
         JSON.stringify({
           type: "device_key_proof",
@@ -1236,6 +1332,12 @@ export class CodexRemoteControlClient {
       try {
         const envelope = this.sendJsonRpc(
           params === undefined ? { id, method } : { id, method, params },
+          {
+            timeoutMs: normalizedTimeoutMs,
+            requestMetadata: pending.requestMetadata,
+            signal,
+            timeoutError: createTimeoutError,
+          },
         );
         pending.envelopeKey = envelopeKey(envelope);
       } catch (error) {
@@ -1258,10 +1360,25 @@ export class CodexRemoteControlClient {
     return true;
   }
 
-  sendJsonRpc(message) {
+  sendJsonRpc(
+    message,
+    {
+      timeoutMs = this.requestTimeoutMs,
+      requestMetadata = null,
+      signal = null,
+      timeoutError = null,
+    } = {},
+  ) {
     if (!this.isConnected()) {
       throw new Error("Remote control websocket is not connected");
     }
+    this.assertRequestSideEffectAllowed({
+      method: String(message?.method || "json-rpc"),
+      timeoutMs,
+      requestMetadata,
+      signal,
+      timeoutError,
+    });
     this.ensureStreamIdentity();
     const envelope = {
       type: "client_message",
@@ -1277,9 +1394,16 @@ export class CodexRemoteControlClient {
       envelope,
       acknowledgedSegments: new Set(),
       segmentCount: null,
+      requestMetadata: normalizeRequestMetadata(requestMetadata),
+      timeoutMs,
     });
     try {
-      this.sendEnvelope(envelope);
+      this.sendEnvelope(envelope, {
+        timeoutMs,
+        requestMetadata,
+        signal,
+        timeoutError,
+      });
     } catch (error) {
       this.unacked.delete(key);
       throw error;
@@ -1287,7 +1411,15 @@ export class CodexRemoteControlClient {
     return envelope;
   }
 
-  sendEnvelope(envelope) {
+  sendEnvelope(
+    envelope,
+    {
+      timeoutMs = this.requestTimeoutMs,
+      requestMetadata = null,
+      signal = null,
+      timeoutError = null,
+    } = {},
+  ) {
     if (!this.isConnected()) {
       throw new Error("Remote control websocket is not connected");
     }
@@ -1295,14 +1427,68 @@ export class CodexRemoteControlClient {
     const state = this.unacked.get(envelopeKey(envelope));
     if (state) state.segmentCount = segments.length;
     for (const segment of segments) {
+      this.assertRequestSideEffectAllowed({
+        method: String(envelope?.message?.method || "websocket-send"),
+        timeoutMs,
+        requestMetadata,
+        signal,
+        timeoutError,
+      });
       this.ws.send(JSON.stringify(segment));
     }
   }
 
   replayUnacked() {
-    for (const state of this.unacked.values()) {
-      this.sendEnvelope(state.envelope);
+    for (const [key, state] of this.unacked.entries()) {
+      const requestMetadata = normalizeRequestMetadata(
+        state.requestMetadata,
+      );
+      if (
+        requestMetadata
+        && remainingRequestTimeoutMs({
+          timeoutMs: state.timeoutMs,
+          requestMetadata,
+          nowMs: this.now(),
+        }) <= 0
+      ) {
+        this.unacked.delete(key);
+        continue;
+      }
+      this.sendEnvelope(state.envelope, {
+        timeoutMs: state.timeoutMs,
+        requestMetadata,
+      });
     }
+  }
+
+  assertRequestSideEffectAllowed({
+    method,
+    timeoutMs,
+    requestMetadata,
+    signal = null,
+    timeoutError = null,
+  }) {
+    throwIfAborted(signal);
+    if (!requestMetadata) return;
+    if (
+      remainingRequestTimeoutMs({
+        timeoutMs,
+        requestMetadata,
+        nowMs: this.now(),
+      }) > 0
+    ) {
+      return;
+    }
+    if (typeof timeoutError === "function") {
+      throw timeoutError();
+    }
+    throw preDispatchTimeoutError({
+      method,
+      timeoutMs,
+      requestMetadata,
+      streamId: this.streamId,
+      streamGeneration: this.streamGeneration,
+    });
   }
 
   handleAck(envelope) {

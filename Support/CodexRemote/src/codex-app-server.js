@@ -177,6 +177,7 @@ export class CodexAppServerBackend {
         threadId: this.threadId,
         cwd: this.cwd,
         model: this.model || null,
+        reasoningEffort: this.reasoningEffort || null,
       });
       turnStarted = await this.client.request("turn/start", {
         threadId: this.threadId,
@@ -517,6 +518,36 @@ export class CodexAppServerBackend {
     this.modelProfile = null;
   }
 
+  effectiveThreadConfig() {
+    const config = { ...(this.threadConfig || {}) };
+    if (this.model) config.model = this.model;
+    if (this.reasoningEffort) {
+      config.model_reasoning_effort = this.reasoningEffort;
+    }
+    return Object.keys(config).length ? config : null;
+  }
+
+  resolvedThreadProfile(response, operation) {
+    const profile = {
+      model: response?.model || null,
+      reasoningEffort: response?.reasoningEffort || null,
+    };
+    if (this.model && profile.model !== this.model) {
+      throw new Error(
+        `Codex app-server ${operation} resolved model mismatch: expected ${this.model}, received ${profile.model || "missing"}`,
+      );
+    }
+    if (
+      this.reasoningEffort &&
+      profile.reasoningEffort !== this.reasoningEffort
+    ) {
+      throw new Error(
+        `Codex app-server ${operation} resolved reasoning effort mismatch: expected ${this.reasoningEffort}, received ${profile.reasoningEffort || "missing"}`,
+      );
+    }
+    return profile;
+  }
+
   async ensureThreadResumed() {
     if (!this.resumePromise) {
       this.resumePromise = (async () => {
@@ -525,6 +556,7 @@ export class CodexAppServerBackend {
           threadId: this.threadId,
           cwd: this.cwd,
           model: this.model || null,
+          reasoningEffort: this.reasoningEffort || null,
           timeoutMs: this.resumeTimeoutMs,
         });
         const response = await this.client.request("thread/resume", {
@@ -532,15 +564,15 @@ export class CodexAppServerBackend {
           cwd: this.cwd,
           approvalPolicy: this.approvalPolicy,
           sandbox: this.sandbox,
-          config: this.threadConfig,
+          config: this.effectiveThreadConfig(),
           model: this.model || null,
         }, {
           timeoutMs: this.resumeTimeoutMs,
         });
-        this.resumedThread = {
-          model: response?.model || null,
-          reasoningEffort: response?.reasoningEffort || null,
-        };
+        this.resumedThread = this.resolvedThreadProfile(
+          response,
+          "thread/resume",
+        );
         this.diag("thread_resumed", {
           threadId: this.threadId,
           durationMs: Date.now() - startedAt,
@@ -563,13 +595,14 @@ export class CodexAppServerBackend {
         this.diag("thread_start_call", {
           cwd: this.cwd,
           model: this.model || null,
+          reasoningEffort: this.reasoningEffort || null,
           timeoutMs: this.requestTimeoutMs,
         });
         const response = await this.client.request("thread/start", {
           cwd: this.cwd,
           approvalPolicy: this.approvalPolicy,
           sandbox: this.sandbox,
-          config: this.threadConfig,
+          config: this.effectiveThreadConfig(),
           model: this.model || null,
           threadSource: "automation",
         });
@@ -577,11 +610,9 @@ export class CodexAppServerBackend {
         if (!threadId) {
           throw new Error("Codex app-server thread/start did not return a thread id");
         }
+        const profile = this.resolvedThreadProfile(response, "thread/start");
         this.threadId = threadId;
-        this.resumedThread = {
-          model: response?.model || null,
-          reasoningEffort: response?.reasoningEffort || null,
-        };
+        this.resumedThread = profile;
         this.diag("thread_started", {
           threadId: this.threadId,
           durationMs: Date.now() - startedAt,
@@ -713,6 +744,7 @@ export class CodexAppServerBackend {
         threadId: this.threadId,
         cwd: this.cwd,
         model: this.model || null,
+        reasoningEffort: this.reasoningEffort || null,
       });
       turnStarted = await this.client.request("turn/start", {
         threadId: this.threadId,

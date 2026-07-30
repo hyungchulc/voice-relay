@@ -165,6 +165,7 @@ struct AppSettings: Equatable {
 
     var realtimeModel: String
     var realtimeVoice: String
+    var realtimeSpeechRate: Double
     var realtimeReasoningEffort: String
     var realtimeInstructions: String
 
@@ -220,6 +221,7 @@ struct AppSettings: Equatable {
             additionalContextProvidersRoot: "",
             realtimeModel: "gpt-realtime-2.1",
             realtimeVoice: "marin",
+            realtimeSpeechRate: 1.0,
             realtimeReasoningEffort: "high",
             realtimeInstructions: SettingsStore.defaultRealtimeInstructions
         )
@@ -388,6 +390,8 @@ final class SettingsStore {
             "voiceRelay.additionalContext.providersRoot"
         static let realtimeModel = "voiceRelay.voice.realtimeModel"
         static let realtimeVoice = "voiceRelay.voice.realtimeVoice"
+        static let realtimeSpeechRate =
+            "voiceRelay.voice.realtimeSpeechRate"
         static let realtimeReasoningEffort = "voiceRelay.voice.realtimeReasoningEffort"
         static let realtimeInstructions = "voiceRelay.voice.realtimeInstructions"
     }
@@ -550,6 +554,11 @@ final class SettingsStore {
             ),
             realtimeVoice: Self.normalizedRealtimeVoice(
                 defaults.string(forKey: Key.realtimeVoice) ?? fallback.realtimeVoice
+            ),
+            realtimeSpeechRate: Self.clampedRealtimeSpeechRate(
+                defaults.object(forKey: Key.realtimeSpeechRate) == nil
+                    ? fallback.realtimeSpeechRate
+                    : defaults.double(forKey: Key.realtimeSpeechRate)
             ),
             realtimeReasoningEffort: Self.normalizedRealtimeReasoningEffort(
                 defaults.string(forKey: Key.realtimeReasoningEffort)
@@ -766,6 +775,10 @@ final class SettingsStore {
         )
         defaults.set(Self.normalizedRealtimeModel(settings.realtimeModel), forKey: Key.realtimeModel)
         defaults.set(Self.normalizedRealtimeVoice(settings.realtimeVoice), forKey: Key.realtimeVoice)
+        defaults.set(
+            Self.clampedRealtimeSpeechRate(settings.realtimeSpeechRate),
+            forKey: Key.realtimeSpeechRate
+        )
         defaults.set(
             Self.normalizedRealtimeReasoningEffort(settings.realtimeReasoningEffort),
             forKey: Key.realtimeReasoningEffort
@@ -1068,6 +1081,13 @@ final class SettingsStore {
             allowed: Set(supportedRealtimeVoices),
             fallback: AppSettings.defaults.realtimeVoice
         )
+    }
+
+    static func clampedRealtimeSpeechRate(_ value: Double) -> Double {
+        guard value.isFinite else {
+            return AppSettings.defaults.realtimeSpeechRate
+        }
+        return min(1.5, max(0.25, value))
     }
 
     static func normalizedRealtimeReasoningEffort(_ value: String) -> String {

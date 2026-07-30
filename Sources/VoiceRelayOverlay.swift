@@ -37,6 +37,7 @@ private struct AppConfig {
     let authorityPackFingerprint: String
     let realtimeModel: String
     let realtimeVoice: String
+    let realtimeSpeechRate: Double
     let realtimeReasoningEffort: String
     let realtimeInstructions: String
     let returnGreetingEnabled: Bool
@@ -128,6 +129,11 @@ private struct AppConfig {
             ),
             realtimeVoice: SettingsStore.normalizedRealtimeVoice(
                 env["VOICE_RELAY_REALTIME_VOICE"] ?? settings.realtimeVoice
+            ),
+            realtimeSpeechRate: SettingsStore.clampedRealtimeSpeechRate(
+                Double(
+                    env["VOICE_RELAY_REALTIME_SPEECH_RATE"] ?? ""
+                ) ?? settings.realtimeSpeechRate
             ),
             realtimeReasoningEffort: SettingsStore.normalizedRealtimeReasoningEffort(
                 env["VOICE_RELAY_REALTIME_REASONING"] ?? settings.realtimeReasoningEffort
@@ -878,6 +884,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private lazy var realtimeController = DirectRealtimeController(
         model: config.realtimeModel,
         voice: config.realtimeVoice,
+        speechRate: config.realtimeSpeechRate,
         reasoningEffort: config.realtimeReasoningEffort,
         instructions: config.realtimeInstructions,
         language: config.speechLocale,
@@ -2410,26 +2417,27 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             guard let self, self.resolvedAnchor == .orb else { return }
             self.orbView.updateAudioLevel(level)
         }
-        realtimeController.onCodexRequest = { [weak self] text, completion in
+        realtimeController.onCodexRequest = {
+            [weak self] request, completion in
             guard let self else {
                 completion(.failure(CodexAppRemoteError.processExited("앱이 닫혔어")))
                 return
             }
             let generation = self.voiceState.generation
             self.performCodexRequest(
-                text,
+                request.codexInput,
                 generation: generation,
                 displayResult: false,
                 finishSurface: false,
                 completion: completion
             )
         }
-        realtimeController.onCodexSteer = { [weak self] text, completion in
+        realtimeController.onCodexSteer = { [weak self] request, completion in
             guard let self else {
                 completion(.failure(CodexAppRemoteError.processExited("앱이 닫혔어")))
                 return
             }
-            self.codexClient.steerActiveTurn(text, completion: completion)
+            self.codexClient.steerActiveTurn(request, completion: completion)
         }
         realtimeController.onSDPOffer = { [weak self] sdp, completion in
             guard let self else {
@@ -2666,6 +2674,27 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             scheduleConversationCollapse(
                 delay: max(config.collapseDelay, 1.1)
             )
+        case "assistantOutputQueueState":
+            guard let active = event["active"] as? Bool else { return }
+            let becameIdle =
+                assistantOutputLifecycle.setRealtimeQueueLease(
+                    generation: generation,
+                    active: active
+                )
+            if active {
+                hoverCollapseWorkItem?.cancel()
+                hoverCollapseWorkItem = nil
+                isReplyPreviewVisible = true
+                showConversationHistory(
+                    animated: !answerTargetVisible && config.animateSurface
+                )
+            } else if becameIdle {
+                replyRetainUntil =
+                    NotchAnswerLifecyclePolicy.retentionDeadline()
+                scheduleConversationCollapse(
+                    delay: max(config.collapseDelay, 1.1)
+                )
+            }
         case "stopIntent":
             beginRealtimeSpokenStop(generation: generation)
         case "stopAcknowledgementFinal":

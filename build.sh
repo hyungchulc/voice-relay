@@ -38,6 +38,7 @@ SOURCES=(
   "$ROOT/Sources/AppLocalization.swift"
   "$ROOT/Sources/AmbientBackdropView.swift"
   "$ROOT/Sources/VoiceRelayOverlay.swift"
+  "$ROOT/Sources/VoiceCodexRequestEnvelope.swift"
   "$ROOT/Sources/AuthorityPackComposer.swift"
   "$ROOT/Sources/CodexAppRemoteClient.swift"
   "$ROOT/Sources/LaunchAtLoginManager.swift"
@@ -97,6 +98,7 @@ xcrun swiftc \
   "$ROOT/Sources/OverlayPlacement.swift" \
   "$ROOT/Sources/PresenceMonitor.swift" \
   "$ROOT/Sources/SettingsStore.swift" \
+  "$ROOT/Sources/VoiceCodexRequestEnvelope.swift" \
   "$ROOT/Sources/VoiceSurfacePolicy.swift" \
   "$ROOT/Sources/RealtimeAudioAdmissionPolicy.swift" \
   "$ROOT/Sources/RealtimeEchoAdmissionPolicy.swift" \

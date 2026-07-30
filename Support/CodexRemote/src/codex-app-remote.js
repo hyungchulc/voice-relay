@@ -25,6 +25,179 @@ export const FULL_ACCESS_PERMISSIONS = Object.freeze({
 });
 const MAX_EXACT_ACCEPTANCE_SCAN_BYTES = 16 * 1024 * 1024;
 
+export class SteerMutationDeadlineExpiredError extends Error {
+  constructor({ mutationDispatched = false } = {}) {
+    super("The additional instruction deadline expired");
+    this.name = "SteerMutationDeadlineExpiredError";
+    this.code = "APP_REMOTE_STEER_DEADLINE_EXPIRED";
+    this.followupMutationDispatched =
+      mutationDispatched === true
+        ? true
+        : mutationDispatched === false
+          ? false
+          : null;
+    this.preDispatch = this.followupMutationDispatched === false;
+    this.followupFailurePhase =
+      this.followupMutationDispatched === false
+        ? "steer_mutation_deadline_pre_dispatch"
+        : this.followupMutationDispatched === true
+          ? "steer_mutation_deadline_post_dispatch"
+          : "steer_mutation_deadline_post_await_unknown";
+    this.followupSafeToRetry = false;
+  }
+}
+
+export function remainingSteerMutationTime(
+  mutationDeadlineEpochMs,
+  nowMs,
+) {
+  const deadline = Math.trunc(Number(mutationDeadlineEpochMs));
+  const now = Math.trunc(Number(nowMs));
+  if (!Number.isSafeInteger(deadline) || !Number.isSafeInteger(now)) {
+    return 0;
+  }
+  return Math.max(0, deadline - now);
+}
+
+export function steerMutationDispatchEvidence(result) {
+  if (result?.status === "steered") return true;
+  if (result?.mutationDispatched === true) return true;
+  if (result?.mutationDispatched === false) return false;
+  return null;
+}
+
+export function steerFailureErrorForResult(result) {
+  const mutationDispatched = steerMutationDispatchEvidence(result);
+  if (
+    result?.deadlineExpired === true
+    || String(result?.reason || "") === "steer_deadline_expired"
+  ) {
+    return new SteerMutationDeadlineExpiredError({
+      mutationDispatched,
+    });
+  }
+
+  const error = new Error(
+    String(
+      result?.reason
+        || "The additional instruction was not added to the active Codex task",
+    ),
+  );
+  error.code = "APP_REMOTE_STEER_FAILED";
+  if (Object.hasOwn(Object(result), "mutationDispatched")) {
+    error.followupMutationDispatched = mutationDispatched;
+  }
+  if (typeof result?.failurePhase === "string") {
+    error.followupFailurePhase = result.failurePhase;
+  }
+  if (typeof result?.safeToRetry === "boolean") {
+    error.followupSafeToRetry = result.safeToRetry;
+  }
+  return error;
+}
+
+export async function awaitSteerMutationResultBeforeDeadline({
+  operation,
+  mutationDeadlineEpochMs,
+  now = () => Date.now(),
+}) {
+  if (typeof operation !== "function") {
+    throw new TypeError("Steer mutation operation must be a function");
+  }
+  if (
+    remainingSteerMutationTime(
+      mutationDeadlineEpochMs,
+      now(),
+    ) <= 0
+  ) {
+    throw new SteerMutationDeadlineExpiredError({
+      mutationDispatched: false,
+    });
+  }
+  const result = await operation();
+  if (
+    remainingSteerMutationTime(
+      mutationDeadlineEpochMs,
+      now(),
+    ) <= 0
+  ) {
+    throw new SteerMutationDeadlineExpiredError({
+      mutationDispatched: steerMutationDispatchEvidence(result),
+    });
+  }
+  return result;
+}
+
+export function validatedSteerSuccessReceiptForSerialization(
+  receipt,
+  { now = () => Date.now() } = {},
+) {
+  if (receipt?.status !== "steered") return receipt;
+  const mutationDeadlineEpochMs = Math.trunc(
+    Number(receipt?.mutationDeadlineEpochMs),
+  );
+  if (
+    !Number.isSafeInteger(mutationDeadlineEpochMs)
+    || remainingSteerMutationTime(
+      mutationDeadlineEpochMs,
+      now(),
+    ) <= 0
+  ) {
+    throw new SteerMutationDeadlineExpiredError({
+      mutationDispatched:
+        steerMutationDispatchEvidence(receipt) ?? true,
+    });
+  }
+  return receipt;
+}
+
+export class SerializedSteerMutationQueue {
+  constructor({
+    now = () => Date.now(),
+    mutationBudgetMs,
+  }) {
+    const budget = Math.trunc(Number(mutationBudgetMs));
+    if (!Number.isSafeInteger(budget) || budget <= 0) {
+      throw new Error("Steer mutation budget must be a positive integer");
+    }
+    this.now = now;
+    this.mutationBudgetMs = budget;
+    this.tail = Promise.resolve();
+  }
+
+  enqueue(operation) {
+    if (typeof operation !== "function") {
+      throw new TypeError("Steer mutation operation must be a function");
+    }
+    const receivedAtMs = Math.trunc(Number(this.now()));
+    const mutationDeadlineEpochMs =
+      receivedAtMs + this.mutationBudgetMs;
+    if (
+      !Number.isSafeInteger(receivedAtMs)
+      || !Number.isSafeInteger(mutationDeadlineEpochMs)
+    ) {
+      throw new Error("Steer mutation deadline is invalid");
+    }
+    const run = async () => {
+      if (
+        remainingSteerMutationTime(
+          mutationDeadlineEpochMs,
+          this.now(),
+        ) <= 0
+      ) {
+        throw new SteerMutationDeadlineExpiredError();
+      }
+      return operation({
+        receivedAtMs,
+        mutationDeadlineEpochMs,
+      });
+    };
+    const result = this.tail.then(run, run);
+    this.tail = result.catch(() => {});
+    return result;
+  }
+}
+
 export class CodexAppRemoteBackend {
   constructor({
     remoteDebugUrl,
@@ -60,7 +233,6 @@ export class CodexAppRemoteBackend {
     waitReplies = waitForCodexReplies,
     taskScopedFollowupEvidence = createSessionLogTaskScopedFollowupEvidence(),
     now = () => Date.now(),
-    steerAcceptanceForegroundTimeoutMs = 15_000,
     steerAcceptanceTimeoutMs = responseTimeoutMs,
   }) {
     const restoredState = this.readStateFromPath(statePath);
@@ -74,12 +246,8 @@ export class CodexAppRemoteBackend {
     this.waitReplies = waitReplies;
     this.taskScopedFollowupEvidence = taskScopedFollowupEvidence;
     this.now = now;
-    this.steerAcceptanceForegroundTimeoutMs = Math.max(
-      1,
-      Number(steerAcceptanceForegroundTimeoutMs) || 15_000,
-    );
     this.steerAcceptanceTimeoutMs = Math.max(
-      this.steerAcceptanceForegroundTimeoutMs + 1,
+      1,
       Number(steerAcceptanceTimeoutMs) || responseTimeoutMs,
     );
     this.activeTurn = null;
@@ -776,8 +944,29 @@ export class CodexAppRemoteBackend {
     const requestId =
       normalizedFollowupRequestToken(options?.requestToken) ||
       `voice-relay-steer-app-remote-${this.now()}`;
-    const preEnterStartedAt = Date.now();
+    const mutationDeadlineEpochMs = Math.trunc(
+      Number(options?.mutationDeadlineEpochMs),
+    );
+    const preEnterStartedAt = this.now();
+    const expired = (mutationDispatched = false) => ({
+      status: "failed",
+      reason: "steer_deadline_expired",
+      requestId,
+      mutationDispatched,
+      deadlineExpired: true,
+    });
+    const remainingMutationTime = () =>
+      remainingSteerMutationTime(
+        mutationDeadlineEpochMs,
+        this.now(),
+      );
     if (!prompt) throw new Error("Steer note cannot be empty");
+    if (
+      !Number.isSafeInteger(mutationDeadlineEpochMs)
+      || remainingMutationTime() <= 0
+    ) {
+      return expired(false);
+    }
     if (!this.activeTurn) {
       return {
         status: "ignored",
@@ -794,10 +983,18 @@ export class CodexAppRemoteBackend {
       };
     }
     active.steerPending = true;
-    let acceptancePending = false;
     try {
       if (!active.turnId || !active.threadId) {
-        const accepted = await waitForDeferred(active.acceptance, 15_000);
+        const activeAcceptanceTime = Math.min(
+          15_000,
+          remainingMutationTime(),
+        );
+        if (activeAcceptanceTime <= 0) return expired(false);
+        const accepted = await waitForDeferred(
+          active.acceptance,
+          activeAcceptanceTime,
+        );
+        if (remainingMutationTime() <= 0) return expired(false);
         if (
           !accepted ||
           this.activeTurn !== active ||
@@ -808,10 +1005,12 @@ export class CodexAppRemoteBackend {
           return { status: "ignored", reason: "active_turn_not_accepted", requestId };
         }
       }
+      if (remainingMutationTime() <= 0) return expired(false);
       const capture = await this.taskScopedFollowupEvidence.capture({
         rootSessionId: active.threadId,
         turnId: active.turnId,
       });
+      if (remainingMutationTime() <= 0) return expired(false);
       if (this.activeTurn !== active || active.cancelRequested) {
         return { status: "ignored", reason: "active_turn_cancelled", requestId };
       }
@@ -822,12 +1021,15 @@ export class CodexAppRemoteBackend {
       if (!Number.isSafeInteger(capturedOffset) || capturedOffset < 0) {
         return { status: "failed", reason: "missing_same_turn_ack", requestId };
       }
-      const captureCompletedAt = Date.now();
+      const captureCompletedAt = this.now();
+      const dispatchTimeRemaining = remainingMutationTime();
+      if (dispatchTimeRemaining <= 0) return expired(false);
       active.steerDispatching = true;
       console.log(
         `${new Date().toISOString()} app-remote steer ${requestId} dispatching same-turn follow-up without conversation resume`,
       );
       let dispatchError = null;
+      let mutationDispatchEvidence = false;
       let composerSubmittedAt = null;
       try {
         await this.invokeCommand(
@@ -843,7 +1045,10 @@ export class CodexAppRemoteBackend {
             serviceTier: null,
             messageMetadata: { source: "voice_relay_remote_steer" },
           },
-          { timeoutMs: 60_000 },
+          {
+            timeoutMs: Math.min(60_000, dispatchTimeRemaining),
+            mutationDeadlineEpochMs,
+          },
         );
         const currentStreamGeneration = normalizedRemoteStreamGeneration(
           this.remoteControlClient?.streamGeneration,
@@ -851,10 +1056,15 @@ export class CodexAppRemoteBackend {
         if (currentStreamGeneration !== null) {
           active.remoteStreamGeneration = currentStreamGeneration;
         }
+        mutationDispatchEvidence = true;
         composerSubmittedAt = new Date(this.now()).toISOString();
       } catch (error) {
         dispatchError = error;
+        if (error?.code === "APP_REMOTE_STEER_DEADLINE_EXPIRED") {
+          return expired(error.followupMutationDispatched);
+        }
         const failure = exactFollowupFailureDetails(error);
+        mutationDispatchEvidence = failure.mutationDispatched;
         if (failure.safeToRetry && failure.mutationDispatched === false) {
           return {
             status: "failed",
@@ -864,7 +1074,7 @@ export class CodexAppRemoteBackend {
           };
         }
       }
-      const dispatchCompletedAt = Date.now();
+      const dispatchCompletedAt = this.now();
       const preEnterTimings = {
         captureMs: Math.max(0, captureCompletedAt - preEnterStartedAt),
         dispatchMs: Math.max(0, dispatchCompletedAt - captureCompletedAt),
@@ -875,6 +1085,13 @@ export class CodexAppRemoteBackend {
         await this.interruptLifecycle(active);
         return { status: "ignored", reason: "active_turn_cancelled", requestId };
       }
+      const acceptanceTimeRemaining = Math.min(
+        this.steerAcceptanceTimeoutMs,
+        remainingMutationTime(),
+      );
+      if (acceptanceTimeRemaining <= 0) {
+        return expired(mutationDispatchEvidence);
+      }
       const pendingAcceptance = Promise.resolve(
         this.taskScopedFollowupEvidence.waitForAcceptance({
           sessionFile: capture.sessionFile,
@@ -882,7 +1099,7 @@ export class CodexAppRemoteBackend {
           turnId: active.turnId,
           afterOffset: capturedOffset,
           requestToken: requestId,
-          timeoutMs: this.steerAcceptanceTimeoutMs,
+          timeoutMs: acceptanceTimeRemaining,
         }),
       )
         .then((accepted) => {
@@ -896,6 +1113,12 @@ export class CodexAppRemoteBackend {
             prompt,
             requestId,
           });
+          if (acceptedResult.status === "steered") {
+            mutationDispatchEvidence = true;
+          }
+          if (remainingMutationTime() <= 0) {
+            return expired(mutationDispatchEvidence);
+          }
           if (acceptedResult.status === "steered" || !dispatchError) {
             return acceptedResult;
           }
@@ -905,42 +1128,24 @@ export class CodexAppRemoteBackend {
             ...exactFollowupFailureDetails(dispatchError),
           };
         })
-        .catch(() => ({
-          status: "failed",
-          reason: dispatchError
-            ? "delivery_unconfirmed"
-            : "missing_same_turn_ack",
-          requestId,
-          composerSubmittedAt,
-          ...(dispatchError ? exactFollowupFailureDetails(dispatchError) : {}),
-        }));
-      const foregroundAcceptance = await waitForPromise(
-        pendingAcceptance,
-        this.steerAcceptanceForegroundTimeoutMs,
-      );
-      if (foregroundAcceptance.settled) return foregroundAcceptance.value;
-
-      acceptancePending = true;
-      void pendingAcceptance.finally(() => {
-        if (this.activeTurn?.requestId === active.requestId) {
-          this.activeTurn.steerPending = false;
-          this.activeTurn.steerDispatching = false;
-        }
-      });
-      return {
-        status: "submitted_pending_ack",
-        requestId,
-        turnId: active.turnId,
-        prompt,
-        composerSubmittedAt,
-        preEnterTimings,
-        dispatchOutcome: dispatchError ? "ambiguous" : "acknowledged",
-        ...(dispatchError ? exactFollowupFailureDetails(dispatchError) : {}),
-        incorporated: false,
-        pendingAcceptance,
-      };
+        .catch(() =>
+          remainingMutationTime() <= 0
+            ? expired(mutationDispatchEvidence)
+            : {
+                status: "failed",
+                reason: dispatchError
+                  ? "delivery_unconfirmed"
+                  : "missing_same_turn_ack",
+                requestId,
+                composerSubmittedAt,
+                ...(dispatchError
+                  ? exactFollowupFailureDetails(dispatchError)
+                  : {}),
+              },
+        );
+      return await pendingAcceptance;
     } finally {
-      if (!acceptancePending && this.activeTurn?.requestId === active.requestId) {
+      if (this.activeTurn?.requestId === active.requestId) {
         this.activeTurn.steerPending = false;
         this.activeTurn.steerDispatching = false;
       }
@@ -1195,7 +1400,14 @@ export class RemoteControlCommandDispatcher {
     this.threadResidencyById = new Map();
   }
 
-  async invoke(command, params = {}, { timeoutMs = 60_000 } = {}) {
+  async invoke(
+    command,
+    params = {},
+    {
+      timeoutMs = 60_000,
+      mutationDeadlineEpochMs = null,
+    } = {},
+  ) {
     switch (command) {
       case "send-cli-request-for-host":
         return this.client.request(params.method, params.params, {
@@ -1208,7 +1420,10 @@ export class RemoteControlCommandDispatcher {
       case "update-thread-settings-for-next-turn":
         return this.updateThreadSettings(params);
       case "send-follow-up-message":
-        return this.sendFollowup(params, { timeoutMs });
+        return this.sendFollowup(params, {
+          timeoutMs,
+          mutationDeadlineEpochMs,
+        });
       case "start-conversation":
         return this.startConversation(params, { timeoutMs });
       case "interrupt-conversation":
@@ -1222,7 +1437,13 @@ export class RemoteControlCommandDispatcher {
     }
   }
 
-  async resumeConversation(params, { timeoutMs }) {
+  async resumeConversation(
+    params,
+    {
+      timeoutMs,
+      mutationDeadlineEpochMs = null,
+    },
+  ) {
     const threadId = requiredString(
       params.conversationId,
       "Remote controller conversation id",
@@ -1248,9 +1469,14 @@ export class RemoteControlCommandDispatcher {
       }
       try {
         const thread = await this.readThread(threadId, {
-          timeoutMs,
+          timeoutMs: this.boundedCommandTimeout(
+            timeoutMs,
+            mutationDeadlineEpochMs,
+          ),
           phase: "resident_thread_reconciliation",
+          mutationDeadlineEpochMs,
         });
+        this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
         this.markThreadResident({
           threadId,
           model,
@@ -1267,9 +1493,14 @@ export class RemoteControlCommandDispatcher {
     if (params.forceResume !== true) {
       try {
         const thread = await this.readThread(threadId, {
-          timeoutMs,
+          timeoutMs: this.boundedCommandTimeout(
+            timeoutMs,
+            mutationDeadlineEpochMs,
+          ),
           phase: "thread_residency_probe",
+          mutationDeadlineEpochMs,
         });
+        this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
         this.markThreadResident({
           threadId,
           model,
@@ -1296,12 +1527,23 @@ export class RemoteControlCommandDispatcher {
         },
         model,
       },
-      { timeoutMs },
+      {
+        timeoutMs: this.boundedCommandTimeout(
+          timeoutMs,
+          mutationDeadlineEpochMs,
+        ),
+      },
     );
+    this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
     const thread = await this.readThread(threadId, {
-      timeoutMs,
+      timeoutMs: this.boundedCommandTimeout(
+        timeoutMs,
+        mutationDeadlineEpochMs,
+      ),
       phase: "post_resume_reconciliation",
+      mutationDeadlineEpochMs,
     });
+    this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
     this.markThreadResident({
       threadId,
       model,
@@ -1422,6 +1664,56 @@ export class RemoteControlCommandDispatcher {
     this.threadResidencyById.delete(threadId);
   }
 
+  assertSteerMutationDeadline(mutationDeadlineEpochMs) {
+    if (
+      mutationDeadlineEpochMs === null
+      || mutationDeadlineEpochMs === undefined
+    ) {
+      return null;
+    }
+    const remainingMs = remainingSteerMutationTime(
+      mutationDeadlineEpochMs,
+      this.now(),
+    );
+    if (remainingMs <= 0) {
+      throw new SteerMutationDeadlineExpiredError();
+    }
+    return remainingMs;
+  }
+
+  boundedCommandTimeout(timeoutMs, mutationDeadlineEpochMs) {
+    const requestedTimeoutMs = Number(timeoutMs);
+    const normalizedTimeoutMs =
+      Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0
+        ? Math.max(1, Math.floor(requestedTimeoutMs))
+        : 60_000;
+    const remainingMs = this.assertSteerMutationDeadline(
+      mutationDeadlineEpochMs,
+    );
+    return remainingMs === null
+      ? normalizedTimeoutMs
+      : Math.max(1, Math.min(normalizedTimeoutMs, remainingMs));
+  }
+
+  steerDeadlineRequestMetadata(
+    mutationDeadlineEpochMs,
+    phase = "exact_followup_turn_steer",
+  ) {
+    if (
+      mutationDeadlineEpochMs === null
+      || mutationDeadlineEpochMs === undefined
+    ) {
+      return { phase };
+    }
+    this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
+    const deadlineAtMs = Math.trunc(Number(mutationDeadlineEpochMs));
+    return {
+      phase,
+      deadlineAtMs,
+      attemptDeadlineAtMs: deadlineAtMs,
+    };
+  }
+
   updateThreadSettings(params) {
     const threadId = requiredString(
       params.conversationId,
@@ -1440,7 +1732,14 @@ export class RemoteControlCommandDispatcher {
     };
   }
 
-  async sendFollowup(params, { timeoutMs }) {
+  async sendFollowup(
+    params,
+    {
+      timeoutMs,
+      mutationDeadlineEpochMs = null,
+    },
+  ) {
+    this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
     const threadId = requiredString(
       params.conversationId,
       "Remote controller conversation id",
@@ -1478,10 +1777,16 @@ export class RemoteControlCommandDispatcher {
         let reconciledActiveTurnId = null;
         try {
           thread = await this.readThread(threadId, {
-            timeoutMs,
+            timeoutMs: this.boundedCommandTimeout(
+              timeoutMs,
+              mutationDeadlineEpochMs,
+            ),
             phase: "pre_exact_followup_stream_reconciliation",
+            mutationDeadlineEpochMs,
           });
+          this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
         } catch (error) {
+          this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
           if (!isExactFollowupRehydratableReadFailure(error)) {
             throw annotateExactFollowupError(error, {
               phase: "pre_exact_followup_stream_reconciliation",
@@ -1500,9 +1805,17 @@ export class RemoteControlCommandDispatcher {
                 forceResume: true,
                 requireReconciliation: true,
               },
-              { timeoutMs },
+              {
+                timeoutMs: this.boundedCommandTimeout(
+                  timeoutMs,
+                  mutationDeadlineEpochMs,
+                ),
+                mutationDeadlineEpochMs,
+              },
             );
+            this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
           } catch (resumeError) {
+            this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
             throw annotateExactFollowupError(resumeError, {
               phase: "pre_exact_followup_stream_resume",
               mutationDispatched: null,
@@ -1540,6 +1853,13 @@ export class RemoteControlCommandDispatcher {
         }
       }
       try {
+        const steerTimeoutMs = this.boundedCommandTimeout(
+          timeoutMs,
+          mutationDeadlineEpochMs,
+        );
+        const requestMetadata = this.steerDeadlineRequestMetadata(
+          mutationDeadlineEpochMs,
+        );
         return await this.client.request(
           "turn/steer",
           {
@@ -1547,9 +1867,25 @@ export class RemoteControlCommandDispatcher {
             expectedTurnId,
             input,
           },
-          { timeoutMs },
+          {
+            timeoutMs: steerTimeoutMs,
+            requestMetadata,
+          },
         );
       } catch (error) {
+        if (error?.code === "APP_REMOTE_STEER_DEADLINE_EXPIRED") {
+          throw error;
+        }
+        if (
+          error?.code === "REMOTE_CONTROL_REQUEST_TIMEOUT"
+          && error?.preDispatch === true
+          && Number(error?.deadlineAtMs)
+            === Number(mutationDeadlineEpochMs)
+        ) {
+          throw new SteerMutationDeadlineExpiredError({
+            mutationDispatched: false,
+          });
+        }
         const preDispatch = error?.preDispatch === true;
         throw annotateExactFollowupError(error, {
           phase: "exact_followup_turn_steer",
@@ -1785,19 +2121,35 @@ export class RemoteControlCommandDispatcher {
 
   async readThread(
     threadId,
-    { timeoutMs, phase = "thread_read_reconciliation" },
+    {
+      timeoutMs,
+      phase = "thread_read_reconciliation",
+      mutationDeadlineEpochMs = null,
+    },
   ) {
-    const requestedTimeoutMs = Number(timeoutMs);
+    const requestedTimeoutMs = this.boundedCommandTimeout(
+      timeoutMs,
+      mutationDeadlineEpochMs,
+    );
     const totalTimeoutMs =
       Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0
         ? Math.max(2, Math.floor(requestedTimeoutMs))
         : 60_000;
-    const deadlineAtMs = this.now() + totalTimeoutMs;
+    const relativeDeadlineAtMs = this.now() + totalTimeoutMs;
+    const deadlineAtMs =
+      mutationDeadlineEpochMs === null
+      || mutationDeadlineEpochMs === undefined
+        ? relativeDeadlineAtMs
+        : Math.min(
+            relativeDeadlineAtMs,
+            Math.trunc(Number(mutationDeadlineEpochMs)),
+          );
     let recovery = null;
     let primaryFailure = null;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       const remainingMs = Math.floor(deadlineAtMs - this.now());
       if (remainingMs <= 0) {
+        this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
         if (primaryFailure) primaryFailure.deadlineExceeded = true;
         throw (
           primaryFailure || new Error("thread reconciliation deadline exceeded")
@@ -1854,8 +2206,12 @@ export class RemoteControlCommandDispatcher {
                 1,
                 Math.floor(attemptDeadlineAtMs - this.now()),
               );
+              const boundedRequestTimeoutMs = this.boundedCommandTimeout(
+                requestTimeoutMs,
+                mutationDeadlineEpochMs,
+              );
               return this.client.request(method, params, {
-                timeoutMs: requestTimeoutMs,
+                timeoutMs: boundedRequestTimeoutMs,
                 requestMetadata: activeRequestMetadata,
                 signal,
               });
@@ -1905,8 +2261,10 @@ export class RemoteControlCommandDispatcher {
             return thread;
           },
         });
+        this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
         return thread;
       } catch (error) {
+        this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
         if (
           !isRetryableThreadReconciliationFailure(error, activeReadMethod) ||
           attempt === 2
@@ -1923,6 +2281,7 @@ export class RemoteControlCommandDispatcher {
         primaryFailure = error;
         const recoveryTimeoutMs = Math.floor(deadlineAtMs - this.now());
         if (recoveryTimeoutMs <= 0) {
+          this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
           error.deadlineExceeded = true;
           throw error;
         }
@@ -1943,6 +2302,7 @@ export class RemoteControlCommandDispatcher {
                   signal,
                 }),
             });
+            this.assertSteerMutationDeadline(mutationDeadlineEpochMs);
           } catch (recoveryError) {
             if (recoveryError !== error) {
               error.recoveryFailed = true;
@@ -2482,25 +2842,6 @@ async function runWithAbsoluteDeadline({
     ]);
   } finally {
     if (timer) clearTimeout(timer);
-  }
-}
-
-async function waitForPromise(promise, timeoutMs) {
-  const timedOut = Symbol("timed_out");
-  let timeout;
-  try {
-    const value = await Promise.race([
-      promise,
-      new Promise((resolve) => {
-        timeout = setTimeout(() => resolve(timedOut), timeoutMs);
-        timeout.unref?.();
-      }),
-    ]);
-    return value === timedOut
-      ? { settled: false, value: null }
-      : { settled: true, value };
-  } finally {
-    if (timeout) clearTimeout(timeout);
   }
 }
 

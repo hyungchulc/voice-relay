@@ -118,7 +118,12 @@ const controller = new remoteModule.CodexRemoteControlClient({
 let backend = null;
 let activeRequestId = null;
 let threadResolutionPromise = null;
-let steerChain = Promise.resolve();
+const CODEX_STEER_TERMINAL_DEADLINE_MS = 10 * 60_000;
+const steerMutationQueue =
+  new backendModule.SerializedSteerMutationQueue({
+    now: () => Date.now(),
+    mutationBudgetMs: CODEX_STEER_TERMINAL_DEADLINE_MS,
+  });
 
 const input = readline.createInterface({
   input: process.stdin,
@@ -148,7 +153,15 @@ async function handleLine(line) {
 
   const id = String(request?.id || "");
   try {
-    const result = await dispatch(String(request?.command || ""), request?.params || {}, id);
+    const command = String(request?.command || "");
+    let result = await dispatch(command, request?.params || {}, id);
+    if (command === "steer") {
+      result =
+        backendModule.validatedSteerSuccessReceiptForSerialization(
+          result,
+          { now: () => Date.now() },
+        );
+    }
     write({ id, result });
   } catch (error) {
     write({
@@ -156,6 +169,22 @@ async function handleLine(line) {
       error: {
         code: String(error?.code || "APP_REMOTE_FAILED"),
         message: String(error?.message || error),
+        ...("followupMutationDispatched" in Object(error)
+          ? {
+              mutationDispatched:
+                error.followupMutationDispatched === true
+                  ? true
+                  : error.followupMutationDispatched === false
+                    ? false
+                    : null,
+            }
+          : {}),
+        ...(typeof error?.followupFailurePhase === "string"
+          ? { failurePhase: error.followupFailurePhase }
+          : {}),
+        ...(typeof error?.preDispatch === "boolean"
+          ? { preDispatch: error.preDispatch }
+          : {}),
       },
     });
   }
@@ -383,21 +412,54 @@ async function ask(params, requestId) {
 }
 
 function steer(params, requestId) {
-  const operation = steerChain.then(
-    () => submitSteer(params, requestId),
-    () => submitSteer(params, requestId),
+  const mutationBudgetMs = Math.trunc(
+    Number(params.terminalDeadlineMs),
   );
-  steerChain = operation.catch(() => {});
-  return operation;
+  if (mutationBudgetMs !== CODEX_STEER_TERMINAL_DEADLINE_MS) {
+    const error = new Error("The additional instruction deadline is invalid");
+    error.code = "APP_REMOTE_INVALID_STEER";
+    return Promise.reject(error);
+  }
+  return steerMutationQueue.enqueue(
+    ({ mutationDeadlineEpochMs }) =>
+      submitSteer(
+        params,
+        requestId,
+        mutationDeadlineEpochMs,
+      ),
+  );
 }
 
-async function submitSteer(params, requestId) {
+async function submitSteer(
+  params,
+  requestId,
+  mutationDeadlineEpochMs,
+) {
   const text = String(params.text || "").trim();
+  const controlRequestID = String(params.controlRequestID || "").trim();
+  const voiceTurnID = String(params.voiceTurnID || "").trim();
+  const remainingMutationTime = () =>
+    backendModule.remainingSteerMutationTime(
+      mutationDeadlineEpochMs,
+      Date.now(),
+    );
+  const throwExpired = (mutationDispatched = false) => {
+    throw new backendModule.SteerMutationDeadlineExpiredError({
+      mutationDispatched,
+    });
+  };
   if (!text) {
     const error = new Error("The additional instruction is empty");
     error.code = "APP_REMOTE_INVALID_STEER";
     throw error;
   }
+  if (!/^voice-relay-steer-[a-z0-9_-]{8,160}$/iu.test(controlRequestID)
+      || !/^turn-\d+-\d+$/u.test(voiceTurnID)) {
+    const error = new Error("The additional instruction identity is invalid");
+    error.code = "APP_REMOTE_INVALID_STEER";
+    throw error;
+  }
+  if (remainingMutationTime() <= 0) throwExpired();
   if (!backend || !backend.hasActiveTurn()) {
     const error = new Error(
       "There is no active Codex task for the additional instruction",
@@ -405,33 +467,50 @@ async function submitSteer(params, requestId) {
     error.code = "APP_REMOTE_NO_ACTIVE_TURN";
     throw error;
   }
-  const safeRequestId = String(requestId || "")
-    .replace(/[^a-zA-Z0-9-]/g, "")
-    .slice(0, 64);
-  const requestToken =
-    `voice-relay-steer-${Date.now()}-${safeRequestId || "voice"}`;
+  const requestToken = controlRequestID;
   let result = null;
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    result = await backend.submitSteer(text, { requestToken });
+    if (remainingMutationTime() <= 0) throwExpired(false);
+    result = await backendModule.awaitSteerMutationResultBeforeDeadline({
+      operation: () => backend.submitSteer(text, {
+        requestToken,
+        mutationDeadlineEpochMs,
+      }),
+      mutationDeadlineEpochMs,
+      now: () => Date.now(),
+    });
+    if (remainingMutationTime() <= 0) {
+      throwExpired(
+        backendModule.steerMutationDispatchEvidence(result),
+      );
+    }
     if (result?.reason !== "steer_already_pending") break;
-    await new Promise((resolve) => setTimeout(resolve, 125));
+    const retryDelayMs = Math.min(125, remainingMutationTime());
+    if (retryDelayMs <= 0) {
+      throwExpired(
+        backendModule.steerMutationDispatchEvidence(result),
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+    if (remainingMutationTime() <= 0) {
+      throwExpired(
+        backendModule.steerMutationDispatchEvidence(result),
+      );
+    }
     if (!backend.hasActiveTurn()) break;
   }
   const status = String(result?.status || "");
-  if (status !== "steered" && status !== "submitted_pending_ack") {
-    const error = new Error(
-      String(
-        result?.reason ||
-          "The additional instruction was not added to the active Codex task",
-      ),
-    );
-    error.code = "APP_REMOTE_STEER_FAILED";
-    throw error;
+  if (status !== "steered") {
+    throw backendModule.steerFailureErrorForResult(result);
   }
+  if (remainingMutationTime() <= 0) throwExpired(true);
   return {
     status,
     requestId: String(result?.requestId || requestToken),
     turnId: String(result?.turnId || ""),
+    voiceTurnId: voiceTurnID,
+    mutationDeadlineEpochMs,
+    mutationDispatched: true,
   };
 }
 
@@ -695,10 +774,6 @@ function finalAnswer(reply) {
     .map((message) => String(message?.text || "").trim())
     .filter(Boolean);
   if (finals.length) return finals.join("\n\n");
-  const fallback = messages
-    .map((message) => String(message?.text || "").trim())
-    .filter(Boolean);
-  if (fallback.length) return fallback.at(-1);
   throw new Error(
     "The Codex/ChatGPT task did not return a final response",
   );

@@ -595,6 +595,77 @@ struct ExternalAudioPlaybackSnapshot: Equatable {
     }
 }
 
+enum AssistantPlaybackOverlapDecision: Equatable {
+    case none
+    case pause
+    case resume
+}
+
+struct AssistantPlaybackOverlapPolicy {
+    private(set) var isPaused = false
+    private var continuouslyActiveBaseline = Set<String>()
+    private var interferingProcesses = Set<String>()
+    private var consecutiveClearSamples = 0
+
+    mutating func begin(
+        with snapshot: ExternalAudioPlaybackSnapshot
+    ) {
+        isPaused = false
+        continuouslyActiveBaseline = snapshot.isAvailable
+            ? snapshot.processLabels
+            : []
+        interferingProcesses.removeAll()
+        consecutiveClearSamples = 0
+    }
+
+    mutating func observe(
+        _ snapshot: ExternalAudioPlaybackSnapshot,
+        clearSamplesRequired: Int = 2
+    ) -> AssistantPlaybackOverlapDecision {
+        guard snapshot.isAvailable else {
+            guard isPaused else { return .none }
+            reset()
+            return .resume
+        }
+        continuouslyActiveBaseline.formIntersection(
+            snapshot.processLabels
+        )
+        let newlyActive = snapshot.processLabels.subtracting(
+            continuouslyActiveBaseline
+        )
+        if !newlyActive.isEmpty {
+            interferingProcesses.formUnion(newlyActive)
+            consecutiveClearSamples = 0
+            if !isPaused {
+                isPaused = true
+                return .pause
+            }
+            return .none
+        }
+        guard isPaused else { return .none }
+        interferingProcesses.formIntersection(snapshot.processLabels)
+        guard interferingProcesses.isEmpty else {
+            consecutiveClearSamples = 0
+            return .none
+        }
+        consecutiveClearSamples += 1
+        guard consecutiveClearSamples >= max(1, clearSamplesRequired) else {
+            return .none
+        }
+        isPaused = false
+        continuouslyActiveBaseline = snapshot.processLabels
+        consecutiveClearSamples = 0
+        return .resume
+    }
+
+    mutating func reset() {
+        isPaused = false
+        continuouslyActiveBaseline.removeAll()
+        interferingProcesses.removeAll()
+        consecutiveClearSamples = 0
+    }
+}
+
 enum ConversationSpeaker: Equatable {
     case user
     case assistant
@@ -827,15 +898,19 @@ struct AssistantOutputLifecycle {
     private(set) var generation = 0
     private(set) var pendingNativeResponseIDs = Set<String>()
     private(set) var pendingLocalSpeechCount = 0
+    private(set) var realtimeQueueLeaseActive = false
 
     var isActive: Bool {
-        !pendingNativeResponseIDs.isEmpty || pendingLocalSpeechCount > 0
+        !pendingNativeResponseIDs.isEmpty
+            || pendingLocalSpeechCount > 0
+            || realtimeQueueLeaseActive
     }
 
     mutating func reset(generation: Int) {
         self.generation = generation
         pendingNativeResponseIDs.removeAll()
         pendingLocalSpeechCount = 0
+        realtimeQueueLeaseActive = false
     }
 
     @discardableResult
@@ -877,10 +952,21 @@ struct AssistantOutputLifecycle {
         return !isActive
     }
 
+    @discardableResult
+    mutating func setRealtimeQueueLease(
+        generation: Int,
+        active: Bool
+    ) -> Bool {
+        guard generation == self.generation else { return false }
+        realtimeQueueLeaseActive = active
+        return !isActive
+    }
+
     mutating func cancelAll(generation: Int) {
         guard generation == self.generation else { return }
         pendingNativeResponseIDs.removeAll()
         pendingLocalSpeechCount = 0
+        realtimeQueueLeaseActive = false
     }
 }
 
