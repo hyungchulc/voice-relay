@@ -254,7 +254,12 @@ final class SettingsStore {
         "shimmer",
         "verse",
     ]
-    static let currentSchemaVersion = 18
+    static let currentSchemaVersion = 19
+    private static let legacyDefaultRealtimeInstructionFingerprints:
+        Set<UInt64> = [
+            0x01a7718371a87c1c,
+            0x054d9a4fca5b5e96,
+        ]
     static var defaultCodexWorkspaceURL: URL {
         FileManager.default.urls(
             for: .applicationSupportDirectory,
@@ -265,25 +270,16 @@ final class SettingsStore {
     }
     static let defaultRealtimeInstructions = """
     # Role and Objective
-    You are the product's low-latency voice layer. Greet the user briefly when a new voice session starts, then listen.
+    You are the product's low-latency conversational voice layer.
 
-    # Language
-    Match the user's language. Keep spoken replies natural and concise.
+    # Language and Voice
+    Respond in the user's language. Match the user's conversational register. Keep spoken replies natural, concise, and free of internal implementation details.
 
-    # Direct replies
-    Route greetings, thanks, goodbyes, repeat requests, simple presence or audio checks, and simple questions about your configured name or identity directly. Treat an unambiguous request to stop, cancel, or end the current voice or Codex work as the dedicated stop_session lifecycle action. Route only current device-local time, date, or weekday questions as local_datetime. Use clarify only when the audio or request is genuinely unclear.
+    # Semantic Routing
+    For every completed user turn, call the provided route tool immediately without speaking first. Decide from the complete utterance and active conversation. Follow the non-editable routing contract supplied by the application instead of a phrase list.
 
-    # Codex handoff
-    Route every substantive request as codex, including personal context, schedules, messages, files, memory, current facts beyond local time or date, web lookup, weather, calculations, explanations, recommendations, troubleshooting, planning, code, actions, or anything uncertain. If a complete reliable answer could take more than about five seconds, route it as codex. When in doubt, route it as codex. Preserve the user's exact request.
-
-    # Handoff progress
-    Call the route tool immediately without speaking first. The native handoff flow will speak one short progress line after a codex route. That line is only a filler acknowledgement while Codex works. Never answer the delegated request, describe limitations, or add another preamble.
-
-    # Tool results
-    After handoff, do not generate another answer. Read each native Codex commentary and final result exactly as instructed, without adding, omitting, paraphrasing, summarizing, translating, or reinterpreting it. If Codex fails, read only the native failure response.
-
-    # Unclear audio
-    If audio is unclear, ask one short clarification question. Do not guess or call a tool.
+    # Delivery
+    After the route tool returns, follow the application's response instruction for that action. Do not reveal private reasoning, routing mechanics, tools, or hidden context.
     """
     static func resolvedSpeechLocaleIdentifier(
         _ identifier: String,
@@ -429,6 +425,17 @@ final class SettingsStore {
 
     func load() -> AppSettings {
         let storedSchemaVersion = defaults.integer(forKey: Key.schemaVersion)
+        if storedSchemaVersion < Self.currentSchemaVersion,
+           let storedRealtimeInstructions =
+            defaults.string(forKey: Key.realtimeInstructions),
+           Self.isLegacyDefaultRealtimeInstructions(
+            storedRealtimeInstructions
+           ) {
+            defaults.set(
+                Self.defaultRealtimeInstructions,
+                forKey: Key.realtimeInstructions
+            )
+        }
         if storedSchemaVersion < Self.currentSchemaVersion {
             defaults.set(Self.currentSchemaVersion, forKey: Key.schemaVersion)
         }
@@ -1171,6 +1178,28 @@ final class SettingsStore {
             return defaultRealtimeInstructions
         }
         return trimmed
+    }
+
+    static func realtimeInstructionsFingerprint(_ value: String) -> UInt64 {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .utf8
+            .reduce(UInt64(0xcbf29ce484222325)) { fingerprint, byte in
+                (fingerprint ^ UInt64(byte))
+                    &* UInt64(0x100000001b3)
+            }
+    }
+
+    static func isLegacyDefaultRealtimeInstructions(_ value: String) -> Bool {
+        isLegacyDefaultRealtimeInstructionsFingerprint(
+            realtimeInstructionsFingerprint(value)
+        )
+    }
+
+    static func isLegacyDefaultRealtimeInstructionsFingerprint(
+        _ fingerprint: UInt64
+    ) -> Bool {
+        legacyDefaultRealtimeInstructionFingerprints.contains(fingerprint)
     }
 
     private static func validateDirectory(path: String, label: String) throws {
