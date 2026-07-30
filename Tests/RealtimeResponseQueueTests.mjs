@@ -1132,9 +1132,12 @@ runtime.start({
   productName: "Voice Relay",
   assistantName: "Aria",
   wakePhrases: ["Aria"],
-  prefill: "Aria",
+  prefill: "",
   shouldGreet: true,
   activationReason: "wake_only",
+  activationID: "wake-only-72",
+  wakeTranscript: "아리아야",
+  wakeLocale: "ko-KR",
 });
 runtime.transportOpened({ generation: 72 });
 runtime.transportReady({ generation: 72 });
@@ -1158,6 +1161,15 @@ assert.equal(
   ).length,
   0,
   "a wake-only activation token must not be inserted as user conversation",
+);
+assert.equal(
+  wakeOnlyPrefillMessages.filter(message =>
+    message.type === "userTranscript"
+    && message.turnId === "wake-only-72"
+    && message.text === "아리아야"
+  ).length,
+  1,
+  "a wake-only activation must display the full recognized utterance exactly once",
 );
 const configuredWakeAcknowledgement =
   wakeOnlyPrefillEvents.find(event =>
@@ -1190,12 +1202,13 @@ runtime.start({
   additionalLanguages: ["en-US"],
   productName: "Voice Relay",
   assistantName: "Aria",
-  wakePhrases: ["Aria"],
-  prefill: "check the weather.",
+  wakePhrases: ["아리아야", "Hey Aria"],
+  prefill: "들리니?",
   shouldGreet: false,
   activationReason: "wake_with_command",
   activationID: "wake-command-73",
-  wakeLocale: "en-US",
+  wakeTranscript: "아리아야,  들리니?",
+  wakeLocale: "ko-KR",
 });
 runtime.transportOpened({ generation: 73 });
 runtime.transportReady({ generation: 73 });
@@ -1215,7 +1228,7 @@ assert.equal(
   wakeWithCommandEvents.filter(event =>
     event.type === "conversation.item.create"
     && event.item?.role === "user"
-    && event.item?.content?.[0]?.text === "check the weather."
+    && event.item?.content?.[0]?.text === "들리니?"
   ).length,
   1,
   "wake handoff must route the canonical command without duplicating the wake phrase",
@@ -1226,10 +1239,45 @@ assert.equal(
     .filter(message =>
       message.type === "userTranscript"
       && message.turnId === "wake-command-73"
-      && message.text === "check the weather."
+      && message.text === "아리아야,  들리니?"
     ).length,
   1,
-  "the first wake-command utterance must become visible exactly once with its stable activation identity",
+  "the first wake-command utterance must display the full recognized text once with its stable activation identity",
+);
+runtime.receiveRealtimeEvent({
+  generation: 73,
+  event: {
+    type: "response.created",
+    response: {
+      id: "wake-command-route-73",
+      metadata: { voice_relay_kind: "route_classifier" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 73,
+  event: {
+    type: "response.function_call_arguments.done",
+    name: "route_voice_turn",
+    call_id: "wake-command-call-73",
+    arguments: JSON.stringify({
+      kind: "direct_chat",
+      social_origin: "user_originated",
+      spoken_language: "ko-KR",
+      spoken_register: "casual",
+      stop_target: "not_applicable",
+    }),
+  },
+});
+assert.equal(
+  nativeMessages
+    .slice(wakeWithCommandPrefillStart)
+    .filter(message =>
+      message.type === "userTranscript"
+      && message.turnId === "wake-command-73"
+    ).length,
+  1,
+  "routing the suffix-only prefill must not emit a duplicate visible user turn",
 );
 
 const koreanWakePriorityStart = nativeMessages.length;

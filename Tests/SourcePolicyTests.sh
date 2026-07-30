@@ -3385,6 +3385,28 @@ require_text \
   "wake handoff must route only the wake-stripped canonical command text"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
+  'recognizedUtteranceText:' \
+  "wake activation must preserve the full recognized utterance for display"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"wakeTranscript": pendingStart.wakeTranscript' \
+  "Realtime start must carry a display-only wake transcript beside the route prefill"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'const visibleUserText = wakeTranscript || prefill;' \
+  "the visible wake transcript must prefer the full recognized utterance"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'acceptUserTurn(
+            prefill,
+            true,
+            true,
+            false,
+            activationID
+          );' \
+  "wake routing must use the suffix-only prefill while suppressing a second display event"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
   'command: candidate.match.command' \
   "wake cleanup must preserve the canonical wake-stripped command"
 require_text \

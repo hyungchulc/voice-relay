@@ -45,6 +45,7 @@ final class DirectRealtimeController: NSObject {
         shouldGreet: Bool,
         reason: String,
         activationID: String,
+        wakeTranscript: String,
         wakeLocale: String,
         wakeHandoffTicketID: String
     )?
@@ -248,6 +249,7 @@ final class DirectRealtimeController: NSObject {
             shouldGreet,
             reason,
             wakeActivation?.activationID ?? "",
+            wakeActivation?.recognizedUtteranceText ?? "",
             wakeActivation?.wakeLocaleIdentifier ?? "",
             wakeActivation?.handoffTicketID ?? ""
         )
@@ -386,6 +388,7 @@ final class DirectRealtimeController: NSObject {
                 "shouldGreet": pendingStart.shouldGreet,
                 "activationReason": pendingStart.reason,
                 "activationID": pendingStart.activationID,
+                "wakeTranscript": pendingStart.wakeTranscript,
                 "wakeLocale": pendingStart.wakeLocale,
                 "wakeHandoffTicketID":
                     pendingStart.wakeHandoffTicketID,
@@ -5434,9 +5437,23 @@ private extension DirectRealtimeController {
         diagnostic("media_ready", generation);
         const startPayload = session.startPayload || {};
         const prefill = String(startPayload.prefill || "").trim();
+        const wakeTranscript =
+          String(startPayload.wakeTranscript || "").trim();
         const activationReason =
           String(startPayload.activationReason || "");
         const isWakeOnly = activationReason === "wake_only";
+        const activationID =
+          String(startPayload.activationID || "")
+          || `prefill-${generation}`;
+        const visibleUserText = wakeTranscript || prefill;
+        if (visibleUserText) {
+          send({
+            type: "userTranscript",
+            generation,
+            turnId: activationID,
+            text: visibleUserText
+          });
+        }
         if (isWakeOnly) {
           diagnostic(
             "wake_only_prefill_not_routed",
@@ -5448,15 +5465,6 @@ private extension DirectRealtimeController {
           );
         }
         if (prefill && !isWakeOnly) {
-          const activationID =
-            String(startPayload.activationID || "")
-            || `prefill-${generation}`;
-          send({
-            type: "userTranscript",
-            generation,
-            turnId: activationID,
-            text: prefill
-          });
           acceptUserTurn(
             prefill,
             true,

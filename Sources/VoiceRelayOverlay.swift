@@ -2495,8 +2495,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                         : "wake_with_command",
                 ],
                 transcriptFields: [
-                    "command": match.command,
-                    "text": activation.commandText,
+                    "command": activation.commandText,
+                    "text": activation.recognizedUtteranceText,
                 ]
             )
             self?.startRealtimeVoice(

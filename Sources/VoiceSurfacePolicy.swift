@@ -1093,6 +1093,7 @@ struct WakePhraseMatch: Equatable {
 struct WakeActivationContext: Equatable {
     let activationID: String
     let commandText: String
+    let recognizedUtteranceText: String
     let wakeLocaleIdentifier: String
     let handoffTicketID: String?
 }
@@ -1100,6 +1101,14 @@ struct WakeActivationContext: Equatable {
 enum WakeRealtimePrefillPolicy {
     static func prefill(command: String) -> String {
         command.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+    }
+}
+
+enum WakeDisplayTranscriptPolicy {
+    static func visibleText(recognizedText: String) -> String {
+        recognizedText.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
     }

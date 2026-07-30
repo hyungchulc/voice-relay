@@ -829,6 +829,10 @@ final class WakePhraseController {
                 commandText: WakeRealtimePrefillPolicy.prefill(
                     command: candidate.match.command
                 ),
+                recognizedUtteranceText:
+                    WakeDisplayTranscriptPolicy.visibleText(
+                        recognizedText: candidate.transcript
+                    ),
                 wakeLocaleIdentifier: candidate.localeIdentifier,
                 handoffTicketID: handoffTicket?.id
             )

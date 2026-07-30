@@ -1616,6 +1616,12 @@ struct PolicyTests {
             "wake handoff must pass only the canonical wake-stripped command"
         )
         expect(
+            WakeDisplayTranscriptPolicy.visibleText(
+                recognizedText: "  릴레이 야,  오늘 일정 알려줘?  "
+            ) == "릴레이 야,  오늘 일정 알려줘?",
+            "wake display must preserve the recognized phrase, punctuation, and internal spacing"
+        )
+        expect(
             WakePhrasePolicy.match(
                 "오늘 릴레이야 일정 알려줘",
                 phrases: ["릴레이야"]
@@ -1997,14 +2003,27 @@ struct PolicyTests {
             userTurnDisplay.accept(
                 generation: 4,
                 turnID: "wake-command-activation",
-                text: "오늘 날씨 알려줘"
+                text: "아리아야 오늘 날씨 알려줘"
             )
                 && !userTurnDisplay.accept(
                     generation: 4,
                     turnID: "wake-command-activation",
-                    text: "아리아야 오늘 날씨 알려줘"
+                    text: "오늘 날씨 알려줘"
                 ),
-            "a wake command must display its canonical wake-stripped text once even if a conflicting duplicate arrives"
+            "a wake command must display its full recognized utterance once even if a suffix-only duplicate arrives"
+        )
+        expect(
+            userTurnDisplay.accept(
+                generation: 4,
+                turnID: "wake-only-activation",
+                text: "아리아야"
+            )
+                && !userTurnDisplay.accept(
+                    generation: 4,
+                    turnID: "wake-only-activation",
+                    text: "아리아야"
+                ),
+            "a wake-only activation must display once without consuming the later Realtime turn identity"
         )
         userTurnDisplay.begin(generation: 5)
         expect(
