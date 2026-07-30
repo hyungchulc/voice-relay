@@ -1611,9 +1611,9 @@ struct PolicyTests {
         )
         expect(
             WakeRealtimePrefillPolicy.prefill(
-                recognizedTranscript: "  Aria 영상 좀 멈춰  "
-            ) == "Aria 영상 좀 멈춰",
-            "the complete Apple Speech utterance, including the wake phrase, must reach Realtime"
+                command: "  영상 좀 멈춰  "
+            ) == "영상 좀 멈춰",
+            "wake handoff must pass only the canonical wake-stripped command"
         )
         expect(
             WakePhrasePolicy.match(
@@ -1755,11 +1755,11 @@ struct PolicyTests {
             WakePhraseCapturePolicy.activationDelay(
                 for: wakeOnlyMatch,
                 isFinal: true
-            ) < WakePhraseCapturePolicy.activationDelay(
+            ) >= WakePhraseCapturePolicy.activationDelay(
                 for: wakeOnlyMatch,
                 isFinal: false
             ),
-            "a finalized wake-only utterance should still activate promptly"
+            "a finalized wake-only result must preserve the continuation window"
         )
         expect(
             WakePhraseCapturePolicy.activationDelay(
@@ -1796,6 +1796,231 @@ struct PolicyTests {
         expect(
             !wakeCommitment.isCurrent(repeatedPartial),
             "a retracted wake candidate must invalidate every pending commitment"
+        )
+
+        var wakeJournal = WakeAudioHandoffJournal()
+        wakeJournal.beginWake()
+        let firstWakeSpan = wakeJournal.append(
+            pcm: Data(repeating: 1, count: 200)
+        )
+        let wakeTicket = wakeJournal.commit(
+            recognizedThroughFrame: firstWakeSpan.startFrame + 40,
+            ticketID: "wake-ticket"
+        )
+        let secondWakeSpan = wakeJournal.append(
+            pcm: Data(repeating: 2, count: 100)
+        )
+        expect(
+            firstWakeSpan == WakeAudioFrameSpan(
+                startFrame: 0,
+                endFrame: 100
+            )
+                && secondWakeSpan == WakeAudioFrameSpan(
+                    startFrame: 100,
+                    endFrame: 150
+                ),
+            "the shared wake journal must maintain one gap-free absolute frame cursor"
+        )
+        expect(
+            wakeJournal.claim(
+                ticketID: wakeTicket.id,
+                generation: 7
+            ),
+            "the committed wake handoff must be claimable by exactly one Realtime generation"
+        )
+        let replayedWakePCM: Data
+        if case let .ready(data) = wakeJournal.replay(
+            ticketID: wakeTicket.id,
+            generation: 7
+        ) {
+            replayedWakePCM = data
+        } else {
+            replayedWakePCM = Data()
+        }
+        expect(
+            replayedWakePCM.count == 220
+                && replayedWakePCM.prefix(120)
+                    == Data(repeating: 1, count: 120)
+                && replayedWakePCM.suffix(100)
+                    == Data(repeating: 2, count: 100),
+            "handoff replay must contain every frame after the recognized wake boundary exactly once"
+        )
+        expect(
+            !wakeJournal.claim(
+                ticketID: wakeTicket.id,
+                generation: 8
+            ),
+            "a claimed wake handoff identity must reject a second generation"
+        )
+        wakeJournal.finish(
+            ticketID: wakeTicket.id,
+            generation: 7
+        )
+        expect(
+            wakeJournal.replay(
+                ticketID: wakeTicket.id,
+                generation: 7
+            ) == .unavailable,
+            "a drained handoff must retire its immutable ticket"
+        )
+
+        var truncatedWakeJournal = WakeAudioHandoffJournal()
+        truncatedWakeJournal.beginWake()
+        _ = truncatedWakeJournal.append(
+            pcm: Data(repeating: 0, count: 20)
+        )
+        let truncatedTicket = truncatedWakeJournal.commit(
+            recognizedThroughFrame: 0,
+            ticketID: "truncated-ticket"
+        )
+        _ = truncatedWakeJournal.append(
+            pcm: Data(
+                repeating: 3,
+                count:
+                    WakeAudioHandoffJournal.committedByteCapacity
+                    + 2
+            )
+        )
+        expect(
+            truncatedWakeJournal.claim(
+                ticketID: truncatedTicket.id,
+                generation: 9
+            )
+                && truncatedWakeJournal.replay(
+                    ticketID: truncatedTicket.id,
+                    generation: 9
+                ) == .truncated,
+            "an overflowing handoff must fail closed instead of routing incomplete tail audio"
+        )
+        var staleBoundaryWakeJournal = WakeAudioHandoffJournal()
+        staleBoundaryWakeJournal.beginWake()
+        _ = staleBoundaryWakeJournal.append(
+            pcm: Data(
+                repeating: 4,
+                count:
+                    Int(
+                        WakeAudioHandoffJournal
+                            .rollingFrameCapacity
+                    )
+                    * WakeAudioHandoffJournal.bytesPerFrame
+                    + 400
+            )
+        )
+        let staleBoundaryTicket = staleBoundaryWakeJournal.commit(
+            recognizedThroughFrame: 0,
+            ticketID: "stale-boundary-ticket"
+        )
+        expect(
+            staleBoundaryWakeJournal.claim(
+                ticketID: staleBoundaryTicket.id,
+                generation: 10
+            )
+                && staleBoundaryWakeJournal.replay(
+                    ticketID: staleBoundaryTicket.id,
+                    generation: 10
+                ) == .truncated,
+            "a wake boundary older than the rolling capture must fail closed instead of hiding lost PCM"
+        )
+
+        var wakeReplayPump = WakeAudioReplayPump()
+        let replayChunkBytes = 1_440
+        let replayPayload = Data(
+            (0..<(replayChunkBytes * 120 + 37)).map {
+                UInt8($0 % 251)
+            }
+        )
+        wakeReplayPump.append(replayPayload)
+        expect(
+            wakeReplayPump.takeAvailableChunks(
+                bytesPerChunk: replayChunkBytes,
+                outboundCount: 80,
+                maximumOutbound: 96
+            ).isEmpty,
+            "wake replay must reserve queue capacity for terminal control messages instead of overflowing or evicting audio"
+        )
+        var replayedPayload = Data()
+        var replayPasses = 0
+        while wakeReplayPump.pendingByteCount >= replayChunkBytes {
+            let chunks = wakeReplayPump.takeAvailableChunks(
+                bytesPerChunk: replayChunkBytes,
+                outboundCount: 0,
+                maximumOutbound: 96
+            )
+            expect(
+                !chunks.isEmpty
+                    && chunks.count
+                        <= 96 - WakeAudioReplayPump.controlQueueReserve,
+                "wake replay must drain through bounded queue-capacity passes"
+            )
+            chunks.forEach { replayedPayload.append($0) }
+            replayPasses += 1
+            expect(
+                replayPasses < 8,
+                "wake replay pump must make bounded forward progress"
+            )
+        }
+        if let remainder =
+            wakeReplayPump.takeRemainderIfBelowChunk(
+                bytesPerChunk: replayChunkBytes
+            ) {
+            replayedPayload.append(remainder)
+        }
+        expect(
+            replayedPayload == replayPayload
+                && !wakeReplayPump.hasPendingBytes,
+            "wake replay must preserve every queued PCM byte across queue-pressure passes"
+        )
+
+        var userTurnDisplay = CanonicalUserTurnDisplayRegistry()
+        userTurnDisplay.begin(generation: 4)
+        expect(
+            userTurnDisplay.accept(
+                generation: 4,
+                turnID: "first-turn",
+                text: "들리니?"
+            ),
+            "the first canonical user utterance must be admitted to the visible transcript"
+        )
+        expect(
+            !userTurnDisplay.accept(
+                generation: 4,
+                turnID: "first-turn",
+                text: "들리니?"
+            )
+                && userTurnDisplay.isFinalized(
+                    generation: 4,
+                    turnID: "first-turn"
+                ),
+            "duplicate final delivery must not duplicate the first visible utterance"
+        )
+        expect(
+            userTurnDisplay.accept(
+                generation: 4,
+                turnID: "wake-command-activation",
+                text: "오늘 날씨 알려줘"
+            )
+                && !userTurnDisplay.accept(
+                    generation: 4,
+                    turnID: "wake-command-activation",
+                    text: "아리아야 오늘 날씨 알려줘"
+                ),
+            "a wake command must display its canonical wake-stripped text once even if a conflicting duplicate arrives"
+        )
+        userTurnDisplay.begin(generation: 5)
+        expect(
+            !userTurnDisplay.isFinalized(
+                generation: 5,
+                turnID: "first-turn"
+            ),
+            "first-turn display identities must reset only at generation closure"
+        )
+        expect(
+            userTurnDisplay.accept(
+                generation: 5,
+                turnID: "utterance-5-1",
+                text: "이번에는 들리니?"
+            ),
+            "wake-only activation must leave the first later Realtime utterance eligible for one visible final"
         )
 
         let disabledLoginService = FakeLaunchAtLoginService(

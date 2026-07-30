@@ -1392,8 +1392,40 @@ require_text \
   "active-turn controls must preserve capture-time ownership across completion"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'configuredBaseLanguages.length === 1' \
-  "Realtime transcription may receive a hint only for one configured base language"
+  'function realtimeTranscriptionConfiguration()' \
+  "Realtime transcription must derive one immutable configuration from Voice Relay settings"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'model: "gpt-live-transcribe"' \
+  "configured bilingual transcription must use the supported multilingual model"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'configuration.languages = languages' \
+  "multiple configured base languages must use the plural languages field"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'const languages = ["ko", "en"]' \
+  "Realtime transcription languages must come from settings instead of a production allowlist"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'configuration.language = languages[0]' \
+  "gpt-live-transcribe must never receive the legacy singular language field"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'function hasClearlyUnconfiguredScript' \
+  "configured-language routing must fail closed for clearly unconfigured scripts"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'function codexSpeechText(text)' \
+  "spoken Codex output must pass through the maintained speech-only sanitizer"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'isTerminalReferenceLine' \
+  "speech sanitization must remove complete trailing source/link clusters"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'model: "gpt-4o-mini-transcribe"' \
+  "bilingual settings must not silently drop all language context"
 require_count \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'configuredSpokenLanguageBoundary()' \
@@ -1403,6 +1435,46 @@ require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'additionalLanguages' \
   "Realtime instructions must preserve the configured additional languages"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'prepareWakeAudioCapture()' \
+  "wake recognition must reuse the maintained Native Realtime audio graph"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'WakeAudioHandoffJournal' \
+  "wake-to-Realtime handoff must retain post-wake PCM by frame identity"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'flushWakeAudioHandoffIfNeeded' \
+  "committed wake PCM must replay before live Realtime capture advances"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'WakeAudioReplayPump' \
+  "wake replay must drain through a bounded lossless pump instead of overflowing the socket queue"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'stage: "wake_audio_handoff_claim"' \
+  "an unavailable immutable wake ticket must fail closed before Realtime continues"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'result.isFinal' \
+  "modern wake finalization must retain the provider terminal signal"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'commitWakeAudioHandoff' \
+  "accepted wake candidates must commit an exact audio handoff boundary"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'CanonicalUserTurnDisplayRegistry' \
+  "the notch must admit one canonical visible user turn per stable identity"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  '"realtime_user_turn_displayed"' \
+  "canonical first-turn display admission must remain observable by stable turn identity"
+reject_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'realtimeUserDraft = text.trimmingCharacters' \
+  "untrusted partial ASR text must not become visible canonical conversation content"
 require_text \
   "$ROOT/Sources/OnboardingWindowController.swift" \
   'AmbientBackdropView()' \
@@ -3309,12 +3381,12 @@ reject_text \
   "modern wake recognition must not prepend full-session transcription history"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  'prefill: realtimePrefill,' \
-  "the complete stabilized Apple Speech utterance must reach Realtime"
+  'prefill: activation.commandText,' \
+  "wake handoff must route only the wake-stripped canonical command text"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
-  'candidate.realtimePrefill' \
-  "wake cleanup must preserve the complete recognized utterance"
+  'command: candidate.match.command' \
+  "wake cleanup must preserve the canonical wake-stripped command"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'acknowledgeWake: match.command.isEmpty' \

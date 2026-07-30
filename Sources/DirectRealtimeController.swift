@@ -43,8 +43,12 @@ final class DirectRealtimeController: NSObject {
         generation: Int,
         prefill: String?,
         shouldGreet: Bool,
-        reason: String
+        reason: String,
+        activationID: String,
+        wakeLocale: String,
+        wakeHandoffTicketID: String
     )?
+    private var wakeHandoffTicketIDsByGeneration: [Int: String] = [:]
     private var activeGeneration: Int?
     private var stoppingGenerations = Set<Int>()
     private var codexRequestDispatchRegistry =
@@ -101,14 +105,18 @@ final class DirectRealtimeController: NSObject {
                 payload: ["generation": generation]
             )
         }
-        transport.onListeningReady = { [weak self] generation in
+        transport.onListeningReady = {
+            [weak self] generation, handoffReplaySent in
             guard let self, self.activeGeneration == generation else { return }
             _ = self.startupRetryState.markListeningReady(generation: generation)
             self.startupRetryWorkItem?.cancel()
             self.startupRetryWorkItem = nil
             self.evaluate(
                 method: "transportReady",
-                payload: ["generation": generation]
+                payload: [
+                    "generation": generation,
+                    "handoffReplaySent": handoffReplaySent,
+                ]
             )
         }
         transport.onEvent = { [weak self] generation, event in
@@ -193,7 +201,8 @@ final class DirectRealtimeController: NSObject {
         generation: Int,
         prefill: String? = nil,
         shouldGreet: Bool = true,
-        reason: String = "manual"
+        reason: String = "manual",
+        wakeActivation: WakeActivationContext? = nil
     ) {
         if let previousGeneration = activeGeneration,
            previousGeneration != generation {
@@ -237,8 +246,15 @@ final class DirectRealtimeController: NSObject {
             generation,
             prefill,
             shouldGreet,
-            reason
+            reason,
+            wakeActivation?.activationID ?? "",
+            wakeActivation?.wakeLocaleIdentifier ?? "",
+            wakeActivation?.handoffTicketID ?? ""
         )
+        if let ticketID = wakeActivation?.handoffTicketID,
+           !ticketID.isEmpty {
+            wakeHandoffTicketIDsByGeneration[generation] = ticketID
+        }
         activeGeneration = generation
         emitState("starting", generation: generation)
         flushPendingStartIfReady()
@@ -275,6 +291,9 @@ final class DirectRealtimeController: NSObject {
             stoppingGenerations.filter { $0 >= generation - 8 }
         )
         codexRequestDispatchRegistry.closeGeneration(generation)
+        wakeHandoffTicketIDsByGeneration.removeValue(
+            forKey: generation
+        )
         activeGeneration = nil
         transport.stop(
             generation: generation,
@@ -366,6 +385,10 @@ final class DirectRealtimeController: NSObject {
                 "wakePhrases": wakePhrases,
                 "shouldGreet": pendingStart.shouldGreet,
                 "activationReason": pendingStart.reason,
+                "activationID": pendingStart.activationID,
+                "wakeLocale": pendingStart.wakeLocale,
+                "wakeHandoffTicketID":
+                    pendingStart.wakeHandoffTicketID,
             ]
         )
     }
@@ -617,7 +640,11 @@ extension DirectRealtimeController: WKScriptMessageHandler {
                     self.transport.start(
                         generation: generation,
                         model: credential.model,
-                        ephemeralCredential: credential.value
+                        ephemeralCredential: credential.value,
+                        wakeHandoffTicketID:
+                            self.wakeHandoffTicketIDsByGeneration[
+                                generation
+                            ]
                     )
                 case let .failure(error):
                     self.startupRetryState.cancel(generation: generation)
@@ -1092,6 +1119,7 @@ private extension DirectRealtimeController {
         session = null;
         if (current) {
           try { clearTimeout(current.draftFlushTimer); } catch (_) {}
+          try { clearTimeout(current.wakeGreetingTimer); } catch (_) {}
           for (const segment of current.userUtteranceSegments?.values?.()
               || []) {
             try { clearTimeout(segment.watchdogTimer); } catch (_) {}
@@ -1822,6 +1850,29 @@ private extension DirectRealtimeController {
         const error = event?.error || {};
         const causalEventId = String(error.event_id || "");
         const responseId = String(session?.activeResponseId || "");
+        if (
+          causalEventId
+          && causalEventId === String(
+            session?.transcriptionUpdateEventID || ""
+          )
+        ) {
+          diagnostic(
+            "realtime_transcription_configuration_rejected",
+            generation,
+            {
+              code: String(error.code || ""),
+              errorType: String(error.type || ""),
+              eventID: causalEventId
+            }
+          );
+          send({
+            type: "error",
+            generation,
+            message:
+              "The configured speech recognition languages are not supported by this Realtime session"
+          });
+          return;
+        }
         if (causalEventId.startsWith("voice-relay-truncate-")) {
           diagnostic("truncate_rejected", generation, {
             code: String(error.code || ""),
@@ -2111,7 +2162,7 @@ private extension DirectRealtimeController {
         const sameBase = configured.find(tag =>
           languageBase(tag) === candidateBase
         );
-        return sameBase || configured[0] || "und";
+        return sameBase || preferredConfiguredLanguageTag();
       }
 
       function languageBase(value) {
@@ -2149,9 +2200,99 @@ private extension DirectRealtimeController {
         ));
       }
 
+      function realtimeTranscriptionConfiguration() {
+        const languages = configuredLanguageBases();
+        const configuration = { model: "gpt-live-transcribe" };
+        if (languages.length > 0) {
+          configuration.languages = languages;
+        }
+        return configuration;
+      }
+
+      function preferredConfiguredLanguageTag() {
+        const configured = configuredLanguageTags();
+        const wakeLocale = String(
+          session?.startPayload?.wakeLocale || ""
+        ).replace(/_/gu, "-");
+        const exact = configured.find(tag =>
+          tag.toLocaleLowerCase() === wakeLocale.toLocaleLowerCase()
+        );
+        if (exact) return exact;
+        const wakeBase = languageBase(wakeLocale);
+        return configured.find(tag =>
+          languageBase(tag) === wakeBase
+        ) || configured[0] || "und";
+      }
+
+      function configuredLocaleScripts() {
+        const scripts = new Set();
+        for (const tag of configuredLanguageTags()) {
+          try {
+            const script = new Intl.Locale(tag).maximize().script;
+            if (script) scripts.add(script);
+          } catch (_) {}
+        }
+        return scripts;
+      }
+
+      function strongScriptName(character) {
+        const patterns = [
+          ["Latn", /\p{Script=Latin}/u],
+          ["Hang", /\p{Script=Hangul}/u],
+          ["Hani", /\p{Script=Han}/u],
+          ["Hira", /\p{Script=Hiragana}/u],
+          ["Kana", /\p{Script=Katakana}/u],
+          ["Cyrl", /\p{Script=Cyrillic}/u],
+          ["Arab", /\p{Script=Arabic}/u],
+          ["Deva", /\p{Script=Devanagari}/u],
+          ["Grek", /\p{Script=Greek}/u],
+          ["Hebr", /\p{Script=Hebrew}/u],
+          ["Thai", /\p{Script=Thai}/u]
+        ];
+        return patterns.find(([, pattern]) =>
+          pattern.test(character)
+        )?.[0] || "";
+      }
+
+      function allowedStrongScripts() {
+        const allowed = new Set();
+        for (const script of configuredLocaleScripts()) {
+          if (script === "Kore") {
+            allowed.add("Hang");
+          } else if (script === "Jpan") {
+            allowed.add("Hira");
+            allowed.add("Kana");
+            allowed.add("Hani");
+          } else if (script === "Hans"
+              || script === "Hant"
+              || script === "Hanb") {
+            allowed.add("Hani");
+          } else {
+            allowed.add(script);
+          }
+        }
+        return allowed;
+      }
+
+      function hasClearlyUnconfiguredScript(value) {
+        const allowed = allowedStrongScripts();
+        if (allowed.size === 0) return false;
+        let strongCount = 0;
+        let allowedCount = 0;
+        for (const character of String(value || "")) {
+          if (!/\p{L}/u.test(character)) continue;
+          const script = strongScriptName(character);
+          if (!script) continue;
+          strongCount += 1;
+          if (allowed.has(script)) allowedCount += 1;
+        }
+        if (strongCount < 2 || allowedCount > 0) return false;
+        return (strongCount - allowedCount) / strongCount >= 0.70;
+      }
+
       function configuredSpokenLanguageBoundary() {
         const configured = configuredLanguageTags();
-        const fallback = configured[0] || "und";
+        const fallback = preferredConfiguredLanguageTag();
         return (
           `The only allowed spoken_language tags are ${JSON.stringify(configured)}. ` +
           `Return one exact tag from that list. If the language cannot be identified within that list, return the configured fallback ${JSON.stringify(fallback)} and choose a non-mutating clarification for short or uncertain speech. Never introduce another language.`
@@ -2685,12 +2826,81 @@ private extension DirectRealtimeController {
           /(?:\b(?:task|thread|session|request|run|job|message|conversation|trace)\s*(?:id|identifier)\b|(?:작업|태스크|스레드|세션|요청|실행|메시지|대화|트레이스)\s*(?:id|아이디|식별자))\s*[은는이가]?\s*(?:is|was|:|=)?\s*[`*_]*\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b[`*_]*(?:\s*(?:야|예요|입니다))?[.!]?/giu;
         const labeledFullHash =
           /(?:\b(?:commit|revision|sha(?:-?1)?)\b|(?:커밋|리비전|해시))\s*[은는이가]?\s*(?:is|was|:|=)?\s*[`*_]*\b(?:[0-9a-f]{40}|[0-9a-f]{64})\b[`*_]*(?:\s*(?:야|예요|입니다))?[.!]?/giu;
+        const rawLines = String(text || "")
+          .replace(/\r\n?/g, "\n")
+          .split("\n");
+        const isTerminalReferenceLine = line => {
+          const value = String(line || "").trim();
+          if (!value) return false;
+          return standaloneLink.test(value)
+            || /^(?:https?:\/\/|www\.)\S+\s*[.!]?$/iu.test(value)
+            || /^<(?:https?:\/\/|www\.)[^>]+>\s*[.!]?$/iu.test(value)
+            || footnoteDefinition.test(value);
+        };
+        const isShortStandaloneSourceLabel = line => {
+          const value = String(line || "")
+            .replace(/^\s*(?:[-*•]|\d+[.)])\s*/u, "")
+            .trim();
+          if (!value || value.length > 96) return false;
+          if (sourceHeading.test(value)
+              || sourceLikeLine.test(value)
+              || /[.!?。！？]\s*$/u.test(value)
+              || /[:;]\s+/u.test(value)) {
+            return false;
+          }
+          const words = value.split(/\s+/u).filter(Boolean);
+          return words.length <= 12 && /[\p{L}\p{N}]/u.test(value);
+        };
+        let terminalIndex = rawLines.length - 1;
+        while (
+          terminalIndex >= 0
+          && !rawLines[terminalIndex].trim()
+        ) {
+          terminalIndex -= 1;
+        }
+        let removedTerminalSource = false;
+        while (
+          terminalIndex >= 0
+          && isTerminalReferenceLine(rawLines[terminalIndex])
+        ) {
+          removedTerminalSource = true;
+          rawLines.splice(terminalIndex, 1);
+          terminalIndex -= 1;
+          while (
+            terminalIndex >= 0
+            && !rawLines[terminalIndex].trim()
+          ) {
+            rawLines.splice(terminalIndex, 1);
+            terminalIndex -= 1;
+          }
+          if (
+            terminalIndex >= 0
+            && isShortStandaloneSourceLabel(rawLines[terminalIndex])
+          ) {
+            rawLines.splice(terminalIndex, 1);
+            terminalIndex -= 1;
+          }
+          while (
+            terminalIndex >= 0
+            && !rawLines[terminalIndex].trim()
+          ) {
+            rawLines.splice(terminalIndex, 1);
+            terminalIndex -= 1;
+          }
+        }
+        if (removedTerminalSource) {
+          while (
+            terminalIndex >= 0
+            && sourceHeading.test(rawLines[terminalIndex].trim())
+          ) {
+            rawLines.splice(terminalIndex, 1);
+            terminalIndex -= 1;
+          }
+        }
         const output = [];
         let skippingSourceBlock = false;
 
-        for (const rawLine of String(text || "")
-          .replace(/\r\n?/g, "\n")
-          .split("\n")) {
+        for (const rawLine of rawLines) {
           const trimmed = rawLine.trim();
           if (sourceHeading.test(trimmed)) {
             skippingSourceBlock = true;
@@ -3962,7 +4172,10 @@ private extension DirectRealtimeController {
             && confidence !== "high") {
           action = "clarify";
         }
-        if (!configuredLanguage && isShortUncertainTranscript(text)) {
+        if (
+          (!configuredLanguage && isShortUncertainTranscript(text))
+          || hasClearlyUnconfiguredScript(text)
+        ) {
           action = "clarify";
         }
 
@@ -4152,6 +4365,10 @@ private extension DirectRealtimeController {
         }
         switch (event.type) {
           case "input_audio_buffer.speech_started": {
+            try {
+              clearTimeout(session.wakeGreetingTimer);
+            } catch (_) {}
+            session.wakeGreetingTimer = null;
             const beginning = beginUserUtterance(event);
             diagnostic("vad_speech_started", generation, {
               groupID: String(beginning?.group?.id || ""),
@@ -4169,6 +4386,7 @@ private extension DirectRealtimeController {
             send({
               type: "userTranscriptPartial",
               generation: session.generation,
+              turnId: String(beginning?.group?.id || ""),
               text: combinedPendingUserTranscript()
             });
             break;
@@ -4224,6 +4442,7 @@ private extension DirectRealtimeController {
             send({
               type: "userTranscriptPartial",
               generation: session.generation,
+              turnId: String(segment.groupID || ""),
               text: session.currentUserTranscript
             });
             break;
@@ -4413,8 +4632,13 @@ private extension DirectRealtimeController {
                   && stopTarget !== "current_voice_or_codex_work"
                 ? "codex"
                 : requestedKind;
-            if (!classifierLanguageConfigured
-                && isShortUncertainTranscript(text)) {
+            if (
+              (
+                !classifierLanguageConfigured
+                && isShortUncertainTranscript(text)
+              )
+              || hasClearlyUnconfiguredScript(text)
+            ) {
               kind = "clarify";
             }
             const socialOrigin = kind === "direct_chat"
@@ -5084,6 +5308,8 @@ private extension DirectRealtimeController {
           lastReportedAssistantDraft: "",
           lastReportedPhase: "",
           draftFlushTimer: null,
+          wakeGreetingTimer: null,
+          transcriptionUpdateEventID: "",
           productName: String(payload.productName || "Voice Relay"),
           assistantName: String(payload.assistantName || "Relay"),
           wakePhrases: Array.isArray(payload.wakePhrases)
@@ -5110,32 +5336,37 @@ private extension DirectRealtimeController {
           .split("-")[0]
           .toLocaleLowerCase();
         const acceptedLanguageCodes = configuredLanguageTags();
-        const configuredBaseLanguages = Array.from(new Set(
-          acceptedLanguageCodes.map(languageBase).filter(Boolean)
-        ));
-        const transcriptionLanguageHint =
-          configuredBaseLanguages.length === 1
-            ? configuredBaseLanguages[0]
-            : "";
+        const transcriptionConfiguration =
+          realtimeTranscriptionConfiguration();
+        const transcriptionUpdateEventID =
+          nextClientEventId("transcription-session-update");
+        session.transcriptionUpdateEventID =
+          transcriptionUpdateEventID;
         const configuredLanguageBoundary =
           "\n\n# Configured identity and languages\n" +
           `The configured assistant name is ${JSON.stringify(String(startPayload.assistantName || "Assistant"))}. ` +
           `The configured product name is ${JSON.stringify(String(startPayload.productName || "Voice Assistant"))}. ` +
           `The primary input language is ${JSON.stringify(primaryInputLanguage || "system")}. ` +
+          `For this activation, prefer ${JSON.stringify(preferredConfiguredLanguageTag())} when the current utterance is ambiguous. ` +
           `The only allowed languages are these normalized configured languages: ${JSON.stringify(acceptedLanguageCodes)}. ` +
           "Reply in the language actually spoken by the user. " +
-          "When a short utterance is ambiguous, prefer the primary input language and never switch scripts from weak evidence or introduce an unconfigured language.";
+          "When a short utterance is ambiguous, prefer the configured language selected for this activation and never switch scripts from weak evidence or introduce an unconfigured language.";
         diagnostic("realtime_media_configured", generation, {
           channel: "input_and_output",
           kind: "server_vad",
           reason: "session_update",
           shape:
             "pcm24k;threshold=0.68;prefix_ms=300;silence_ms=1200;create_response=false;interrupt_response=false",
-          source: "gpt-4o-mini-transcribe",
-          status: String(startPayload.voice || "")
+          source: String(transcriptionConfiguration.model || ""),
+          status: JSON.stringify(
+            transcriptionConfiguration.languages
+              || transcriptionConfiguration.language
+              || []
+          )
         });
         dataSend({
           type: "session.update",
+          event_id: transcriptionUpdateEventID,
           session: {
             type: "realtime",
             output_modalities: ["audio"],
@@ -5169,12 +5400,7 @@ private extension DirectRealtimeController {
                   type: "audio/pcm",
                   rate: 24000
                 },
-                transcription: {
-                  model: "gpt-4o-mini-transcribe",
-                  ...(transcriptionLanguageHint
-                    ? { language: transcriptionLanguageHint }
-                    : {})
-                },
+                transcription: transcriptionConfiguration,
                 turn_detection: {
                   type: "server_vad",
                   create_response: false,
@@ -5211,47 +5437,82 @@ private extension DirectRealtimeController {
         const activationReason =
           String(startPayload.activationReason || "");
         const isWakeOnly = activationReason === "wake_only";
+        if (isWakeOnly) {
+          diagnostic(
+            "wake_only_prefill_not_routed",
+            generation,
+            {
+              reason: "wake_token_is_activation_not_user_turn",
+              status: preferredConfiguredLanguageTag()
+            }
+          );
+        }
         if (prefill && !isWakeOnly) {
+          const activationID =
+            String(startPayload.activationID || "")
+            || `prefill-${generation}`;
+          send({
+            type: "userTranscript",
+            generation,
+            turnId: activationID,
+            text: prefill
+          });
           acceptUserTurn(
             prefill,
             true,
+            true,
             false,
-            false,
-            `prefill-${generation}`
+            activationID
           );
         } else if (startPayload.shouldGreet) {
-          session.awaitingFinal = true;
           const isPresenceReturn =
             activationReason === "presence_return";
           const greetingLanguage =
-            configuredLanguageTags()[0]
+            preferredConfiguredLanguageTag()
             || String(startPayload.language || "und");
-          if (prefill && isWakeOnly) {
+          const createGreeting = () => {
+            if (!session
+                || session.generation !== generation
+                || session.userSpeechActive
+                || session.activeUserTurn
+                || session.acceptedTurnQueue.length > 0) {
+              return;
+            }
+            session.awaitingFinal = true;
+            dataSend({
+              type: "response.create",
+              response: {
+                tool_choice: "none",
+                metadata: {
+                  voice_relay_kind: isPresenceReturn
+                    ? "presence_return_greeting"
+                    : "wake_acknowledgement"
+                },
+                instructions:
+                  isPresenceReturn
+                    ? `You are ${session.assistantName} in ${session.productName}. The user has just returned after being away. Use only the configured greeting language BCP 47 tag ${JSON.stringify(greetingLanguage)}. Give one very brief, natural welcome-back greeting, then stop and listen. Choose fresh wording freely instead of using a fixed stock phrase. Do not mention tools, routing, absence duration, or capabilities.`
+                    : `You are ${session.assistantName} in ${session.productName}. The user just called your configured wake phrase. Use only the configured greeting language BCP 47 tag ${JSON.stringify(greetingLanguage)}. Give one very brief, natural acknowledgement that you heard them and are listening, then stop and listen. Choose fresh wording freely instead of using a fixed stock phrase. Do not mention tools, routing, or capabilities.`
+              }
+            });
+            state("speaking", generation);
+          };
+          if (Boolean(payload.handoffReplaySent) && isWakeOnly) {
             diagnostic(
-              "wake_only_prefill_not_routed",
+              "wake_acknowledgement_deferred_for_handoff_audio",
               generation,
               {
-                reason: "wake_token_is_activation_not_user_turn",
+                delayMs: "2700",
                 status: greetingLanguage
               }
             );
+            session.wakeGreetingTimer = setTimeout(
+              createGreeting,
+              2700
+            );
+            state("listening", generation);
+          } else {
+            createGreeting();
           }
-          dataSend({
-            type: "response.create",
-            response: {
-              tool_choice: "none",
-              metadata: {
-                voice_relay_kind: isPresenceReturn
-                  ? "presence_return_greeting"
-                  : "wake_acknowledgement"
-              },
-              instructions:
-                isPresenceReturn
-                  ? `You are ${session.assistantName} in ${session.productName}. The user has just returned after being away. Use only the configured greeting language BCP 47 tag ${JSON.stringify(greetingLanguage)}. Give one very brief, natural welcome-back greeting, then stop and listen. Choose fresh wording freely instead of using a fixed stock phrase. Do not mention tools, routing, absence duration, or capabilities.`
-                  : `You are ${session.assistantName} in ${session.productName}. The user just called your configured wake phrase. Use only the configured greeting language BCP 47 tag ${JSON.stringify(greetingLanguage)}. Give one very brief, natural acknowledgement that you heard them and are listening, then stop and listen. Choose fresh wording freely instead of using a fixed stock phrase. Do not mention tools, routing, or capabilities.`
-            }
-          });
-          state("speaking", generation);
         } else {
           state("listening", generation);
         }

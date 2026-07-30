@@ -1090,9 +1090,16 @@ struct WakePhraseMatch: Equatable {
     let command: String
 }
 
+struct WakeActivationContext: Equatable {
+    let activationID: String
+    let commandText: String
+    let wakeLocaleIdentifier: String
+    let handoffTicketID: String?
+}
+
 enum WakeRealtimePrefillPolicy {
-    static func prefill(recognizedTranscript: String) -> String {
-        recognizedTranscript.trimmingCharacters(
+    static func prefill(command: String) -> String {
+        command.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
     }
@@ -1102,6 +1109,7 @@ struct SpeechAnalyzerWakeTranscriptReducer {
     struct Emission: Equatable {
         let transcript: String
         let segmentCount: Int
+        let audioEndSeconds: TimeInterval
     }
 
     private struct Segment: Equatable {
@@ -1204,7 +1212,8 @@ struct SpeechAnalyzerWakeTranscriptReducer {
         guard !transcript.isEmpty else { return nil }
         return Emission(
             transcript: transcript,
-            segmentCount: segments.count
+            segmentCount: segments.count,
+            audioEndSeconds: segments.map(\.end).max() ?? 0
         )
     }
 
@@ -1221,16 +1230,22 @@ struct SpeechAnalyzerWakeTranscriptReducer {
 
 enum WakePhraseCapturePolicy {
     static let partialSettlementGrace: TimeInterval = 1.05
-    static let finalizedGrace: TimeInterval = 0.16
+    static let finalizedWakeOnlyGrace: TimeInterval = 1.05
+    static let finalizedCommandGrace: TimeInterval = 0.16
+    static let partialCommandGrace: TimeInterval = 0.35
 
     static func activationDelay(
         for match: WakePhraseMatch,
         isFinal: Bool
     ) -> TimeInterval {
-        if isFinal {
-            return finalizedGrace
+        if match.command.isEmpty {
+            return isFinal
+                ? finalizedWakeOnlyGrace
+                : partialSettlementGrace
         }
-        return partialSettlementGrace
+        return isFinal
+            ? finalizedCommandGrace
+            : partialCommandGrace
     }
 
     static func preferred(
@@ -1302,6 +1317,291 @@ struct WakeAnalyzerInputTimeline {
         let startFrame = nextFramePosition
         nextFramePosition += Int64(max(0, frameCount))
         return startFrame
+    }
+}
+
+struct WakeAudioFrameSpan: Equatable {
+    let startFrame: Int64
+    let endFrame: Int64
+}
+
+struct WakeAudioHandoffTicket: Equatable {
+    let id: String
+    let recognizedThroughFrame: Int64
+}
+
+enum WakeAudioHandoffReplay: Equatable {
+    case ready(Data)
+    case truncated
+    case unavailable
+}
+
+struct WakeAudioHandoffJournal {
+    static let sampleRate: Int64 = 24_000
+    static let bytesPerFrame = MemoryLayout<Int16>.size
+    static let rollingFrameCapacity = sampleRate * 3
+    static let committedByteCapacity = 1_048_576
+
+    private struct Record {
+        var startFrame: Int64
+        var data: Data
+
+        var endFrame: Int64 {
+            startFrame
+                + Int64(data.count / WakeAudioHandoffJournal.bytesPerFrame)
+        }
+    }
+
+    private var records: [Record] = []
+    private(set) var nextFrame: Int64 = 0
+    private var ticket: WakeAudioHandoffTicket?
+    private var claimedGeneration: Int?
+    private var truncated = false
+
+    var hasCommittedHandoff: Bool {
+        ticket != nil
+    }
+
+    mutating func beginWake() {
+        records.removeAll(keepingCapacity: true)
+        nextFrame = 0
+        ticket = nil
+        claimedGeneration = nil
+        truncated = false
+    }
+
+    @discardableResult
+    mutating func append(pcm rawPCM: Data) -> WakeAudioFrameSpan {
+        let usableByteCount =
+            rawPCM.count - rawPCM.count % Self.bytesPerFrame
+        let pcm = rawPCM.prefix(usableByteCount)
+        let span = WakeAudioFrameSpan(
+            startFrame: nextFrame,
+            endFrame:
+                nextFrame + Int64(usableByteCount / Self.bytesPerFrame)
+        )
+        guard !pcm.isEmpty else { return span }
+        records.append(
+            Record(
+                startFrame: span.startFrame,
+                data: Data(pcm)
+            )
+        )
+        nextFrame = span.endFrame
+        if let ticket {
+            let retainedBytes = max(
+                0,
+                Int(nextFrame - ticket.recognizedThroughFrame)
+                    * Self.bytesPerFrame
+            )
+            if retainedBytes > Self.committedByteCapacity {
+                truncated = true
+            }
+        } else {
+            trimBefore(
+                max(0, nextFrame - Self.rollingFrameCapacity)
+            )
+        }
+        return span
+    }
+
+    mutating func commit(
+        recognizedThroughFrame: Int64,
+        ticketID: String = UUID().uuidString
+    ) -> WakeAudioHandoffTicket {
+        let earliestFrame = records.first?.startFrame ?? nextFrame
+        let boundaryWasAlreadyTrimmed =
+            recognizedThroughFrame < earliestFrame
+        let boundary = min(
+            nextFrame,
+            max(earliestFrame, recognizedThroughFrame)
+        )
+        let resolved = WakeAudioHandoffTicket(
+            id: ticketID,
+            recognizedThroughFrame: boundary
+        )
+        ticket = resolved
+        claimedGeneration = nil
+        truncated = boundaryWasAlreadyTrimmed
+        trimBefore(boundary)
+        return resolved
+    }
+
+    mutating func claim(
+        ticketID: String,
+        generation: Int
+    ) -> Bool {
+        guard ticket?.id == ticketID,
+              claimedGeneration == nil else {
+            return false
+        }
+        claimedGeneration = generation
+        return true
+    }
+
+    mutating func replay(
+        ticketID: String,
+        generation: Int
+    ) -> WakeAudioHandoffReplay {
+        guard let ticket,
+              ticket.id == ticketID,
+              claimedGeneration == generation else {
+            return .unavailable
+        }
+        guard !truncated else { return .truncated }
+        var result = Data()
+        for record in records {
+            guard record.endFrame > ticket.recognizedThroughFrame else {
+                continue
+            }
+            let startFrame = max(
+                record.startFrame,
+                ticket.recognizedThroughFrame
+            )
+            let byteOffset =
+                Int(startFrame - record.startFrame) * Self.bytesPerFrame
+            result.append(record.data.dropFirst(byteOffset))
+        }
+        return .ready(result)
+    }
+
+    mutating func finish(ticketID: String, generation: Int) {
+        guard ticket?.id == ticketID,
+              claimedGeneration == generation else {
+            return
+        }
+        beginWake()
+    }
+
+    mutating func cancel(ticketID: String? = nil) {
+        if let ticketID, ticket?.id != ticketID {
+            return
+        }
+        beginWake()
+    }
+
+    private mutating func trimBefore(_ cutoffFrame: Int64) {
+        while let first = records.first,
+              first.endFrame <= cutoffFrame {
+            records.removeFirst()
+        }
+        guard !records.isEmpty,
+              records[0].startFrame < cutoffFrame else {
+            return
+        }
+        let byteOffset =
+            Int(cutoffFrame - records[0].startFrame) * Self.bytesPerFrame
+        records[0].data = Data(records[0].data.dropFirst(byteOffset))
+        records[0].startFrame = cutoffFrame
+    }
+}
+
+struct WakeAudioReplayPump {
+    static let controlQueueReserve = 16
+
+    private var bytes = Data()
+    private var readOffset = 0
+
+    var pendingByteCount: Int {
+        max(0, bytes.count - readOffset)
+    }
+
+    var hasPendingBytes: Bool {
+        pendingByteCount > 0
+    }
+
+    mutating func append(_ value: Data) {
+        guard !value.isEmpty else { return }
+        compactIfUseful()
+        bytes.append(value)
+    }
+
+    mutating func takeAvailableChunks(
+        bytesPerChunk: Int,
+        outboundCount: Int,
+        maximumOutbound: Int
+    ) -> [Data] {
+        let chunkSize = max(1, bytesPerChunk)
+        let safeCapacity = max(
+            0,
+            maximumOutbound - Self.controlQueueReserve
+        )
+        let availableSlots = max(0, safeCapacity - outboundCount)
+        let chunkCount = min(
+            availableSlots,
+            pendingByteCount / chunkSize
+        )
+        guard chunkCount > 0 else { return [] }
+        var chunks: [Data] = []
+        chunks.reserveCapacity(chunkCount)
+        for _ in 0..<chunkCount {
+            let end = readOffset + chunkSize
+            chunks.append(Data(bytes[readOffset..<end]))
+            readOffset = end
+        }
+        compactIfUseful()
+        return chunks
+    }
+
+    mutating func takeRemainderIfBelowChunk(
+        bytesPerChunk: Int
+    ) -> Data? {
+        guard pendingByteCount < max(1, bytesPerChunk) else {
+            return nil
+        }
+        let remainder = Data(bytes.dropFirst(readOffset))
+        reset()
+        return remainder
+    }
+
+    mutating func reset() {
+        bytes.removeAll(keepingCapacity: false)
+        readOffset = 0
+    }
+
+    private mutating func compactIfUseful() {
+        guard readOffset > 0,
+              readOffset >= 65_536
+                || readOffset * 2 >= bytes.count else {
+            return
+        }
+        bytes = Data(bytes.dropFirst(readOffset))
+        readOffset = 0
+    }
+}
+
+struct CanonicalUserTurnDisplayRegistry {
+    private var generation: Int?
+    private var payloads: [String: String] = [:]
+    private var order: [String] = []
+    private let maximumRememberedTurns = 128
+
+    mutating func begin(generation: Int) {
+        self.generation = generation
+        payloads.removeAll(keepingCapacity: true)
+        order.removeAll(keepingCapacity: true)
+    }
+
+    mutating func accept(
+        generation: Int,
+        turnID: String,
+        text: String
+    ) -> Bool {
+        guard self.generation == generation else { return false }
+        let id = turnID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty, !value.isEmpty else { return false }
+        if payloads[id] != nil { return false }
+        payloads[id] = value
+        order.append(id)
+        while order.count > maximumRememberedTurns {
+            payloads.removeValue(forKey: order.removeFirst())
+        }
+        return true
+    }
+
+    func isFinalized(generation: Int, turnID: String) -> Bool {
+        self.generation == generation && payloads[turnID] != nil
     }
 }
 

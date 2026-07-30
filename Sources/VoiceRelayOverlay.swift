@@ -929,6 +929,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private var voiceState = VoiceSurfaceReducer()
     private var lastNotchActivityLayoutState: Bool?
     private var conversationTranscript = ConversationTranscriptState()
+    private var userTurnDisplayRegistry =
+        CanonicalUserTurnDisplayRegistry()
     private var streamedAnswer = ""
     private var conversationHistory: [ConversationEntry] {
         conversationTranscript.history
@@ -2480,22 +2482,27 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 voice: self.config.realtimeVoice
             )
         }
-        wakePhrase.onWake = { [weak self] match, realtimePrefill in
+        wakePhrase.onWake = { [weak self] match, activation in
             VoiceRelayDiagnostics.flow(
                 "wake_to_realtime_handoff",
                 fields: [
+                    "handoff": activation.handoffTicketID == nil
+                        ? "unavailable"
+                        : "committed",
+                    "locale": activation.wakeLocaleIdentifier,
                     "reason": match.command.isEmpty
                         ? "wake_only"
                         : "wake_with_command",
                 ],
                 transcriptFields: [
                     "command": match.command,
-                    "text": realtimePrefill,
+                    "text": activation.commandText,
                 ]
             )
             self?.startRealtimeVoice(
-                prefill: realtimePrefill,
-                acknowledgeWake: match.command.isEmpty
+                prefill: activation.commandText,
+                acknowledgeWake: match.command.isEmpty,
+                wakeActivation: activation
             )
         }
         wakePhrase.onError = { [weak self] message in
@@ -2563,18 +2570,44 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             }
         case "userTranscriptPartial":
             guard let text = event["text"] as? String else { return }
-            realtimeUserDraft = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !realtimeUserDraft.isEmpty else { return }
-            beginRealtimeUserTurn(generation: generation)
-            if resolvedAnchor == .notch {
-                isReplyPreviewVisible = true
-                showConversationHistory(
-                    animated: !answerTargetVisible && config.animateSurface
-                )
+            let turnID = (event["turnId"] as? String) ?? ""
+            if !turnID.isEmpty,
+               userTurnDisplayRegistry.isFinalized(
+                   generation: generation,
+                   turnID: turnID
+               ) {
+                return
             }
+            guard !text.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty else {
+                return
+            }
+            beginRealtimeUserTurn(generation: generation)
         case "userTranscript":
             guard let text = event["text"] as? String else { return }
-            let turnID = (event["turnId"] as? String) ?? ""
+            let turnID = ((event["turnId"] as? String) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !turnID.isEmpty else {
+                VoiceRelayDiagnostics.flow(
+                    "realtime_user_turn_display_rejected",
+                    generation: generation,
+                    fields: ["reason": "missing_turn_id"]
+                )
+                return
+            }
+            guard userTurnDisplayRegistry.accept(
+                   generation: generation,
+                   turnID: turnID,
+                   text: text
+               ) else {
+                VoiceRelayDiagnostics.flow(
+                    "realtime_user_turn_display_duplicate_ignored",
+                    generation: generation,
+                    fields: ["turnID": turnID]
+                )
+                return
+            }
             SettingsStore.shared.completedFirstVoiceGreeting = true
             scheduleVoiceIdleTimeout()
             beginRealtimeUserTurn(generation: generation)
@@ -2589,6 +2622,12 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                     animated: !answerTargetVisible && config.animateSurface
                 )
             }
+            VoiceRelayDiagnostics.flow(
+                "realtime_user_turn_displayed",
+                generation: generation,
+                fields: ["turnID": turnID],
+                transcriptFields: ["userText": text]
+            )
         case "assistantProgress":
             guard let text = event["text"] as? String else { return }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2803,7 +2842,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private func startRealtimeVoice(
         prefill: String? = nil,
         acknowledgeWake: Bool = false,
-        activationReason: String? = nil
+        activationReason: String? = nil,
+        wakeActivation: WakeActivationContext? = nil
     ) -> Bool {
         guard !voiceState.phase.isSessionActive,
               Date() >= nextVoiceStartAllowedAt else {
@@ -2852,6 +2892,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             setAnswerVisible(false, animated: config.animateSurface)
         }
         let generation = voiceState.begin()
+        userTurnDisplayRegistry.begin(generation: generation)
         VoiceRelayDiagnostics.flow(
             "realtime_surface_starting",
             generation: generation,
@@ -2898,7 +2939,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                         ? exactPrefill
                         : nil,
                     shouldGreet: shouldGreet,
-                    reason: resolvedActivationReason
+                    reason: resolvedActivationReason,
+                    wakeActivation: wakeActivation
                 )
             }
         )

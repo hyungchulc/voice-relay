@@ -1191,9 +1191,11 @@ runtime.start({
   productName: "Voice Relay",
   assistantName: "Aria",
   wakePhrases: ["Aria"],
-  prefill: "Aria, check the weather.",
+  prefill: "check the weather.",
   shouldGreet: false,
   activationReason: "wake_with_command",
+  activationID: "wake-command-73",
+  wakeLocale: "en-US",
 });
 runtime.transportOpened({ generation: 73 });
 runtime.transportReady({ generation: 73 });
@@ -1213,11 +1215,106 @@ assert.equal(
   wakeWithCommandEvents.filter(event =>
     event.type === "conversation.item.create"
     && event.item?.role === "user"
-    && event.item?.content?.[0]?.text === "Aria, check the weather."
+    && event.item?.content?.[0]?.text === "check the weather."
   ).length,
   1,
-  "wake-only filtering must not discard a real command tail",
+  "wake handoff must route the canonical command without duplicating the wake phrase",
 );
+assert.equal(
+  nativeMessages
+    .slice(wakeWithCommandPrefillStart)
+    .filter(message =>
+      message.type === "userTranscript"
+      && message.turnId === "wake-command-73"
+      && message.text === "check the weather."
+    ).length,
+  1,
+  "the first wake-command utterance must become visible exactly once with its stable activation identity",
+);
+
+const koreanWakePriorityStart = nativeMessages.length;
+runtime.start({
+  generation: 74,
+  language: "en-US",
+  additionalLanguages: ["ko-KR"],
+  productName: "Voice Relay",
+  assistantName: "Aria",
+  wakePhrases: ["아리아야", "Hey Aria"],
+  prefill: "",
+  shouldGreet: true,
+  activationReason: "wake_only",
+  activationID: "wake-only-74",
+  wakeLocale: "ko-KR",
+});
+runtime.transportOpened({ generation: 74 });
+runtime.transportReady({
+  generation: 74,
+  handoffReplaySent: false,
+});
+const koreanWakeEvents = nativeMessages
+  .slice(koreanWakePriorityStart)
+  .filter(message => message.type === "realtimeSend")
+  .map(message => JSON.parse(message.eventJSON));
+assert.equal(
+  JSON.stringify(
+    Array.from(
+      koreanWakeEvents.find(event =>
+        event.type === "session.update"
+      )?.session?.audio?.input?.transcription?.languages || [],
+    ),
+  ),
+  JSON.stringify(["en", "ko"]),
+  "wake language evidence must not rewrite the settings-derived ASR language order",
+);
+assert.match(
+  koreanWakeEvents.find(event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind
+      === "wake_acknowledgement"
+  )?.response?.instructions || "",
+  /configured greeting language BCP 47 tag "ko-KR"/,
+  "a Korean wake locale must select Korean for the acknowledgement within the configured set",
+);
+
+const replayedWakeStart = nativeMessages.length;
+runtime.start({
+  generation: 75,
+  language: "en-US",
+  additionalLanguages: ["ko-KR"],
+  productName: "Voice Relay",
+  assistantName: "Aria",
+  wakePhrases: ["아리아야", "Hey Aria"],
+  prefill: "",
+  shouldGreet: true,
+  activationReason: "wake_only",
+  activationID: "wake-only-replay-75",
+  wakeLocale: "ko-KR",
+});
+runtime.transportOpened({ generation: 75 });
+runtime.transportReady({
+  generation: 75,
+  handoffReplaySent: true,
+});
+assert.equal(
+  nativeMessages
+    .slice(replayedWakeStart)
+    .filter(message => message.type === "realtimeSend")
+    .map(message => JSON.parse(message.eventJSON))
+    .filter(event =>
+      event.type === "response.create"
+      && event.response?.metadata?.voice_relay_kind
+        === "wake_acknowledgement"
+    ).length,
+  0,
+  "replayed post-wake audio must suppress an immediate greeting that could mask the suffix",
+);
+runtime.receiveRealtimeEvent({
+  generation: 75,
+  event: {
+    type: "input_audio_buffer.speech_started",
+    item_id: "wake-replay-suffix-75",
+  },
+});
 
 const presenceReturnStart = nativeMessages.length;
 runtime.start({
@@ -2052,6 +2149,50 @@ assert.equal(
     .at(-1)?.text,
   sourceRichOriginal,
   "speech projection must not alter the exact Codex final shown on the visible surface",
+);
+
+const terminalSourceHarness = makeContractHarness({
+  generation: 109,
+  language: "en-US",
+});
+const terminalSourceCall = beginContractCodex(
+  terminalSourceHarness,
+  "Give me the verified summary.",
+);
+const terminalSourceOriginal =
+  "The Weather Network reported clear skies in the substantive answer.\n\n" +
+  "The Weather Network\n" +
+  "https://weather.example/current\n\n" +
+  "Official forecast\n" +
+  "[Forecast details](https://weather.example/details)";
+terminalSourceHarness.runtime.resolveCodex({
+  generation: terminalSourceHarness.generation,
+  callId: terminalSourceCall.callID,
+  output: terminalSourceOriginal,
+});
+const terminalSourceFunctionOutput =
+  terminalSourceHarness.outbound().findLast(event =>
+    event.type === "conversation.item.create"
+    && event.item?.type === "function_call_output"
+    && event.item?.call_id === terminalSourceCall.callID
+  );
+const terminalSourceSpeech = JSON.parse(
+  terminalSourceFunctionOutput?.item?.output || "{}",
+).answer || "";
+assert.equal(
+  terminalSourceSpeech,
+  "The Weather Network reported clear skies in the substantive answer.",
+  "one or multiple trailing source label and URL records must be omitted from speech",
+);
+assert.match(
+  terminalSourceSpeech,
+  /The Weather Network reported clear skies/,
+  "an ordinary proper name in substantive prose must remain spoken",
+);
+assert.doesNotMatch(
+  terminalSourceSpeech,
+  /Official forecast|Forecast details|https?:\/\//,
+  "Markdown and raw URL source tails must not leak labels or destinations into audio",
 );
 
 const pendingResponseBargeInStart = nativeMessages.length;
@@ -4362,10 +4503,20 @@ const primaryOnlyTranscription =
   primaryOnlyLanguageHarness.outbound()
     .find(event => event.type === "session.update")
     ?.session?.audio?.input?.transcription;
+assert.deepEqual(
+  Array.from(primaryOnlyTranscription?.languages || []),
+  ["ko"],
+  "one primary configured language must provide its normalized ASR base list",
+);
 assert.equal(
-  primaryOnlyTranscription?.language,
-  "ko",
-  "one primary configured language must provide its normalized ASR base hint",
+  primaryOnlyTranscription?.model,
+  "gpt-live-transcribe",
+  "configured language hints must use the supported multilingual transcription model",
+);
+assert.equal(
+  Object.hasOwn(primaryOnlyTranscription || {}, "language"),
+  false,
+  "gpt-live-transcribe must never receive a singular language field",
 );
 
 const oneBaseLanguageHarness = makeContractHarness({
@@ -4377,10 +4528,15 @@ const oneBaseTranscription =
   oneBaseLanguageHarness.outbound()
     .find(event => event.type === "session.update")
     ?.session?.audio?.input?.transcription;
+assert.deepEqual(
+  Array.from(oneBaseTranscription?.languages || []),
+  ["en"],
+  "regional variants of one configured base language must retain one deduplicated ASR base",
+);
 assert.equal(
-  oneBaseTranscription?.language,
-  "en",
-  "regional variants of one configured base language must retain one ASR hint",
+  Object.hasOwn(oneBaseTranscription || {}, "language"),
+  false,
+  "a deduplicated one-base list must not serialize a singular language field",
 );
 
 const multiBaseLanguageHarness = makeContractHarness({
@@ -4393,9 +4549,14 @@ const multiBaseTranscription =
     .find(event => event.type === "session.update")
     ?.session?.audio?.input?.transcription;
 assert.equal(
+  JSON.stringify(Array.from(multiBaseTranscription?.languages || [])),
+  JSON.stringify(["ko", "en"]),
+  "multiple configured base languages must preserve settings order in the plural languages field",
+);
+assert.equal(
   Object.hasOwn(multiBaseTranscription || {}, "language"),
   false,
-  "multiple configured base languages must omit the ASR language hint",
+  "plural-language transcription must never also send a singular language",
 );
 assert.match(
   multiBaseLanguageHarness.outbound()
@@ -4403,6 +4564,23 @@ assert.match(
     ?.session?.instructions || "",
   /only allowed languages are these normalized configured languages: \["ko-KR","en-US"\]/,
   "the Realtime session must expose only the normalized primary and additional language set",
+);
+
+const changedLanguageHarness = makeContractHarness({
+  generation: 108,
+  language: "sv-SE",
+  additionalLanguages: ["en-GB", "sv-FI", "ko-KR"],
+});
+const changedLanguageTranscription =
+  changedLanguageHarness.outbound()
+    .find(event => event.type === "session.update")
+    ?.session?.audio?.input?.transcription;
+assert.equal(
+  JSON.stringify(
+    Array.from(changedLanguageTranscription?.languages || []),
+  ),
+  JSON.stringify(["sv", "en", "ko"]),
+  "a rebuilt session must derive a fresh ordered deduplicated language list from changed settings",
 );
 
 function routeOrdinaryContractTurn(
@@ -4488,6 +4666,29 @@ for (const [generation, spokenLanguage, label] of [
     `${label} classifier language must fail closed in the configured primary language`,
   );
 }
+
+const unconfiguredScriptHarness = makeContractHarness({
+  generation: 110,
+  language: "ko-KR",
+  additionalLanguages: ["en-US"],
+});
+routeOrdinaryContractTurn(unconfiguredScriptHarness, {
+  itemID: "unconfigured-script-user",
+  transcript: "侵台議成",
+  callID: "unconfigured-script-call",
+  spokenLanguage: "ko-KR",
+});
+assert.equal(
+  unconfiguredScriptHarness.native("codexRequest").length,
+  0,
+  "a clearly unconfigured script must fail closed even when the classifier returns a configured language tag",
+);
+assert.match(
+  unconfiguredScriptHarness.outbound().at(-1)
+    ?.response?.instructions || "",
+  /Ask one short clarification question/,
+  "unconfigured-script speech must receive a deterministic clarification instead of routing",
+);
 
 for (const [generation, transcript, spokenLanguage] of [
   [108, "Hani?", "en-US"],

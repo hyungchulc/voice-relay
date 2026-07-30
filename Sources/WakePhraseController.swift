@@ -4,23 +4,38 @@ import Foundation
 import OSLog
 import Speech
 
+struct WakeAudioChunk {
+    let buffer: AVAudioPCMBuffer
+    let span: WakeAudioFrameSpan
+}
+
 protocol WakeAudioBufferSource: AnyObject {
     var wakeAudioFormat: AVAudioFormat? { get }
+    var wakeAudioFrameCursor: Int64 { get }
+
+    @discardableResult
+    func prepareWakeAudioCapture() -> Bool
 
     @discardableResult
     func beginWakeAudioDelivery(
-        _ handler: @escaping (AVAudioPCMBuffer) -> Void,
+        _ handler: @escaping (WakeAudioChunk) -> Void,
         onFailure: @escaping () -> Void
     ) -> Bool
 
     func endWakeAudioDelivery()
+    func commitWakeAudioHandoff(
+        recognizedThroughFrame: Int64
+    ) -> WakeAudioHandoffTicket?
+    func cancelWakeAudioHandoff()
 }
 
 private struct WakeCaptureCandidate: Equatable {
     let match: WakePhraseMatch
-    let realtimePrefill: String
+    let transcript: String
     let isFinal: Bool
     let laneIndex: Int
+    let localeIdentifier: String
+    let recognizedThroughFrame: Int64?
 }
 
 final class WakePhraseController {
@@ -59,9 +74,10 @@ final class WakePhraseController {
     private var modernRuntimeRetryCount = 0
     private var captureStarted = false
     private var legacyUsesExternalAudioSource = false
+    private var legacyExternalCaptureStartFrame: Int64?
 
     private(set) var isMonitoring = false
-    var onWake: ((WakePhraseMatch, String) -> Void)?
+    var onWake: ((WakePhraseMatch, WakeActivationContext) -> Void)?
     var onWakeCandidate: (() -> Void)?
     var onState: ((Bool) -> Void)?
     var onError: ((String) -> Void)?
@@ -358,7 +374,12 @@ final class WakePhraseController {
             locales: locales,
             phrases: phrases,
             externalAudioSource: externalAudioSource,
-            onTranscript: { [weak self] laneIndex, transcript, isFinal in
+            onTranscript: {
+                [weak self] laneIndex,
+                localeIdentifier,
+                transcript,
+                isFinal,
+                recognizedThroughFrame in
                 DispatchQueue.main.async {
                     guard let self,
                           self.wantsMonitoring,
@@ -372,7 +393,9 @@ final class WakePhraseController {
                     _ = self.handleWakeTranscript(
                         transcript,
                         laneIndex: laneIndex,
+                        localeIdentifier: localeIdentifier,
                         isFinal: isFinal,
+                        recognizedThroughFrame: recognizedThroughFrame,
                         generation: generation
                     )
                 }
@@ -551,12 +574,19 @@ final class WakePhraseController {
         }
 
         legacyUsesExternalAudioSource = false
+        legacyExternalCaptureStartFrame = nil
+        _ = externalAudioSource?.prepareWakeAudioCapture()
         let externalCaptureFormat = externalAudioSource?.wakeAudioFormat
         let captureFormat: AVAudioFormat
         if let externalCaptureFormat,
            externalAudioSource?.beginWakeAudioDelivery({
-               [weak self] buffer in
-               self?.requests.forEach { $0.append(buffer) }
+               [weak self] chunk in
+               guard let self else { return }
+               if self.legacyExternalCaptureStartFrame == nil {
+                   self.legacyExternalCaptureStartFrame =
+                       chunk.span.startFrame
+               }
+               self.requests.forEach { $0.append(chunk.buffer) }
            }, onFailure: { [weak self] in
                DispatchQueue.main.async {
                    guard let self,
@@ -662,7 +692,13 @@ final class WakePhraseController {
                         if self.handleWakeTranscript(
                             transcript,
                             laneIndex: laneIndex,
+                            localeIdentifier:
+                                recognizer.locale.identifier,
                             isFinal: result?.isFinal == true,
+                            recognizedThroughFrame:
+                                self.legacyRecognizedThroughFrame(
+                                    transcription
+                                ),
                             generation: generation
                         ) {
                             return
@@ -689,7 +725,9 @@ final class WakePhraseController {
     private func handleWakeTranscript(
         _ transcript: String,
         laneIndex: Int,
+        localeIdentifier: String,
         isFinal: Bool,
+        recognizedThroughFrame: Int64?,
         generation: Int
     ) -> Bool {
         guard wantsMonitoring,
@@ -713,11 +751,11 @@ final class WakePhraseController {
         ) {
             wakeCandidates[laneIndex] = WakeCaptureCandidate(
                 match: match,
-                realtimePrefill: WakeRealtimePrefillPolicy.prefill(
-                    recognizedTranscript: transcript
-                ),
+                transcript: transcript,
                 isFinal: isFinal,
-                laneIndex: laneIndex
+                laneIndex: laneIndex,
+                localeIdentifier: localeIdentifier,
+                recognizedThroughFrame: recognizedThroughFrame
             )
         } else {
             wakeCandidates.removeValue(forKey: laneIndex)
@@ -778,21 +816,39 @@ final class WakePhraseController {
                 ],
                 transcriptFields: [
                     "command": candidate.match.command,
-                    "text": candidate.realtimePrefill,
+                    "text": candidate.transcript,
                 ]
+            )
+            let handoffTicket = candidate.recognizedThroughFrame.flatMap {
+                self.externalAudioSource?.commitWakeAudioHandoff(
+                    recognizedThroughFrame: $0
+                )
+            }
+            let activation = WakeActivationContext(
+                activationID: UUID().uuidString,
+                commandText: WakeRealtimePrefillPolicy.prefill(
+                    command: candidate.match.command
+                ),
+                wakeLocaleIdentifier: candidate.localeIdentifier,
+                handoffTicketID: handoffTicket?.id
             )
             self.stopRecognition(
                 reason: "wake_handoff",
-                cleanupCompletion: { [weak self] in
+                completion: { [weak self] in
                     guard let self, !self.wantsMonitoring else { return }
                     VoiceRelayDiagnostics.flow(
                         "wake_cleanup_barrier_released",
                         generation: generation,
-                        fields: ["next": "realtime_start"]
+                        fields: [
+                            "handoff": handoffTicket == nil
+                                ? "unavailable"
+                                : "committed",
+                            "next": "realtime_start",
+                        ]
                     )
                     self.onWake?(
                         candidate.match,
-                        candidate.realtimePrefill
+                        activation
                     )
                 }
             )
@@ -806,6 +862,22 @@ final class WakePhraseController {
             execute: item
         )
         return true
+    }
+
+    private func legacyRecognizedThroughFrame(
+        _ transcription: SFTranscription
+    ) -> Int64? {
+        guard let startFrame = legacyExternalCaptureStartFrame,
+              let end = transcription.segments
+                .map({ $0.timestamp + $0.duration })
+                .max() else {
+            return nil
+        }
+        return startFrame
+            + Int64(
+                (end * Double(WakeAudioHandoffJournal.sampleRate))
+                    .rounded(.up)
+            )
     }
 
     private func stopRecognition(
@@ -1144,7 +1216,13 @@ private final class SpeechAnalyzerWakeSession {
     private let locales: [Locale]
     private let phrases: [String]
     private weak var externalAudioSource: WakeAudioBufferSource?
-    private let onTranscript: (Int, String, Bool) -> Void
+    private let onTranscript: (
+        Int,
+        String,
+        String,
+        Bool,
+        Int64?
+    ) -> Void
     private let onFailure: (Error) -> Void
     private let audioEngine = AVAudioEngine()
     private let stateLock = NSLock()
@@ -1166,13 +1244,20 @@ private final class SpeechAnalyzerWakeSession {
     private var usesExternalAudioSource = false
     private var analyzerInputTimeline = WakeAnalyzerInputTimeline()
     private var droppedAnalyzerInputCount = 0
+    private var externalCaptureStartFrame: Int64?
 
     init(
         diagnosticGeneration: Int,
         locales: [Locale],
         phrases: [String],
         externalAudioSource: WakeAudioBufferSource?,
-        onTranscript: @escaping (Int, String, Bool) -> Void,
+        onTranscript: @escaping (
+            Int,
+            String,
+            String,
+            Bool,
+            Int64?
+        ) -> Void,
         onFailure: @escaping (Error) -> Void
     ) {
         self.diagnosticGeneration = diagnosticGeneration
@@ -1216,6 +1301,7 @@ private final class SpeechAnalyzerWakeSession {
                     )
                 }
                 let modules: [any SpeechModule] = transcribers
+                _ = externalAudioSource?.prepareWakeAudioCapture()
                 let externalNaturalFormat =
                     externalAudioSource?.wakeAudioFormat
                 let naturalFormat = externalNaturalFormat
@@ -1334,10 +1420,26 @@ private final class SpeechAnalyzerWakeSession {
                                     ]
                                 )
                                 guard let emission else { continue }
+                                let recognizedThroughFrame =
+                                    self.stateLock.withLock {
+                                        self.externalCaptureStartFrame.map {
+                                            $0 + Int64(
+                                                (
+                                                    emission.audioEndSeconds
+                                                        * Double(
+                                                            WakeAudioHandoffJournal
+                                                                .sampleRate
+                                                        )
+                                                ).rounded(.up)
+                                            )
+                                        }
+                                    }
                                 self.onTranscript(
                                     laneIndex,
+                                    self.locales[laneIndex].identifier,
                                     emission.transcript,
-                                    false
+                                    result.isFinal,
+                                    recognizedThroughFrame
                                 )
                             }
                         } catch {
@@ -1356,9 +1458,20 @@ private final class SpeechAnalyzerWakeSession {
                     }
                     guard ownsLifecycle else { return false }
 
-                    let consumeBuffer: (AVAudioPCMBuffer) -> Void = {
-                        [weak self] buffer in
+                    let consumeBuffer: (
+                        AVAudioPCMBuffer,
+                        WakeAudioFrameSpan?
+                    ) -> Void = {
+                        [weak self] buffer, sourceSpan in
                         guard let self else { return }
+                        if let sourceSpan {
+                            self.stateLock.withLock {
+                                if self.externalCaptureStartFrame == nil {
+                                    self.externalCaptureStartFrame =
+                                        sourceSpan.startFrame
+                                }
+                            }
+                        }
                         let analyzerBuffer: AVAudioPCMBuffer
                         let resolvedConverter: AVAudioConverter?
                         if buffer.format.isEqual(analysisFormat) {
@@ -1394,7 +1507,12 @@ private final class SpeechAnalyzerWakeSession {
                     let usesExternalAudioSource =
                         self.externalAudioSource?
                             .beginWakeAudioDelivery(
-                                consumeBuffer,
+                                { chunk in
+                                    consumeBuffer(
+                                        chunk.buffer,
+                                        chunk.span
+                                    )
+                                },
                                 onFailure: { [weak self] in
                                     self?.reportFailure(
                                         WakeRecognitionError
@@ -1413,7 +1531,7 @@ private final class SpeechAnalyzerWakeSession {
                             bufferSize: 1024,
                             format: nil
                         ) { buffer, _ in
-                            consumeBuffer(buffer)
+                            consumeBuffer(buffer, nil)
                         }
                         startupStage = .audioEngineStart
                         self.audioEngine.prepare()

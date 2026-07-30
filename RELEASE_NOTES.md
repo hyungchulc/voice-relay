@@ -1,11 +1,11 @@
-This alpha makes local answers, delegated-work cues, and conversational endings more natural and reliable.
+This alpha makes wake activation, bilingual transcription, and spoken output more reliable.
 
-- Short, self-contained basic arithmetic, stable general knowledge, and simple direct translations now answer locally once without creating a Codex request or progress cue.
-- Current, external, personal, device, app, file, memory, source-dependent, ambiguous, multi-step, and accuracy-critical requests still fail safely to Codex.
-- Progress cues prefer the explicit safe topic and action in the current request before resolving a genuinely referential follow-up from recent conversation context.
-- Ordinary non-sensitive request detail can shape a natural progress cue, while credentials, tokens, contact details, direct private identifiers, URLs, opaque IDs, code, and structured payloads remain excluded.
-- Clear conversational farewells now use the existing terminal lifecycle to give one brief acknowledgement, cancel any active work, close Realtime, and return to wake listening. Bare thanks and approvals remain conversational.
-- Quoted, hypothetical, negated, ambiguous, and object-scoped stop language cannot accidentally close the voice session.
-- Build 30 is the signed update target for installed Voice Relay preview-channel builds.
+- Wake recognition and Realtime now share one persistent native audio graph, with frame-identified post-wake audio preserved across the handoff instead of closing and reopening the microphone.
+- A wake-only partial waits for a bounded finalization window, while a wake phrase followed by a command supersedes it and routes the command without a generic greeting.
+- Realtime transcription now derives its ordered language list from the primary and additional Voice Relay language settings, normalizes regional variants, and never introduces an unconfigured language.
+- Clearly unconfigured-script transcripts ask for clarification instead of being treated as valid Korean or English requests.
+- The first canonical user utterance now appears in the notch once by stable turn identity, without exposing partial transcription noise or duplicating a wake phrase.
+- Spoken answers omit trailing source labels and link blocks while the full visible answer and its sources remain intact.
+- Build 31 is the signed update target for installed Voice Relay preview-channel builds.
 
 This public build is Apple Development signed and is not notarized.
