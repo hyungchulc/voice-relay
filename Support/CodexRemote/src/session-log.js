@@ -16,6 +16,42 @@ const TURN_ABORT_GRACE_MS = Number(
 );
 const SESSION_META_SCAN_BYTES = 256 * 1024;
 
+export class AcceptedSteerResponseRevisionFence {
+  constructor() {
+    this.acceptedRevision = 0;
+    this.acceptedOffset = null;
+    this.requestToken = null;
+    this.turnId = null;
+  }
+
+  accept({ acceptedOffset, requestToken = "", turnId = "" } = {}) {
+    const normalizedOffset = Number(acceptedOffset);
+    if (!Number.isSafeInteger(normalizedOffset) || normalizedOffset < 0) {
+      throw new Error("Accepted steer revision requires a stable session offset");
+    }
+    if (
+      Number.isSafeInteger(this.acceptedOffset) &&
+      normalizedOffset <= this.acceptedOffset
+    ) {
+      throw new Error("Accepted steer revisions must advance the session offset");
+    }
+    this.acceptedRevision += 1;
+    this.acceptedOffset = normalizedOffset;
+    this.requestToken = String(requestToken || "").trim() || null;
+    this.turnId = normalizeSessionId(turnId) || null;
+    return this.snapshot();
+  }
+
+  snapshot() {
+    return Object.freeze({
+      acceptedRevision: this.acceptedRevision,
+      acceptedOffset: this.acceptedOffset,
+      requestToken: this.requestToken,
+      turnId: this.turnId,
+    });
+  }
+}
+
 export async function waitForCodexReply({
   requestId,
   expectedRootSessionId = "",
@@ -68,6 +104,7 @@ export async function streamCodexReplies({
   onTaskStarted = null,
   onAccepted = null,
   onMessage,
+  getAcceptedSteerRevision = null,
   signal = null,
   finalAnswerSettleMs = FINAL_ANSWER_SETTLE_MS,
   turnAbortGraceMs = TURN_ABORT_GRACE_MS,
@@ -85,10 +122,13 @@ export async function streamCodexReplies({
     sinceMs,
   });
   const sent = new Set();
+  const observedFinalKeys = new Set();
+  const observedFinalTexts = new Set();
+  const pendingFinals = [];
   const lastActivityOffsets = new Map();
   let lastHit = null;
-  let finalAnswerSeenAt = null;
-  let finalAnswerOffset = null;
+  let settleCandidate = null;
+  let completedResponseRevision = 0;
   let taskStartedNotified = false;
   let acceptanceNotified = false;
   let pinnedSessionFile = null;
@@ -172,42 +212,94 @@ export async function streamCodexReplies({
         });
         deadline = now() + timeoutMs;
       }
+      const responseRevision = acceptedSteerRevisionSnapshot(
+        getAcceptedSteerRevision,
+      );
+      const unresolvedResponseRevision =
+        responseRevision.acceptedRevision > completedResponseRevision;
       for (const message of hit.messages) {
         const key = message.id || `${message.phase}:${message.text}`;
+        if (message.phase === "final_answer") {
+          const normalizedText = normalizeFinalText(message.text);
+          if (
+            observedFinalKeys.has(key) ||
+            !normalizedText ||
+            observedFinalTexts.has(normalizedText)
+          ) {
+            continue;
+          }
+          observedFinalKeys.add(key);
+          observedFinalTexts.add(normalizedText);
+          const pendingFinal = {
+            key,
+            message: messageWithFile(message, file),
+            seenAt: now(),
+            finalOffset: Number.isSafeInteger(message.finalOffset)
+              ? message.finalOffset
+              : null,
+          };
+          pendingFinals.push(pendingFinal);
+          settleCandidate = pendingFinal;
+          continue;
+        }
         if (sent.has(key)) continue;
         sent.add(key);
         await onMessage(messageWithFile(message, file));
         deadline = now() + timeoutMs;
-        if (message.phase === "final_answer") {
-          finalAnswerSeenAt = now();
-          finalAnswerOffset = Number.isSafeInteger(message.finalOffset)
-            ? message.finalOffset
-            : null;
-        }
       }
       if (
-        finalAnswerSeenAt !== null &&
-        Number.isSafeInteger(hit.latestBridgeRequestOffset) &&
-        Number.isSafeInteger(finalAnswerOffset) &&
-        hit.latestBridgeRequestOffset > finalAnswerOffset
+        hit.complete &&
+        hit.pendingImageGenerationCount === 0 &&
+        (!unresolvedResponseRevision ||
+          authoritativeCompletionForRevision(hit, responseRevision))
       ) {
-        finalAnswerSeenAt = null;
-        finalAnswerOffset = null;
+        if (unresolvedResponseRevision) {
+          completedResponseRevision = responseRevision.acceptedRevision;
+        }
+        const terminalFinal = combinedPendingFinal(pendingFinals);
+        if (terminalFinal && !sent.has(terminalFinal.key)) {
+          sent.add(terminalFinal.key);
+          await onMessage(terminalFinal.message);
+        }
+        return {
+          ...hit,
+          messages: terminalMessages(hit.messages, terminalFinal?.message),
+          completedBy: "task_complete",
+          completedResponseRevision,
+        };
       }
-      if (hit.complete && hit.pendingImageGenerationCount === 0) return hit;
+      if (unresolvedResponseRevision) {
+        settleCandidate = null;
+        continue;
+      }
+      if (
+        settleCandidate &&
+        Number.isSafeInteger(hit.activityOffset) &&
+        Number.isSafeInteger(settleCandidate.finalOffset) &&
+        hit.activityOffset > settleCandidate.finalOffset
+      ) {
+        settleCandidate = null;
+      }
     }
     if (rediscoverSessionFile) continue;
     if (
-      finalAnswerSeenAt !== null &&
+      settleCandidate &&
       lastHit?.pendingImageGenerationCount === 0 &&
-      now() - finalAnswerSeenAt >= finalAnswerSettleMs &&
+      now() - settleCandidate.seenAt >= finalAnswerSettleMs &&
       lastHit
     ) {
+      const terminalFinal = combinedPendingFinal(pendingFinals);
+      if (terminalFinal && !sent.has(terminalFinal.key)) {
+        sent.add(terminalFinal.key);
+        await onMessage(terminalFinal.message);
+      }
       return {
         ...lastHit,
+        messages: terminalMessages(lastHit.messages, terminalFinal?.message),
         complete: true,
         completedAt: lastHit.completedAt || new Date(now()).toISOString(),
         completedBy: "final_answer_settle",
+        completedResponseRevision,
       };
     }
     await sleepFn(500);
@@ -218,6 +310,74 @@ export async function streamCodexReplies({
       ? `Timed out waiting for final Codex reply for ${requestId}`
       : `Timed out waiting for Codex replies for ${requestId}`,
   );
+}
+
+function acceptedSteerRevisionSnapshot(getAcceptedSteerRevision) {
+  if (typeof getAcceptedSteerRevision !== "function") {
+    return {
+      acceptedRevision: 0,
+      acceptedOffset: null,
+      requestToken: null,
+      turnId: null,
+    };
+  }
+  const snapshot = getAcceptedSteerRevision() || {};
+  const acceptedRevision = Number(snapshot.acceptedRevision);
+  const acceptedOffset = Number(snapshot.acceptedOffset);
+  return {
+    acceptedRevision:
+      Number.isSafeInteger(acceptedRevision) && acceptedRevision > 0
+        ? acceptedRevision
+        : 0,
+    acceptedOffset:
+      Number.isSafeInteger(acceptedOffset) && acceptedOffset >= 0
+        ? acceptedOffset
+        : null,
+    requestToken: String(snapshot.requestToken || "").trim() || null,
+    turnId: normalizeSessionId(snapshot.turnId) || null,
+  };
+}
+
+function authoritativeCompletionForRevision(hit, responseRevision) {
+  return (
+    Number.isSafeInteger(responseRevision.acceptedOffset) &&
+    Number.isSafeInteger(hit.completedOffset) &&
+    hit.completedOffset > responseRevision.acceptedOffset &&
+    (!responseRevision.turnId || hit.turnId === responseRevision.turnId)
+  );
+}
+
+function normalizeFinalText(value) {
+  return String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim();
+}
+
+function combinedPendingFinal(pendingFinals) {
+  if (!Array.isArray(pendingFinals) || pendingFinals.length === 0) return null;
+  const latest = pendingFinals.at(-1);
+  return {
+    key: `combined_final:${pendingFinals.map((entry) => entry.key).join("|")}`,
+    message: {
+      ...latest.message,
+      text: pendingFinals
+        .map((entry) => normalizeFinalText(entry.message.text))
+        .filter(Boolean)
+        .join("\n\n"),
+    },
+  };
+}
+
+function terminalMessages(messages, terminalFinal) {
+  const nonFinalMessages = (messages || []).filter(
+    (message) => message.phase !== "final_answer",
+  );
+  return terminalFinal
+    ? [...nonFinalMessages, terminalFinal]
+    : nonFinalMessages;
 }
 
 function shouldPinSessionFile(hit) {
@@ -676,6 +836,7 @@ export class SessionReplyScanner {
       acceptedTurnId: null,
       activityOffset: null,
       latestBridgeRequestOffset: null,
+      completedOffset: null,
     };
     this.files.set(file, state);
     return state;
@@ -753,6 +914,7 @@ export class SessionReplyScanner {
         state.acceptedTurnId = null;
         state.activityOffset = null;
         state.latestBridgeRequestOffset = null;
+        state.completedOffset = null;
         state.complete = false;
         state.completedAt = null;
         state.messages = [];
@@ -886,14 +1048,17 @@ export class SessionReplyScanner {
     if (entry.type === "event_msg" && payload?.type === "task_complete") {
       state.complete = true;
       state.completedAt = payload.completed_at || null;
+      state.completedOffset = lineEndOffset;
       const finalAnswer = payload.last_agent_message || null;
       if (finalAnswer) {
-        const hasPriorFinalAnswer = state.messages.some(
-          (message) => message.phase === "final_answer" && message.id !== "task_complete",
+        const hasMatchingFinalAnswer = state.messages.some(
+          (message) =>
+            message.phase === "final_answer" &&
+            message.text === finalAnswer,
         );
-        if (!hasPriorFinalAnswer) {
+        if (!hasMatchingFinalAnswer) {
           state.messages.push(attachThreadRelayEvidence({
-            id: "task_complete",
+            id: `task_complete:${lineEndOffset}`,
             phase: "final_answer",
             text: finalAnswer,
           }, state, lineEndOffset, lineEndOffset));
@@ -967,6 +1132,12 @@ export class SessionReplyScanner {
           enumerable: false,
           value: Number.isSafeInteger(state.latestBridgeRequestOffset)
             ? state.latestBridgeRequestOffset
+            : null,
+        },
+        completedOffset: {
+          enumerable: false,
+          value: Number.isSafeInteger(state.completedOffset)
+            ? state.completedOffset
             : null,
         },
       });

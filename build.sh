@@ -16,6 +16,7 @@ SPARKLE_FRAMEWORK="$SPARKLE_ROOT/Sparkle.framework"
 
 bash "$ROOT/Tests/SourcePolicyTests.sh"
 node "$ROOT/Tests/RealtimeResponseQueueTests.mjs"
+node "$ROOT/Tests/CodexReplyRevisionFenceTests.mjs"
 node "$ROOT/Tests/ContextProviderTests.mjs"
 node "$ROOT/Tests/RealtimeCredentialTests.mjs"
 

@@ -11,6 +11,7 @@ import {
   RemoteControllerRequestTimeoutError,
 } from "./codex-remote-control-client.js";
 import {
+  AcceptedSteerResponseRevisionFence,
   createSessionLogTaskScopedFollowupEvidence,
   normalizeSessionId,
   streamCodexReplies,
@@ -508,6 +509,7 @@ export class CodexAppRemoteBackend {
       acceptedOffset: null,
       startedAt: new Date(sinceMs).toISOString(),
       steerPending: false,
+      responseRevisionFence: new AcceptedSteerResponseRevisionFence(),
       cancelRequested: false,
       terminalError: null,
       acceptanceInterruptStarted: false,
@@ -565,6 +567,8 @@ export class CodexAppRemoteBackend {
           onTaskStarted: handleTaskStarted,
           onAccepted: handleAccepted,
           onMessage: onMessage || (async () => {}),
+          getAcceptedSteerRevision: () =>
+            lifecycle.responseRevisionFence.snapshot(),
         }),
       );
       void replyPromise.catch(() => {});
@@ -1115,6 +1119,17 @@ export class CodexAppRemoteBackend {
           });
           if (acceptedResult.status === "steered") {
             mutationDispatchEvidence = true;
+            const fence =
+              active.responseRevisionFence ||
+              (active.responseRevisionFence =
+                new AcceptedSteerResponseRevisionFence());
+            fence.accept({
+              acceptedOffset:
+                acceptedResult.acceptanceEvidence.acceptedOffset,
+              requestToken:
+                acceptedResult.acceptanceEvidence.requestToken,
+              turnId: acceptedResult.acceptanceEvidence.turnId,
+            });
           }
           if (remainingMutationTime() <= 0) {
             return expired(mutationDispatchEvidence);

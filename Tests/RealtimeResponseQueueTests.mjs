@@ -5846,6 +5846,16 @@ assert.equal(
   "steered",
   "terminal acceptance immediately before the absolute deadline must remain valid",
 );
+assert.deepEqual(
+  justInTimeHarness.backend.activeTurn.responseRevisionFence.snapshot(),
+  {
+    acceptedRevision: 1,
+    acceptedOffset: 21,
+    requestToken: justInTimeIdentity,
+    turnId: justInTimeHarness.turnId,
+  },
+  "terminal steer acceptance must create a durable unresolved response revision",
+);
 assert.equal(
   justInTimeMutationCount,
   1,
