@@ -865,12 +865,16 @@ require_text \
   "Codex playback must use one deterministic speech-only projection"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'The only safe topic hint is this sanitized summary:' \
-  "Codex handoff audio must receive only the deterministic sanitized topic"
+  'Locally sanitized progress context follows as quoted conversation data:' \
+  "Codex handoff audio must receive the deterministic locally sanitized progress context"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'When the safe hint names a supported topic, acknowledge that topic naturally.' \
-  "Codex handoff audio must resolve a supported session topic instead of using a generic status"
+  'Ordinary non-sensitive names and topic words already present in the sanitized detail may be paraphrased' \
+  "Codex handoff audio may naturally use bounded ordinary non-sensitive topic detail"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'the earlier conversation topic' \
+  "Codex handoff audio must not expose the internal prior-context fallback placeholder"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'recentFinalizedTurns: recentTurns' \
@@ -1003,10 +1007,52 @@ require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
   'cleanupCompletion?()' \
   "an already-idle wake session must release the Realtime handoff immediately"
-require_text \
+reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'Any factual, current-state, personal-context, device-state, external-information, calculation, or verification request must use codex.' \
-  "Realtime direct chat must exclude all context-dependent or factual work"
+  "Realtime must not blanket-route every stable factual or arithmetic request to Codex"
+require_count \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'localSimpleRoutingBoundary()' \
+  4 \
+  "one shared bounded local-answer contract must govern all ordinary routing surfaces"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Use local_simple only for a short, self-contained, unambiguous, low-stakes request' \
+  "Realtime must admit bounded stable answers without tools or external state"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'deterministic basic arithmetic, stable general knowledge, or simple direct translation' \
+  "the local-answer contract must cover arithmetic, stable knowledge, and translation"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Never use local_simple for current or live information' \
+  "current, contextual, uncertain, and high-stakes work must remain on Codex"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'if (kind === "local_simple") {' \
+  "a bounded local answer must exit before the Codex handoff path"
+require_count \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'semanticSessionClosureRoutingBoundary()' \
+  6 \
+  "one shared semantic-closure contract must govern ordinary and active-Codex routing"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'if (kind === "close_session") {' \
+  "ordinary clear closure must enter the terminal stop lifecycle"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'if (action === "close_session") {' \
+  "active-Codex clear closure must enter the terminal stop lifecycle"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'reason: isClosure ? "semantic_closure" : "semantic_stop"' \
+  "closure and literal stop must share teardown while retaining truthful diagnostics"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'thanks, goodbye, repeat request' \
+  "clear farewell must not remain in the non-closing direct-chat contract"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'could take more than about five seconds' \
@@ -3848,8 +3894,8 @@ reject_text \
   "spoken handoff progress must not receive the raw user request"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'Never repeat raw request text, quoted values, credentials, passwords, tokens, contact details, private identifiers' \
-  "spoken progress must explicitly remain inside the sanitized topic boundary"
+  'Never expose credentials, passwords, tokens, contact details, direct private identifiers, URLs, opaque IDs, code, or structured payloads.' \
+  "spoken progress must retain the sensitive-data exclusion boundary"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'assistant_like_social_turn_suppressed' \
