@@ -180,9 +180,33 @@ if [[ "$STABLE_OUTPUT" == *"--prerelease"* ]]; then
 fi
 
 if ! /usr/bin/grep -q \
-  'The maintained Voice Relay source differs from the public source archive' \
+  'The fetched public source does not match the audited packaging contract' \
   "$ROOT/package-alpha-dmg.sh"; then
-  echo "FAIL: alpha packaging must reject source that differs from the public tag" >&2
+  echo "FAIL: alpha packaging must reject an unaudited public tag" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -Fq \
+  '"$ROOT/audit-public-source.sh" "$SOURCE_ROOT"' \
+  "$ROOT/package-alpha-dmg.sh"; then
+  echo "FAIL: alpha packaging must audit the fetched public source" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -Fq \
+  '"$SOURCE_ROOT/build.sh"' \
+  "$ROOT/package-alpha-dmg.sh"; then
+  echo "FAIL: alpha packaging must build the fetched public source" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -Fq \
+  '"$ROOT/audit-public-source.sh" "$SOURCE_ROOT"' \
+  "$ROOT/package-release.sh"; then
+  echo "FAIL: stable packaging must audit the fetched public source" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -Fq \
+  '"$SOURCE_ROOT/build.sh"' \
+  "$ROOT/package-release.sh"; then
+  echo "FAIL: stable packaging must build the fetched public source" >&2
   exit 1
 fi
 if ! /usr/bin/grep -q \

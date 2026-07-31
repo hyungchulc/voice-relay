@@ -6,6 +6,10 @@ Official builds, setup, and support may be offered separately.
 ## Current release boundary
 
 - Publish source from a clean, publication-safe Git history.
+- Export public source only through `public-source-files.txt`, then run
+  `audit-public-source.sh` against the fresh public clone and the fetched tag
+  archive. Promotional working assets and maintainer-local state are not public
+  corresponding source.
 - Include the Voice Relay icon and complete corresponding source.
 - Never include local preferences, Remote enrollment, device keys, Session IDs,
   private context files, access tokens, logs, or developer filesystem paths.

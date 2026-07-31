@@ -18,7 +18,6 @@ key to copy, embed, or store, and no separate task-owning agent stack.
 
 [Download the public alpha](https://github.com/hyungchulc/voice-relay/releases)
 · [Build from source](#build-and-launch)
-· [See the launch kit](PROMOTION.md)
 
 ## Why Voice Relay is different
 

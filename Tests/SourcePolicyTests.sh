@@ -3820,6 +3820,34 @@ require_text \
   '.env' \
   "public source must ignore local environment files"
 require_text \
+  "$ROOT/public-source-files.txt" \
+  'Support/CodexRemote/src/session-log.js' \
+  "the exact public manifest must keep required session-log product source"
+require_text \
+  "$ROOT/audit-public-source.sh" \
+  'Public source tracked-file boundary does not match public-source-files.txt.' \
+  "public source must fail closed against an exact file manifest"
+require_text \
+  "$ROOT/audit-public-source.sh" \
+  '-name Promotion' \
+  "public source must reject promotional working directories"
+require_text \
+  "$ROOT/export-public-source.sh" \
+  'while IFS= read -r relative_path' \
+  "public source export must copy only manifest paths"
+require_text \
+  "$ROOT/build.sh" \
+  'Tests/PublicSourceAuditTests.sh' \
+  "maintained builds must exercise the public source boundary fixtures"
+require_text \
+  "$ROOT/.github/workflows/ci.yml" \
+  'run: ./audit-public-source.sh .' \
+  "public CI must audit the exact checked-out source tree"
+reject_text \
+  "$ROOT/README.md" \
+  'PROMOTION.md' \
+  "public documentation must not link to an unpublished promotion kit"
+require_text \
   "$ROOT/Sources/SettingsStore.swift" \
   'assistantName: "Relay"' \
   "fresh public installs must use Relay as the assistant name"
@@ -4156,6 +4184,7 @@ if /usr/bin/grep -RIlE \
   --exclude-dir=release \
   --exclude-dir=releases \
   --exclude=LICENSE \
+  --exclude=audit-public-source.sh \
   --exclude=SourcePolicyTests.sh \
   '/Users/[^/[:space:]"]+' \
   "$ROOT" >/dev/null; then
@@ -4170,6 +4199,7 @@ if /usr/bin/grep -RIlE \
   --exclude-dir=release \
   --exclude-dir=releases \
   --exclude=LICENSE \
+  --exclude=audit-public-source.sh \
   --exclude=SourcePolicyTests.sh \
   '[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}' \
   "$ROOT" >/dev/null; then
@@ -4198,7 +4228,7 @@ require_text \
   "release packaging must require an exact corresponding-source pointer"
 require_text \
   "$ROOT/package-release.sh" \
-  'cp "$ROOT/LICENSE" "$DIST_DIR/LICENSE"' \
+  'cp "$SOURCE_ROOT/LICENSE" "$DIST_DIR/LICENSE"' \
   "release packaging must include the GPL license"
 reject_text \
   "$ROOT/package-release.sh" \

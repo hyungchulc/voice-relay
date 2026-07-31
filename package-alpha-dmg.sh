@@ -57,26 +57,20 @@ if [[ "${#SOURCE_ROOTS[@]}" -ne 1 || ! -d "${SOURCE_ROOTS[0]}" ]]; then
   exit 2
 fi
 SOURCE_ROOT="${SOURCE_ROOTS[0]}"
-if ! /usr/bin/diff \
-  -qr \
-  -x .DS_Store \
-  -x build \
-  -x releases \
-  -x appcast.xml \
-  -x experimental-build \
-  "$ROOT" \
-  "$SOURCE_ROOT" >/dev/null; then
-  echo "The maintained Voice Relay source differs from the public source archive." >&2
-  /usr/bin/diff \
-    -qr \
-    -x .DS_Store \
-    -x build \
-    -x releases \
-    -x experimental-build \
-    "$ROOT" \
-    "$SOURCE_ROOT" >&2 || true
+if [[ ! -x "$SOURCE_ROOT/audit-public-source.sh" ]] \
+    || ! /usr/bin/cmp -s \
+      "$ROOT/public-source-files.txt" \
+      "$SOURCE_ROOT/public-source-files.txt" \
+    || ! /usr/bin/cmp -s \
+      "$ROOT/audit-public-source.sh" \
+      "$SOURCE_ROOT/audit-public-source.sh" \
+    || ! /usr/bin/cmp -s \
+      "$ROOT/package-alpha-dmg.sh" \
+      "$SOURCE_ROOT/package-alpha-dmg.sh"; then
+  echo "The fetched public source does not match the audited packaging contract." >&2
   exit 2
 fi
+"$ROOT/audit-public-source.sh" "$SOURCE_ROOT"
 SOURCE_ARCHIVE_SHA256="$(
   /usr/bin/shasum -a 256 "$SOURCE_ARCHIVE" | /usr/bin/awk '{print $1}'
 )"
@@ -84,7 +78,7 @@ SOURCE_ARCHIVE_SHA256="$(
 VOICE_RELAY_ARCHS="arm64 x86_64" \
   VOICE_RELAY_OUT="$STAGE_DIR/build" \
   VOICE_RELAY_SIGNING_IDENTITY="$SIGNING_IDENTITY" \
-  "$ROOT/build.sh" >/dev/null
+  "$SOURCE_ROOT/build.sh" >/dev/null
 
 APP="$STAGE_DIR/build/Voice Relay.app"
 BINARY="$APP/Contents/MacOS/VoiceRelay"
@@ -166,10 +160,10 @@ fi
 mkdir -p "$DIST_DIR"
 /usr/bin/ditto "$APP" "$DIST_DIR/Voice Relay.app"
 ln -s /Applications "$DIST_DIR/Applications"
-cp "$ROOT/LICENSE" "$DIST_DIR/LICENSE"
-cp "$ROOT/ASSETS.md" "$DIST_DIR/ASSETS.md"
-cp "$ROOT/README.md" "$DIST_DIR/README.md"
-cp "$ROOT/DISTRIBUTION.md" "$DIST_DIR/DISTRIBUTION.md"
+cp "$SOURCE_ROOT/LICENSE" "$DIST_DIR/LICENSE"
+cp "$SOURCE_ROOT/ASSETS.md" "$DIST_DIR/ASSETS.md"
+cp "$SOURCE_ROOT/README.md" "$DIST_DIR/README.md"
+cp "$SOURCE_ROOT/DISTRIBUTION.md" "$DIST_DIR/DISTRIBUTION.md"
 {
   echo "Corresponding source for Voice Relay ${RELEASE_LABEL}:"
   echo "$SOURCE_URL"
@@ -251,7 +245,7 @@ test -d "$UPDATE_VERIFY_DIR/Voice Relay.app"
   "$UPDATE_VERIFY_DIR/Voice Relay.app/Contents/MacOS/VoiceRelay" \
   -verify_arch arm64 x86_64
 
-SPARKLE_ROOT="$("$ROOT/fetch-sparkle.sh")"
+SPARKLE_ROOT="$("$SOURCE_ROOT/fetch-sparkle.sh")"
 APPCAST_DIR="$STAGE_DIR/appcast"
 mkdir -p "$APPCAST_DIR"
 /usr/bin/ditto "$UPDATE_ARCHIVE" \
