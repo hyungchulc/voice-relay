@@ -470,6 +470,35 @@ struct PolicyTests {
                 && !unsupportedFastProfile.isSupported,
             "Codex profile selection must use runtime capabilities and fail closed for unsupported thinking or Fast combinations"
         )
+        let orderedReasoningEfforts = CodexReasoningEffortOrder.sorted([
+            "ultra",
+            "medium",
+            "future-zeta",
+            "none",
+            "high",
+            "xhigh",
+            "minimal",
+            "max",
+            "low",
+            "medium",
+            "future-alpha",
+            "FUTURE-ALPHA",
+        ])
+        expect(
+            orderedReasoningEfforts == [
+                "none",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultra",
+                "future-alpha",
+                "future-zeta",
+            ],
+            "Thinking levels must deduplicate and sort by semantic rank while retaining future identifiers deterministically after known values"
+        )
         let previousSettings = AppSettings.defaults
         var profileOnlySettings = previousSettings
         profileOnlySettings.codexModel = "model-a"

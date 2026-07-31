@@ -994,6 +994,26 @@ require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'progress_summary' \
   "the semantic route contract must carry bounded progress meaning without local phrase classification"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'function progressSummaryGenerationBoundary()' \
+  "progress generation must use one reusable semantic invariant"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Describe exactly one resolved action and at most one safely resolved referent.' \
+  "progress summaries must describe one resolved action and referent"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Address the listener directly in the second person when the language naturally permits it.' \
+  "spoken progress must preserve listener-directed conversational deixis"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'When a referent cannot be resolved safely, omit it and describe only the action' \
+  "unresolved progress referents must fail closed to action-level wording"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'short non-sensitive English semantic summary' \
+  "progress generation must not force every language through an English summary contract"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'handoffProgressTopicSummary(' \

@@ -1,12 +1,12 @@
-This alpha makes the Voice Relay Codex profile selected in Settings authoritative for the next actual turn.
+This alpha fixes the Thinking level menu order in Voice Relay Settings.
 
-- Explicit Model and Thinking selections are applied and verified on the bound Voice task before a new turn is dispatched.
-- Default or Inherit re-reads the current host Codex configuration for every request instead of caching a previously resolved value.
-- Turning Fast mode off explicitly clears the Voice priority override and returns service-tier behavior to the host configuration.
-- A normal new request never becomes a profile-less steer of an already active turn; it fails busy before dispatch while the dedicated correction path remains separate.
-- Accepted-turn validation is bound to an immutable per-request profile snapshot and reports both expected and actual values if a mismatch is observed.
-- Codex failures use a sanitized deterministic playback notice, so Realtime cannot invent plausible requested content after a failed route.
-- Regression coverage protects explicit medium reasoning on an existing xhigh task, inherited config changes, priority clearing, root-versus-correction routing, and failure-speech fidelity.
-- Build 38 is the signed update target for installed Voice Relay preview-channel builds.
+- Known reasoning levels are presented in semantic ascending order rather than alphabetically.
+- The ordering covers none, minimal, low, medium, high, xhigh, max, and ultra whenever the host reports them.
+- Duplicate capability identifiers are removed without dropping supported values.
+- Unknown future identifiers remain available and are ordered deterministically after known levels.
+- Spoken work-in-progress cues now describe one resolved action and referent instead of voicing classifier categories, alternatives, or unresolved option lists.
+- Progress cues preserve conversational deixis, address the listener naturally, and omit unresolved or sensitive referents across languages and domains.
+- Regression coverage protects shuffled input, duplicates, and future capability identifiers.
+- Build 39 is the signed update target for installed Voice Relay preview-channel builds.
 
 This public build is Apple Development signed and is not notarized.

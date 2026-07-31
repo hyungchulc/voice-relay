@@ -1,6 +1,52 @@
 import Darwin
 import Foundation
 
+enum CodexReasoningEffortOrder {
+    private static let semanticRank = Dictionary(
+        uniqueKeysWithValues: [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra",
+        ].enumerated().map { ($0.element, $0.offset) }
+    )
+
+    static func sorted(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        let unique = values.compactMap { raw -> String? in
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            let identifier = value.lowercased()
+            guard !value.isEmpty, seen.insert(identifier).inserted else {
+                return nil
+            }
+            return value
+        }
+        return unique.sorted { lhs, rhs in
+            let lhsIdentifier = lhs.lowercased()
+            let rhsIdentifier = rhs.lowercased()
+            let lhsRank = semanticRank[lhsIdentifier]
+            let rhsRank = semanticRank[rhsIdentifier]
+            switch (lhsRank, rhsRank) {
+            case let (left?, right?):
+                return left < right
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            case (.none, .none):
+                let insensitive = lhsIdentifier.compare(rhsIdentifier)
+                return insensitive == .orderedSame
+                    ? lhs < rhs
+                    : insensitive == .orderedAscending
+            }
+        }
+    }
+}
+
 struct CodexModelCapability: Equatable {
     let id: String
     let displayName: String
@@ -1030,7 +1076,9 @@ final class CodexAppRemoteClient {
             return CodexModelCapability(
                 id: id,
                 displayName: model["displayName"] as? String ?? id,
-                supportedReasoningEfforts: Array(Set(efforts)).sorted(),
+                supportedReasoningEfforts: CodexReasoningEffortOrder.sorted(
+                    efforts
+                ),
                 serviceTierIDs: Array(Set(serviceTierIDs)).sorted()
             )
         }

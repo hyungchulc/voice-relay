@@ -4529,6 +4529,8 @@ function beginContractCodex(
     settleProgress = true,
     progressText = "Working on it.",
     progressSummary = "",
+    spokenLanguage = harness.generation % 2 ? "ko-KR" : "en-US",
+    spokenRegister = "casual",
   } = {},
 ) {
   const suffix = `${harness.generation}-${harness.messages.length}`;
@@ -4553,8 +4555,8 @@ function beginContractCodex(
     arguments: JSON.stringify({
       kind: "codex",
       social_origin: "not_applicable",
-      spoken_language: harness.generation % 2 ? "ko-KR" : "en-US",
-      spoken_register: "casual",
+      spoken_language: spokenLanguage,
+      spoken_register: spokenRegister,
       stop_target: "not_applicable",
       progress_summary: progressSummary,
     }),
@@ -7309,6 +7311,117 @@ assert.doesNotMatch(
   /Can you hear me clearly|Could you show me whether it will rain tomorrow|the earlier conversation topic|the current request/i,
   "progress speech must receive only the validated semantic summary, not raw current or prior turns",
 );
+
+const progressContractHarness = makeContractHarness({
+  generation: 221,
+  language: "ko-KR",
+  additionalLanguages: ["en-US", "sv-SE", "es-ES"],
+});
+progressContractHarness.receive({
+  type: "conversation.item.input_audio_transcription.completed",
+  item_id: "progress-contract-classifier",
+  transcript: "상태를 확인해줘",
+});
+const progressClassifierRequest = progressContractHarness.outbound().findLast(
+  event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind === "route_classifier",
+);
+const progressSummaryDescription =
+  progressClassifierRequest?.response?.tools?.[0]?.parameters?.properties
+    ?.progress_summary?.description || "";
+const progressClassifierInstructions =
+  progressClassifierRequest?.response?.instructions || "";
+for (const contract of [
+  "exactly one resolved action",
+  "Never describe categories, alternatives, unresolved option lists",
+  "Preserve conversational deixis",
+  "omit it and describe only the action",
+  "Exclude sensitive concrete values regardless of domain",
+]) {
+  assert.match(
+    `${progressSummaryDescription} ${progressClassifierInstructions}`,
+    new RegExp(contract, "i"),
+    "the route summary contract must encode the generalized progress-generation invariant",
+  );
+}
+assert.doesNotMatch(
+  `${progressSummaryDescription} ${progressClassifierInstructions}`,
+  /provide a short non-sensitive English semantic summary/i,
+  "progress meaning must not be forced through one language before natural delivery",
+);
+
+const representativeProgressCases = [
+  {
+    generation: 223,
+    language: "ko-KR",
+    register: "casual",
+    request: "지금 여기 기준으로 상태를 확인해줘",
+    summary: "checking conditions from your current context",
+  },
+  {
+    generation: 224,
+    language: "sv-SE",
+    register: "neutral",
+    request: "Kontrollera öppettiderna för Stockholms stadshus.",
+    summary: "kontrollerar öppettiderna för Stockholms stadshus",
+  },
+  {
+    generation: 225,
+    language: "en-US",
+    register: "polite",
+    request: "Could you check whether it is open there?",
+    summary: "checking opening hours",
+  },
+  {
+    generation: 226,
+    language: "es-ES",
+    register: "neutral",
+    request: "Revisa la tendencia del mercado que mencioné.",
+    summary: "revisando la tendencia del mercado solicitada",
+  },
+];
+for (const example of representativeProgressCases) {
+  const harness = makeContractHarness({
+    generation: example.generation,
+    language: example.language,
+  });
+  beginContractCodex(harness, example.request, {
+    settleProgress: false,
+    progressSummary: example.summary,
+    spokenLanguage: example.language,
+    spokenRegister: example.register,
+  });
+  const instructions = harness.outbound().findLast(event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind === "codex_progress"
+  )?.response?.instructions || "";
+  assert.match(
+    instructions,
+    new RegExp(`"summary":${JSON.stringify(example.summary)}`),
+    "a safe single action and referent must remain bounded summary data",
+  );
+  assert.match(
+    instructions,
+    new RegExp(example.language, "i"),
+    "the handoff cue must use the classifier-provided spoken language",
+  );
+  assert.match(
+    instructions,
+    /Address the listener directly in the second person/i,
+    "the handoff cue must preserve listener-directed deixis",
+  );
+  assert.match(
+    instructions,
+    /Never describe categories, alternatives, unresolved option lists/i,
+    "the handoff cue must reject schema and option-list phrasing across domains",
+  );
+  assert.equal(
+    instructions.includes(example.request),
+    false,
+    "representative cross-language progress instructions must exclude raw requests",
+  );
+}
 
 const safeOrdinaryDetailHarness = makeContractHarness({
   generation: 218,
