@@ -110,17 +110,26 @@ final class DirectRealtimeController: NSObject {
             )
         }
         transport.onListeningReady = {
-            [weak self] generation, handoffReplaySent in
+            [weak self] generation, handoffOutcome in
             guard let self, self.activeGeneration == generation else { return }
             _ = self.startupRetryState.markListeningReady(generation: generation)
             self.startupRetryWorkItem?.cancel()
             self.startupRetryWorkItem = nil
+            var payload: [String: Any] = [
+                "generation": generation,
+            ]
+            if let handoffOutcome {
+                payload["handoff"] = [
+                    "generation": handoffOutcome.key.generation,
+                    "ticketID": handoffOutcome.key.ticketID,
+                    "status": handoffOutcome.status.rawValue,
+                    "bytes": handoffOutcome.byteCount,
+                    "chunks": handoffOutcome.chunkCount,
+                ]
+            }
             self.evaluate(
                 method: "transportReady",
-                payload: [
-                    "generation": generation,
-                    "handoffReplaySent": handoffReplaySent,
-                ]
+                payload: payload
             )
         }
         transport.onEvent = { [weak self] generation, event in
@@ -679,6 +688,28 @@ extension DirectRealtimeController: WKScriptMessageHandler {
         message: String
     ) {
         guard generation == activeGeneration else { return }
+        if let ticketID =
+            wakeHandoffTicketIDsByGeneration[generation],
+           !ticketID.isEmpty {
+            startupRetryWorkItem?.cancel()
+            startupRetryWorkItem = nil
+            startupRetryState.cancel(generation: generation)
+            VoiceRelayDiagnostics.flow(
+                "realtime_transport_failure_terminal",
+                generation: generation,
+                fields: [
+                    "handoff": "fail_closed",
+                    "reason": message,
+                    "retry": "disabled",
+                ]
+            )
+            onEvent?([
+                "type": "error",
+                "generation": generation,
+                "message": message,
+            ])
+            return
+        }
         if startupRetryState.reserveRetry(generation: generation) {
             VoiceRelayDiagnostics.flow(
                 "realtime_startup_retry_scheduled",
@@ -5770,9 +5801,50 @@ private extension DirectRealtimeController {
         if (!session || session.generation !== generation
             || activeStartGeneration !== generation
             || session.transportReady) return;
+        const startPayload = session.startPayload || {};
+        const expectedHandoffTicketID =
+          String(startPayload.wakeHandoffTicketID || "").trim();
+        const handoff =
+          payload.handoff && typeof payload.handoff === "object"
+            ? payload.handoff
+            : null;
+        const handoffBytes = Number(handoff?.bytes || 0);
+        const handoffChunks = Number(handoff?.chunks || 0);
+        const hasValidHandoffStatus =
+          (
+            handoff?.status === "client_send_completed"
+            && handoffBytes > 0
+            && handoffChunks > 0
+          )
+          || (
+            handoff?.status === "no_tail"
+            && handoffBytes === 0
+            && handoffChunks === 0
+          );
+        const hasBoundHandoffOutcome =
+          Boolean(handoff)
+          && Number(handoff.generation || 0) === generation
+          && String(handoff.ticketID || "").trim()
+            === expectedHandoffTicketID
+          && hasValidHandoffStatus;
+        if (
+          (expectedHandoffTicketID && !hasBoundHandoffOutcome)
+          || (!expectedHandoffTicketID && handoff)
+        ) {
+          diagnostic(
+            "wake_audio_handoff_ready_rejected",
+            generation,
+            {
+              reason: expectedHandoffTicketID
+                ? "stale_or_unbound_outcome"
+                : "unexpected_outcome",
+              status: String(handoff?.status || "missing")
+            }
+          );
+          return;
+        }
         session.transportReady = true;
         diagnostic("media_ready", generation);
-        const startPayload = session.startPayload || {};
         const prefill = String(startPayload.prefill || "").trim();
         const wakeTranscript =
           String(startPayload.wakeTranscript || "").trim();
@@ -5784,7 +5856,10 @@ private extension DirectRealtimeController {
           || `prefill-${generation}`;
         const visibleUserText = wakeTranscript || prefill;
         const hasReplayWakeBoundary =
-          isWakeOnly && Boolean(payload.handoffReplaySent);
+          isWakeOnly
+          && hasBoundHandoffOutcome
+          && handoff.status === "client_send_completed"
+          && handoffBytes > 0;
         if (visibleUserText && !hasReplayWakeBoundary) {
           send({
             type: "userTranscript",

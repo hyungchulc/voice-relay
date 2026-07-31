@@ -1366,6 +1366,228 @@ enum WakeAudioHandoffReplay: Equatable {
     case unavailable
 }
 
+struct WakeAudioHandoffKey: Equatable {
+    let ticketID: String
+    let generation: Int
+}
+
+struct WakeAudioHandoffReplayBinding: Equatable {
+    let key: WakeAudioHandoffKey
+    let ordinal: Int
+    let byteCount: Int
+    let isLast: Bool
+}
+
+struct WakeAudioHandoffReplayOutcome: Equatable {
+    enum Status: String {
+        case sent = "client_send_completed"
+        case noTail = "no_tail"
+    }
+
+    let key: WakeAudioHandoffKey
+    let status: Status
+    let byteCount: Int
+    let chunkCount: Int
+}
+
+struct WakeAudioHandoffReplayLifecycle {
+    enum Phase: String, Equatable {
+        case idle
+        case claimed
+        case preparing
+        case draining
+        case sent
+        case noTail = "no_tail"
+        case failed
+        case cancelled
+    }
+
+    enum CaptureDisposition: Equatable {
+        case ordinary
+        case committedJournal
+        case protectedLiveBuffer
+    }
+
+    private(set) var phase: Phase = .idle
+    private(set) var key: WakeAudioHandoffKey?
+    private(set) var totalByteCount = 0
+    private(set) var acceptedByteCount = 0
+    private(set) var acceptedChunkCount = 0
+    private(set) var completedByteCount = 0
+    private(set) var completedChunkCount = 0
+    private(set) var outcome: WakeAudioHandoffReplayOutcome?
+
+    var captureDisposition: CaptureDisposition {
+        switch phase {
+        case .claimed, .preparing:
+            return .committedJournal
+        case .draining:
+            return .protectedLiveBuffer
+        case .idle, .sent, .noTail, .failed, .cancelled:
+            return .ordinary
+        }
+    }
+
+    var requiresProtectedContinuity: Bool {
+        switch phase {
+        case .claimed, .preparing, .draining:
+            return true
+        case .idle, .sent, .noTail, .failed, .cancelled:
+            return false
+        }
+    }
+
+    var shouldBufferInboundEvents: Bool {
+        requiresProtectedContinuity
+    }
+
+    mutating func claim(ticketID: String, generation: Int) -> Bool {
+        guard phase == .idle,
+              !ticketID.isEmpty,
+              generation > 0 else {
+            return false
+        }
+        phase = .claimed
+        key = WakeAudioHandoffKey(
+            ticketID: ticketID,
+            generation: generation
+        )
+        return true
+    }
+
+    mutating func beginPreparing(
+        ticketID: String,
+        generation: Int
+    ) -> Bool {
+        guard phase == .claimed,
+              key == WakeAudioHandoffKey(
+                  ticketID: ticketID,
+                  generation: generation
+              ) else {
+            return false
+        }
+        phase = .preparing
+        return true
+    }
+
+    mutating func beginDraining(
+        ticketID: String,
+        generation: Int,
+        byteCount: Int
+    ) -> WakeAudioHandoffReplayOutcome? {
+        let expectedKey = WakeAudioHandoffKey(
+            ticketID: ticketID,
+            generation: generation
+        )
+        guard phase == .preparing,
+              key == expectedKey,
+              byteCount >= 0 else {
+            return nil
+        }
+        totalByteCount = byteCount
+        acceptedByteCount = 0
+        acceptedChunkCount = 0
+        completedByteCount = 0
+        completedChunkCount = 0
+        if byteCount == 0 {
+            phase = .noTail
+            let resolved = WakeAudioHandoffReplayOutcome(
+                key: expectedKey,
+                status: .noTail,
+                byteCount: 0,
+                chunkCount: 0
+            )
+            outcome = resolved
+            return resolved
+        }
+        phase = .draining
+        return nil
+    }
+
+    func proposedBinding(byteCount: Int) -> WakeAudioHandoffReplayBinding? {
+        guard phase == .draining,
+              let key,
+              byteCount > 0,
+              acceptedByteCount + byteCount <= totalByteCount else {
+            return nil
+        }
+        return WakeAudioHandoffReplayBinding(
+            key: key,
+            ordinal: acceptedChunkCount,
+            byteCount: byteCount,
+            isLast: acceptedByteCount + byteCount == totalByteCount
+        )
+    }
+
+    mutating func recordAccepted(
+        _ binding: WakeAudioHandoffReplayBinding
+    ) -> Bool {
+        guard phase == .draining,
+              binding.key == key,
+              binding.ordinal == acceptedChunkCount,
+              binding.byteCount > 0,
+              acceptedByteCount + binding.byteCount <= totalByteCount,
+              binding.isLast
+                == (
+                    acceptedByteCount + binding.byteCount
+                        == totalByteCount
+                ) else {
+            return false
+        }
+        acceptedByteCount += binding.byteCount
+        acceptedChunkCount += 1
+        return true
+    }
+
+    mutating func recordCompleted(
+        _ binding: WakeAudioHandoffReplayBinding
+    ) -> WakeAudioHandoffReplayOutcome? {
+        guard phase == .draining,
+              binding.key == key,
+              binding.ordinal == completedChunkCount,
+              binding.ordinal < acceptedChunkCount,
+              binding.byteCount > 0,
+              completedByteCount + binding.byteCount
+                <= acceptedByteCount else {
+            return nil
+        }
+        completedByteCount += binding.byteCount
+        completedChunkCount += 1
+        guard binding.isLast,
+              completedByteCount == totalByteCount,
+              completedByteCount == acceptedByteCount,
+              completedChunkCount == acceptedChunkCount,
+              let key else {
+            return nil
+        }
+        phase = .sent
+        let resolved = WakeAudioHandoffReplayOutcome(
+            key: key,
+            status: .sent,
+            byteCount: completedByteCount,
+            chunkCount: completedChunkCount
+        )
+        outcome = resolved
+        return resolved
+    }
+
+    mutating func fail() {
+        guard requiresProtectedContinuity else { return }
+        phase = .failed
+        outcome = nil
+    }
+
+    mutating func cancel() {
+        guard phase != .idle else { return }
+        phase = .cancelled
+        outcome = nil
+    }
+
+    mutating func reset() {
+        self = Self()
+    }
+}
+
 struct WakeAudioHandoffJournal {
     static let sampleRate: Int64 = 24_000
     static let bytesPerFrame = MemoryLayout<Int16>.size
@@ -1546,42 +1768,24 @@ struct WakeAudioReplayPump {
         bytes.append(value)
     }
 
-    mutating func takeAvailableChunks(
-        bytesPerChunk: Int,
-        outboundCount: Int,
-        maximumOutbound: Int
-    ) -> [Data] {
-        let chunkSize = max(1, bytesPerChunk)
-        let safeCapacity = max(
-            0,
-            maximumOutbound - Self.controlQueueReserve
+    func peek(maximumByteCount: Int) -> Data? {
+        let count = min(
+            max(0, maximumByteCount),
+            pendingByteCount
         )
-        let availableSlots = max(0, safeCapacity - outboundCount)
-        let chunkCount = min(
-            availableSlots,
-            pendingByteCount / chunkSize
-        )
-        guard chunkCount > 0 else { return [] }
-        var chunks: [Data] = []
-        chunks.reserveCapacity(chunkCount)
-        for _ in 0..<chunkCount {
-            let end = readOffset + chunkSize
-            chunks.append(Data(bytes[readOffset..<end]))
-            readOffset = end
-        }
-        compactIfUseful()
-        return chunks
+        guard count > 0 else { return nil }
+        return Data(bytes[readOffset..<(readOffset + count)])
     }
 
-    mutating func takeRemainderIfBelowChunk(
-        bytesPerChunk: Int
-    ) -> Data? {
-        guard pendingByteCount < max(1, bytesPerChunk) else {
-            return nil
+    @discardableResult
+    mutating func consumeAccepted(byteCount: Int) -> Bool {
+        guard byteCount > 0,
+              byteCount <= pendingByteCount else {
+            return false
         }
-        let remainder = Data(bytes.dropFirst(readOffset))
-        reset()
-        return remainder
+        readOffset += byteCount
+        compactIfUseful()
+        return true
     }
 
     mutating func reset() {

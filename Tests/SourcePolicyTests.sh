@@ -1282,7 +1282,7 @@ require_text \
   "Realtime events must cross the WebKit bridge as stable JSON text"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
-  'self.enqueueOutbound(text: jsonEvent, isAudio: false)' \
+  'self.enqueueOutbound(text: jsonEvent, origin: .control)' \
   "native WebSocket transport must preserve the validated JSON number spelling"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
@@ -1518,6 +1518,70 @@ require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'WakeAudioReplayPump' \
   "wake replay must drain through a bounded lossless pump instead of overflowing the socket queue"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'struct WakeAudioHandoffReplayLifecycle' \
+  "wake handoff ownership must use one explicit phase lifecycle"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'case claimed' \
+  "wake handoff must distinguish claimed from session-ready draining"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'case preparing' \
+  "wake handoff must hold pre-session capture behind an explicit preparation barrier"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'func peek(maximumByteCount: Int) -> Data?' \
+  "wake replay must inspect bytes without consuming them before outbound acceptance"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'mutating func consumeAccepted(byteCount: Int) -> Bool' \
+  "wake replay bytes may advance only after outbound admission succeeds"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'audioProcessingQueue.async { [weak self] in' \
+  "session readiness must cross the serial capture barrier before freezing handoff PCM"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'message.origin.handoffBinding' \
+  "wake replay success must be bound to the exact WebSocket send completion"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'maximumProtectedLivePCMBytes' \
+  "post-cutover live capture must fail closed instead of growing or dropping without a bound replay outcome"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'wake_audio_handoff_ready_rejected' \
+  "the reducer must reject stale or unbound handoff readiness outcomes"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'handoff.status === "client_send_completed"' \
+  "only an exact completed replay outcome may open the wake suffix window"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"handoff": "fail_closed"' \
+  "a claimed wake handoff must not enter the generic pre-ready retry path after continuity is lost"
+reject_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'handoffReplayPending' \
+  "wake handoff lifecycle must not regress to an ambiguous pending Boolean"
+reject_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'handoffReplayWasSent' \
+  "transport readiness must not depend on a mutable replay Boolean"
+reject_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'takeAvailableChunks' \
+  "wake replay must not destructively dequeue before outbound acceptance"
+reject_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'takeRemainderIfBelowChunk' \
+  "a short handoff remainder must retain explicit replay provenance"
+reject_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'drained_without_drop' \
+  "local buffer extraction must never masquerade as completed handoff delivery"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'stage: "wake_audio_handoff_claim"' \

@@ -2000,6 +2000,110 @@ struct PolicyTests {
             "a wake boundary older than the rolling capture must fail closed instead of hiding lost PCM"
         )
 
+        var orderedWakeJournal = WakeAudioHandoffJournal()
+        orderedWakeJournal.beginWake()
+        _ = orderedWakeJournal.append(
+            pcm: Data(repeating: 0, count: 120)
+        )
+        let orderedWakeTicket = orderedWakeJournal.commit(
+            recognizedThroughFrame: 60,
+            ticketID: "ordered-handoff-ticket"
+        )
+        expect(
+            orderedWakeJournal.claim(
+                ticketID: orderedWakeTicket.id,
+                generation: 31
+            ),
+            "the ordered handoff fixture must claim its exact generation"
+        )
+        var orderedWakeLifecycle =
+            WakeAudioHandoffReplayLifecycle()
+        expect(
+            orderedWakeLifecycle.claim(
+                ticketID: orderedWakeTicket.id,
+                generation: 31
+            )
+                && orderedWakeLifecycle.captureDisposition
+                    == .committedJournal,
+            "a claimed handoff must keep pre-session capture in the committed journal"
+        )
+        _ = orderedWakeJournal.append(
+            pcm: Data(repeating: 1, count: 1_440)
+        )
+        expect(
+            orderedWakeLifecycle.phase == .claimed
+                && orderedWakeLifecycle.outcome == nil
+                && orderedWakeJournal.hasCommittedHandoff,
+            "pre-session capture must not replay, finish, or clear the committed handoff"
+        )
+        expect(
+            orderedWakeLifecycle.beginPreparing(
+                ticketID: orderedWakeTicket.id,
+                generation: 31
+            ),
+            "session readiness must move the exact handoff into a capture-barrier preparation phase"
+        )
+        _ = orderedWakeJournal.append(
+            pcm: Data(repeating: 2, count: 317)
+        )
+        guard case let .ready(orderedReplayPCM) =
+            orderedWakeJournal.replay(
+                ticketID: orderedWakeTicket.id,
+                generation: 31
+            ) else {
+            fatalError("ordered wake handoff replay unexpectedly failed")
+        }
+        expect(
+            orderedReplayPCM
+                == Data(repeating: 1, count: 1_440)
+                    + Data(repeating: 2, count: 316),
+            "the session-ready capture barrier must freeze the complete chronological committed tail"
+        )
+        expect(
+            orderedWakeLifecycle.beginDraining(
+                ticketID: orderedWakeTicket.id,
+                generation: 31,
+                byteCount: orderedReplayPCM.count
+            ) == nil
+                && orderedWakeLifecycle.captureDisposition
+                    == .protectedLiveBuffer,
+            "post-cutover capture must remain protected behind the immutable replay batch"
+        )
+        let orderedFirstBinding =
+            orderedWakeLifecycle.proposedBinding(
+                byteCount: 1_440
+            )!
+        expect(
+            orderedWakeLifecycle.recordAccepted(
+                orderedFirstBinding
+            ),
+            "the committed tail's first chunk must retain its ticket-bound ordinal"
+        )
+        let orderedFinalBinding =
+            orderedWakeLifecycle.proposedBinding(
+                byteCount: 316
+            )!
+        expect(
+            orderedWakeLifecycle.recordAccepted(
+                orderedFinalBinding
+            )
+                && orderedWakeLifecycle.recordCompleted(
+                    orderedFirstBinding
+                ) == nil
+                && orderedWakeLifecycle.recordCompleted(
+                    orderedFinalBinding
+                )?.status == .sent,
+            "the journal must remain protected until every ordered tail chunk completes"
+        )
+        orderedWakeJournal.finish(
+            ticketID: orderedWakeTicket.id,
+            generation: 31
+        )
+        expect(
+            !orderedWakeJournal.hasCommittedHandoff,
+            "the journal must retire only after the matching replay completion"
+        )
+
         var wakeReplayPump = WakeAudioReplayPump()
         let replayChunkBytes = 1_440
         let replayPayload = Data(
@@ -2007,46 +2111,151 @@ struct PolicyTests {
                 UInt8($0 % 251)
             }
         )
-        wakeReplayPump.append(replayPayload)
+        var replayLifecycle =
+            WakeAudioHandoffReplayLifecycle()
         expect(
-            wakeReplayPump.takeAvailableChunks(
-                bytesPerChunk: replayChunkBytes,
-                outboundCount: 80,
-                maximumOutbound: 96
-            ).isEmpty,
-            "wake replay must reserve queue capacity for terminal control messages instead of overflowing or evicting audio"
+            replayLifecycle.claim(
+                ticketID: "pump-handoff-ticket",
+                generation: 34
+            )
+                && replayLifecycle.beginPreparing(
+                    ticketID: "pump-handoff-ticket",
+                    generation: 34
+                )
+                && replayLifecycle.beginDraining(
+                    ticketID: "pump-handoff-ticket",
+                    generation: 34,
+                    byteCount: replayPayload.count
+                ) == nil,
+            "the replay pump fixture must own one immutable drain batch"
+        )
+        wakeReplayPump.append(replayPayload)
+        let firstPeek = wakeReplayPump.peek(
+            maximumByteCount: replayChunkBytes
+        )
+        expect(
+            firstPeek == replayPayload.prefix(replayChunkBytes)
+                && wakeReplayPump.pendingByteCount
+                    == replayPayload.count,
+            "queue saturation or a rejected send must leave every replay byte untouched"
         )
         var replayedPayload = Data()
-        var replayPasses = 0
-        while wakeReplayPump.pendingByteCount >= replayChunkBytes {
-            let chunks = wakeReplayPump.takeAvailableChunks(
-                bytesPerChunk: replayChunkBytes,
-                outboundCount: 0,
-                maximumOutbound: 96
-            )
+        var acceptedBindings: [WakeAudioHandoffReplayBinding] = []
+        while let chunk = wakeReplayPump.peek(
+            maximumByteCount: replayChunkBytes
+        ) {
+            guard let binding =
+                replayLifecycle.proposedBinding(
+                    byteCount: chunk.count
+                ) else {
+                fatalError("wake handoff binding could not be proposed")
+            }
             expect(
-                !chunks.isEmpty
-                    && chunks.count
-                        <= 96 - WakeAudioReplayPump.controlQueueReserve,
-                "wake replay must drain through bounded queue-capacity passes"
+                replayLifecycle.recordAccepted(binding)
+                    && wakeReplayPump.consumeAccepted(
+                        byteCount: chunk.count
+                    ),
+                "only accepted outbound replay bytes may advance the handoff source"
             )
-            chunks.forEach { replayedPayload.append($0) }
-            replayPasses += 1
-            expect(
-                replayPasses < 8,
-                "wake replay pump must make bounded forward progress"
-            )
-        }
-        if let remainder =
-            wakeReplayPump.takeRemainderIfBelowChunk(
-                bytesPerChunk: replayChunkBytes
-            ) {
-            replayedPayload.append(remainder)
+            replayedPayload.append(chunk)
+            acceptedBindings.append(binding)
         }
         expect(
             replayedPayload == replayPayload
                 && !wakeReplayPump.hasPendingBytes,
-            "wake replay must preserve every queued PCM byte across queue-pressure passes"
+            "wake replay admission must preserve every full and short-remainder PCM byte"
+        )
+        for binding in acceptedBindings.dropLast() {
+            expect(
+                replayLifecycle.recordCompleted(binding) == nil
+                    && replayLifecycle.phase == .draining,
+                "handoff readiness must remain blocked until the final WebSocket send completion"
+            )
+        }
+        let orderedOutcome = acceptedBindings.last.flatMap {
+            replayLifecycle.recordCompleted($0)
+        }
+        expect(
+            orderedOutcome
+                == WakeAudioHandoffReplayOutcome(
+                    key: WakeAudioHandoffKey(
+                        ticketID: "pump-handoff-ticket",
+                        generation: 34
+                    ),
+                    status: .sent,
+                    byteCount: replayPayload.count,
+                    chunkCount: acceptedBindings.count
+                )
+                && replayLifecycle.phase == .sent,
+            "only the exact ticket and generation may publish one immutable sent outcome after every send completes"
+        )
+        var failedWakeLifecycle =
+            WakeAudioHandoffReplayLifecycle()
+        expect(
+            failedWakeLifecycle.claim(
+                ticketID: "failed-handoff-ticket",
+                generation: 32
+            )
+                && failedWakeLifecycle.beginPreparing(
+                    ticketID: "failed-handoff-ticket",
+                    generation: 32
+                )
+                && failedWakeLifecycle.beginDraining(
+                    ticketID: "failed-handoff-ticket",
+                    generation: 32,
+                    byteCount: 1_440
+                ) == nil,
+            "the failure fixture must reach the protected drain phase"
+        )
+        let failedBinding =
+            failedWakeLifecycle.proposedBinding(
+                byteCount: 1_440
+            )!
+        expect(
+            !failedWakeLifecycle.recordAccepted(
+                WakeAudioHandoffReplayBinding(
+                    key: WakeAudioHandoffKey(
+                        ticketID: "stale-handoff-ticket",
+                        generation: 99
+                    ),
+                    ordinal: 0,
+                    byteCount: 1_440,
+                    isLast: true
+                )
+            )
+                && failedWakeLifecycle.phase == .draining
+                && failedWakeLifecycle.recordAccepted(failedBinding),
+            "closed, stale, or mismatched admission must not advance the exact handoff ledger"
+        )
+        failedWakeLifecycle.fail()
+        expect(
+            failedWakeLifecycle.phase == .failed
+                && failedWakeLifecycle.outcome == nil
+                && failedWakeLifecycle
+                    .recordCompleted(failedBinding) == nil,
+            "a send failure must fail closed and stale completion must never create a replay outcome"
+        )
+
+        var noTailWakeLifecycle =
+            WakeAudioHandoffReplayLifecycle()
+        expect(
+            noTailWakeLifecycle.captureDisposition == .ordinary
+                && noTailWakeLifecycle.claim(
+                    ticketID: "empty-handoff-ticket",
+                    generation: 33
+                )
+                && noTailWakeLifecycle.beginPreparing(
+                    ticketID: "empty-handoff-ticket",
+                    generation: 33
+                )
+                && noTailWakeLifecycle.beginDraining(
+                    ticketID: "empty-handoff-ticket",
+                    generation: 33,
+                    byteCount: 0
+                )?.status == .noTail
+                && noTailWakeLifecycle.phase == .noTail
+                && noTailWakeLifecycle.captureDisposition == .ordinary,
+            "an exact empty handoff must resolve as no-tail without replaying or trapping ordinary capture"
         )
 
         var userTurnDisplay = CanonicalUserTurnDisplayRegistry()

@@ -1316,7 +1316,6 @@ runtime.start({
 runtime.transportOpened({ generation: 74 });
 runtime.transportReady({
   generation: 74,
-  handoffReplaySent: false,
 });
 const koreanWakeEvents = nativeMessages
   .slice(koreanWakePriorityStart)
@@ -1356,11 +1355,18 @@ runtime.start({
   activationReason: "wake_only",
   activationID: "wake-only-replay-75",
   wakeLocale: "ko-KR",
+  wakeHandoffTicketID: "wake-handoff-75",
 });
 runtime.transportOpened({ generation: 75 });
 runtime.transportReady({
   generation: 75,
-  handoffReplaySent: true,
+  handoff: {
+    generation: 75,
+    ticketID: "wake-handoff-75",
+    status: "client_send_completed",
+    bytes: 3_120,
+    chunks: 3,
+  },
 });
 assert.equal(
   nativeMessages
@@ -1382,6 +1388,92 @@ runtime.receiveRealtimeEvent({
     item_id: "wake-replay-suffix-75",
   },
 });
+
+const boundWakeOutcomeStart = nativeMessages.length;
+runtime.start({
+  generation: 76,
+  language: "en-US",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Aria",
+  wakePhrases: ["Aria"],
+  prefill: "",
+  shouldGreet: false,
+  activationReason: "wake_only",
+  activationID: "wake-no-tail-76",
+  wakeTranscript: "Aria",
+  wakeHandoffTicketID: "wake-handoff-76",
+});
+runtime.transportOpened({ generation: 76 });
+runtime.transportReady({
+  generation: 76,
+  handoff: {
+    generation: 76,
+    ticketID: "stale-handoff-ticket",
+    status: "client_send_completed",
+    bytes: 1_440,
+    chunks: 1,
+  },
+});
+assert.equal(
+  nativeMessages
+    .slice(boundWakeOutcomeStart)
+    .filter(message => message.type === "userTranscript")
+    .length,
+  0,
+  "a stale ticket-bound replay outcome must not latch transport readiness or display the wake token",
+);
+assert.equal(
+  nativeMessages
+    .slice(boundWakeOutcomeStart)
+    .filter(message =>
+      message.type === "diagnostic"
+      && message.stage === "wake_audio_handoff_ready_rejected"
+    ).length,
+  1,
+  "a stale handoff outcome must fail closed with an observable rejection",
+);
+runtime.transportReady({
+  generation: 76,
+  handoff: {
+    generation: 76,
+    ticketID: "wake-handoff-76",
+    status: "client_send_completed",
+    bytes: 0,
+    chunks: 0,
+  },
+});
+assert.equal(
+  nativeMessages
+    .slice(boundWakeOutcomeStart)
+    .filter(message =>
+      message.type === "diagnostic"
+      && message.stage === "wake_audio_handoff_ready_rejected"
+    ).length,
+  2,
+  "an internally inconsistent replay outcome must not latch readiness",
+);
+runtime.transportReady({
+  generation: 76,
+  handoff: {
+    generation: 76,
+    ticketID: "wake-handoff-76",
+    status: "no_tail",
+    bytes: 0,
+    chunks: 0,
+  },
+});
+assert.deepEqual(
+  nativeMessages
+    .slice(boundWakeOutcomeStart)
+    .filter(message => message.type === "userTranscript")
+    .map(message => ({
+      turnId: message.turnId,
+      text: message.text,
+    })),
+  [{ turnId: "wake-no-tail-76", text: "Aria" }],
+  "an exact no-tail outcome must preserve ordinary wake-only display without opening a suffix window",
+);
 
 const presenceReturnStart = nativeMessages.length;
 runtime.start({
@@ -6632,9 +6724,16 @@ for (const [index, fixture] of [
       wakeTranscript: fixture.wakeTranscript,
       wakePhrases: [fixture.wakeTranscript],
       shouldGreet: true,
+      wakeHandoffTicketID: `wake-handoff-${220 + index}`,
     },
     transportReadyPayload: {
-      handoffReplaySent: true,
+      handoff: {
+        generation: 220 + index,
+        ticketID: `wake-handoff-${220 + index}`,
+        status: "client_send_completed",
+        bytes: 2_880,
+        chunks: 2,
+      },
     },
   });
   const itemID = `wake-tail-${index}`;
@@ -6705,9 +6804,16 @@ const trueWakeOnlyHarness = makeContractHarness({
     wakeTranscript: "Hey Aria",
     wakePhrases: ["Hey Aria"],
     shouldGreet: false,
+    wakeHandoffTicketID: "wake-handoff-224",
   },
   transportReadyPayload: {
-    handoffReplaySent: true,
+    handoff: {
+      generation: 224,
+      ticketID: "wake-handoff-224",
+      status: "client_send_completed",
+      bytes: 1_440,
+      chunks: 1,
+    },
   },
 });
 trueWakeOnlyHarness.advance(2_700);
@@ -6772,9 +6878,16 @@ const failedWakeTailHarness = makeContractHarness({
     activationID: "failed-wake-tail-activation",
     wakeTranscript: "Aria",
     shouldGreet: true,
+    wakeHandoffTicketID: "wake-handoff-225",
   },
   transportReadyPayload: {
-    handoffReplaySent: true,
+    handoff: {
+      generation: 225,
+      ticketID: "wake-handoff-225",
+      status: "client_send_completed",
+      bytes: 1_440,
+      chunks: 1,
+    },
   },
 });
 startContractSpeechSegment(

@@ -1,12 +1,10 @@
-This alpha makes spoken session endings reliable and context-aware.
+This alpha preserves the complete first utterance when wake detection hands audio to Realtime.
 
-- An accepted spoken stop now owns one protected acknowledgement transaction from creation through authoritative playback drain.
-- Repeated speech while stopping cannot cancel, duplicate, reroute, or silently discard that acknowledgement.
-- A transport failure cannot tear down terminal audio that is already queued; the retained acknowledgement remains the only completion authority.
-- The short spoken-stop watchdog may observe a missing drain but cannot authorize teardown; the minutes-scale idle timeout remains unchanged.
-- Wake standby resumes exactly once after acknowledged teardown, including the bounded transport-terminal fallback.
-- Conversational closure now uses the immediate dialogue trajectory and tone instead of requiring explicit farewell vocabulary.
-- Realtime receives the configured assistant, user, and product identities from General settings through the generated non-editable identity context.
-- Build 35 is the signed update target for installed Voice Relay preview-channel builds.
+- Capture admission now waits for the Realtime session to commit before replay can finish or clear the wake journal.
+- The replay journal has one owner, and replay pumping is non-destructive until the handoff outcome is committed.
+- WebSocket send completion is recorded against the immutable ticket and generation so late callbacks cannot finish a newer handoff.
+- Failed or stale admissions remain retryable instead of silently dropping the committed audio tail.
+- Regression coverage now exercises the capture barrier, replay ownership, stale generations, send completion, and retry behavior.
+- Build 36 is the signed update target for installed Voice Relay preview-channel builds.
 
 This public build is Apple Development signed and is not notarized.

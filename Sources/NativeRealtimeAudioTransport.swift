@@ -28,7 +28,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     }
 
     var onSocketOpen: ((Int) -> Void)?
-    var onListeningReady: ((Int, Bool) -> Void)?
+    var onListeningReady: ((
+        Int,
+        WakeAudioHandoffReplayOutcome?
+    ) -> Void)?
     var onEvent: ((Int, JSONDictionary) -> Void)?
     var onInputLevel: ((Int, CGFloat) -> Void)?
     var onPlaybackDrained: ((Int, String) -> Void)?
@@ -36,9 +39,35 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     var onError: ((Int, String) -> Void)?
     var onClosed: ((Int) -> Void)?
 
+    private enum OutboundOrigin {
+        case control
+        case liveCapture
+        case wakeHandoff(WakeAudioHandoffReplayBinding)
+
+        var isAudio: Bool {
+            switch self {
+            case .control:
+                return false
+            case .liveCapture, .wakeHandoff:
+                return true
+            }
+        }
+
+        var handoffBinding: WakeAudioHandoffReplayBinding? {
+            guard case let .wakeHandoff(binding) = self else {
+                return nil
+            }
+            return binding
+        }
+    }
+
     private struct OutboundMessage {
         let text: String
-        let isAudio: Bool
+        let origin: OutboundOrigin
+
+        var isAudio: Bool {
+            origin.isAudio
+        }
     }
 
     private struct PlaybackChunk {
@@ -89,9 +118,9 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private var wakeDeliveredChunks = 0
     private var wakeAudioHandoffJournal = WakeAudioHandoffJournal()
     private var wakeAudioReplayPump = WakeAudioReplayPump()
-    private var activeWakeHandoffTicketID = ""
-    private var handoffReplayPending = false
-    private var handoffReplayWasSent = false
+    private var wakeAudioHandoffLifecycle =
+        WakeAudioHandoffReplayLifecycle()
+    private var bufferedWakeHandoffEvents: [JSONDictionary] = []
     private let wakeAudioHealthInterval: TimeInterval = 1.0
     private var voiceProcessingEnabled = false
     private var captureTapInstalled = false
@@ -111,6 +140,8 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private let maximumCaptureSlots = 8
     private var pendingPCM = Data()
     private var pendingBargeInPCM = Data()
+    private let maximumProtectedLivePCMBytes =
+        WakeAudioHandoffJournal.committedByteCapacity
     private let inputChunkFrames = 720
     private let maximumBargeInPrerollBytes =
         Int(RealtimeEchoAdmissionPolicy.sampleRate * 0.65)
@@ -214,11 +245,25 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 self.activeGeneration = generation
                 self.resetCounters()
             }
-            self.activeWakeHandoffTicketID = claimedWakeHandoff
-                ? requestedHandoffTicketID
-                : ""
-            self.handoffReplayPending = claimedWakeHandoff
-            self.handoffReplayWasSent = false
+            self.wakeAudioHandoffLifecycle.reset()
+            if claimedWakeHandoff {
+                guard self.wakeAudioHandoffLifecycle.claim(
+                    ticketID: requestedHandoffTicketID,
+                    generation: generation
+                ) else {
+                    self.wakeAudioHandoffJournal.cancel(
+                        ticketID: requestedHandoffTicketID
+                    )
+                    self.fail(
+                        "The wake audio handoff state could not be claimed",
+                        stage: "wake_audio_handoff_lifecycle_claim"
+                    )
+                    return
+                }
+            }
+            self.bufferedWakeHandoffEvents.removeAll(
+                keepingCapacity: false
+            )
             self.wakeAudioReplayPump.reset()
             if !requestedHandoffTicketID.isEmpty {
                 VoiceRelayDiagnostics.flow(
@@ -326,7 +371,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                             metadata?["voice_relay_kind"] as? String ?? ""
                     )
             }
-            self.enqueueOutbound(text: jsonEvent, isAudio: false)
+            self.enqueueOutbound(text: jsonEvent, origin: .control)
         }
     }
 
@@ -557,28 +602,37 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
 
     func cancelWakeAudioHandoff() {
         stateQueue.sync {
+            wakeAudioHandoffLifecycle.cancel()
             wakeAudioHandoffJournal.cancel()
             wakeAudioReplayPump.reset()
-            activeWakeHandoffTicketID = ""
-            handoffReplayPending = false
-            handoffReplayWasSent = false
+            bufferedWakeHandoffEvents.removeAll(keepingCapacity: false)
         }
     }
 
-    private func enqueueOutbound(text: String, isAudio: Bool) {
-        guard socketOpen, webSocketTask != nil else { return }
+    @discardableResult
+    private func enqueueOutbound(
+        text: String,
+        origin: OutboundOrigin
+    ) -> Bool {
+        guard socketOpen, webSocketTask != nil else {
+            return false
+        }
         if outboundQueue.count >= maximumOutboundMessages {
-            if isAudio {
+            if origin.isAudio {
+                if origin.handoffBinding != nil {
+                    return false
+                }
                 droppedCaptureChunks += 1
                 emitDiagnosticIfUseful()
-                return
+                return false
             }
-            if handoffReplayPending {
+            if wakeAudioHandoffLifecycle
+                .requiresProtectedContinuity {
                 fail(
                     "The Realtime control queue filled during wake handoff",
                     stage: "wake_audio_handoff_send_queue"
                 )
-                return
+                return false
             }
             if let audioIndex = outboundQueue.firstIndex(where: \.isAudio) {
                 outboundQueue.remove(at: audioIndex)
@@ -588,11 +642,11 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                     "The Realtime send queue is full",
                     stage: "send_queue"
                 )
-                return
+                return false
             }
         }
-        let outbound = OutboundMessage(text: text, isAudio: isAudio)
-        if isAudio {
+        let outbound = OutboundMessage(text: text, origin: origin)
+        if origin.isAudio {
             outboundQueue.append(outbound)
         } else {
             let startIndex = sendInFlight ? 1 : 0
@@ -602,6 +656,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             outboundQueue.insert(outbound, at: insertionIndex)
         }
         pumpOutbound()
+        return true
     }
 
     private func pumpOutbound() {
@@ -625,6 +680,9 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                     self.outboundQueue.removeFirst()
                 }
                 if let error {
+                    if message.origin.handoffBinding != nil {
+                        self.wakeAudioHandoffLifecycle.fail()
+                    }
                     self.fail(
                         "Realtime send failed · \(error.localizedDescription)",
                         stage: "websocket_send"
@@ -633,17 +691,27 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 }
                 if message.isAudio {
                     self.sentChunks += 1
-                    if !self.listeningReadyReported,
-                       self.sessionUpdated,
-                       self.sentChunks > 0 {
-                        self.listeningReadyReported = true
-                        self.emitDiagnostic("listening_ready")
-                        self.emitOnMain {
-                            self.onListeningReady?(
-                                generation,
-                                self.handoffReplayWasSent
+                    if let binding =
+                        message.origin.handoffBinding {
+                        let outcome =
+                            self.wakeAudioHandoffLifecycle
+                                .recordCompleted(binding)
+                        if let outcome {
+                            self.finishWakeAudioHandoffReplay(
+                                generation: generation,
+                                outcome: outcome
                             )
+                        } else {
+                            self.emitDiagnosticIfUseful()
                         }
+                    } else if !self.listeningReadyReported,
+                              self.sessionUpdated,
+                              self.sentChunks > 0 {
+                        self.publishListeningReady(
+                            generation: generation,
+                            handoffOutcome:
+                                self.wakeAudioHandoffLifecycle.outcome
+                        )
                     } else {
                         self.emitDiagnosticIfUseful()
                     }
@@ -708,7 +776,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             emitDiagnostic("session_updated")
             do {
                 try startAudio(reason: "session_updated")
-                try flushWakeAudioHandoffIfNeeded(
+                prepareWakeAudioHandoffReplayIfNeeded(
                     generation: generation
                 )
             } catch AudioLifecycleError.startCancelled {
@@ -854,8 +922,12 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
 
         if shouldForwardInputEvent {
-            emitOnMain {
-                self.onEvent?(generation, event)
+            if wakeAudioHandoffLifecycle.shouldBufferInboundEvents {
+                bufferedWakeHandoffEvents.append(event)
+            } else {
+                emitOnMain {
+                    self.onEvent?(generation, event)
+                }
             }
         }
         if let completedAudioResponseID {
@@ -1787,6 +1859,14 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                       ) else {
                     return
                 }
+                if self.wakeAudioHandoffLifecycle
+                    .requiresProtectedContinuity {
+                    self.failWakeAudioHandoff(
+                        "The wake audio handoff lost a capture buffer",
+                        stage: "wake_audio_handoff_capture_backpressure"
+                    )
+                    return
+                }
                 self.droppedCaptureChunks += 1
                 self.emitDiagnosticIfUseful()
             }
@@ -1830,6 +1910,14 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                     return
                 }
                 guard let bufferHostTime else {
+                    if self.wakeAudioHandoffLifecycle
+                        .requiresProtectedContinuity {
+                        self.failWakeAudioHandoff(
+                            "The wake audio handoff lost capture timing",
+                            stage: "wake_audio_handoff_capture_timing"
+                        )
+                        return
+                    }
                     if self.captureTimingHealth.record(
                         timestampAvailable: false
                     ) {
@@ -1845,20 +1933,13 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                     return
                 }
                 let wakePCM = Self.encodePCM16(samples)
-                let capturedDuringHandoffReplay =
-                    self.handoffReplayPending
-                    && !self.activeWakeHandoffTicketID.isEmpty
-                if capturedDuringHandoffReplay {
-                    self.wakeAudioReplayPump.append(wakePCM)
-                    if let generation = self.activeGeneration {
-                        self.pumpWakeAudioHandoffReplayIfNeeded(
-                            generation: generation
-                        )
-                    }
-                }
+                let handoffCaptureDisposition =
+                    self.wakeAudioHandoffLifecycle
+                        .captureDisposition
                 let shouldJournalWakeAudio =
-                    !capturedDuringHandoffReplay
-                    && (
+                    handoffCaptureDisposition
+                        == .committedJournal
+                    || (
                         self.wakeAudioConsumer != nil
                         || self.wakeAudioHandoffJournal
                             .hasCommittedHandoff
@@ -1877,13 +1958,26 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                         )
                     )
                 }
+                if handoffCaptureDisposition
+                    == .committedJournal {
+                    return
+                }
+                if handoffCaptureDisposition
+                    == .protectedLiveBuffer {
+                    guard self.pendingPCM.count + wakePCM.count
+                        <= self.maximumProtectedLivePCMBytes else {
+                        self.failWakeAudioHandoff(
+                            "The wake audio handoff live buffer overflowed",
+                            stage: "wake_audio_handoff_live_buffer"
+                        )
+                        return
+                    }
+                    self.pendingPCM.append(wakePCM)
+                    return
+                }
                 guard self.sessionUpdated,
                       let generation = self.activeGeneration,
                       !self.stopping else {
-                    return
-                }
-                if capturedDuringHandoffReplay
-                    || self.handoffReplayPending {
                     return
                 }
                 self.emitOnMain {
@@ -1954,57 +2048,110 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
     }
 
-    private func flushWakeAudioHandoffIfNeeded(
+    private func prepareWakeAudioHandoffReplayIfNeeded(
         generation: Int
-    ) throws {
-        guard handoffReplayPending,
-              !activeWakeHandoffTicketID.isEmpty else {
+    ) {
+        guard let key = wakeAudioHandoffLifecycle.key else {
             return
         }
-        let ticketID = activeWakeHandoffTicketID
+        guard wakeAudioHandoffLifecycle.beginPreparing(
+            ticketID: key.ticketID,
+            generation: generation
+        ) else {
+            failWakeAudioHandoff(
+                "The wake audio handoff preparation was stale",
+                stage: "wake_audio_handoff_prepare"
+            )
+            return
+        }
+        VoiceRelayDiagnostics.flow(
+            "wake_audio_handoff_preparing",
+            generation: generation,
+            fields: ["status": "capture_barrier_pending"]
+        )
+        audioProcessingQueue.async { [weak self] in
+            guard let self else { return }
+            self.stateQueue.async {
+                guard self.activeGeneration == generation,
+                      !self.stopping else {
+                    return
+                }
+                self.flushWakeAudioHandoffIfNeeded(
+                    generation: generation
+                )
+            }
+        }
+    }
+
+    private func flushWakeAudioHandoffIfNeeded(
+        generation: Int
+    ) {
+        guard let key = wakeAudioHandoffLifecycle.key,
+              key.generation == generation else {
+            failWakeAudioHandoff(
+                "The wake audio handoff identity was unavailable",
+                stage: "wake_audio_handoff_prepare"
+            )
+            return
+        }
+        let ticketID = key.ticketID
         switch wakeAudioHandoffJournal.replay(
             ticketID: ticketID,
             generation: generation
         ) {
         case let .ready(pcm):
-            handoffReplayWasSent = !pcm.isEmpty
             wakeAudioReplayPump.reset()
             wakeAudioReplayPump.append(pcm)
-            pumpWakeAudioHandoffReplayIfNeeded(
-                generation: generation
-            )
+            let noTailOutcome =
+                wakeAudioHandoffLifecycle.beginDraining(
+                    ticketID: ticketID,
+                    generation: generation,
+                    byteCount: pcm.count
+                )
             VoiceRelayDiagnostics.flow(
                 "wake_audio_handoff_replay_started",
                 generation: generation,
                 fields: [
                     "bytes": String(pcm.count),
-                    "status": pcm.isEmpty ? "empty" : "draining",
+                    "status": pcm.isEmpty ? "no_tail" : "draining",
                 ]
+            )
+            if let noTailOutcome {
+                wakeAudioHandoffJournal.finish(
+                    ticketID: ticketID,
+                    generation: generation
+                )
+                pumpPendingInputPCMChunks()
+                VoiceRelayDiagnostics.flow(
+                    "wake_audio_handoff_replayed",
+                    generation: generation,
+                    fields: [
+                        "bytes": "0",
+                        "chunks": "0",
+                        "status": noTailOutcome.status.rawValue,
+                    ]
+                )
+                return
+            }
+            guard wakeAudioHandoffLifecycle.phase == .draining else {
+                failWakeAudioHandoff(
+                    "The wake audio handoff could not begin draining",
+                    stage: "wake_audio_handoff_drain"
+                )
+                return
+            }
+            pumpWakeAudioHandoffReplayIfNeeded(
+                generation: generation
             )
         case .truncated:
-            wakeAudioHandoffJournal.cancel(ticketID: ticketID)
-            wakeAudioReplayPump.reset()
-            activeWakeHandoffTicketID = ""
-            handoffReplayPending = false
-            throw NSError(
-                domain: "VoiceRelay.NativeRealtimeAudioTransport",
-                code: 12,
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "The wake handoff audio exceeded the safe buffer"
-                ]
+            failWakeAudioHandoff(
+                "The wake handoff audio exceeded the safe buffer",
+                stage: "wake_audio_handoff_truncated"
             )
         case .unavailable:
-            wakeAudioReplayPump.reset()
-            activeWakeHandoffTicketID = ""
-            handoffReplayPending = false
-            throw NSError(
-                domain: "VoiceRelay.NativeRealtimeAudioTransport",
-                code: 13,
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "The wake handoff identity could not be claimed"
-                ]
+            failWakeAudioHandoff(
+                "The wake handoff identity could not be replayed",
+                stage: "wake_audio_handoff_unavailable"
             )
         }
     }
@@ -2012,61 +2159,158 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private func pumpWakeAudioHandoffReplayIfNeeded(
         generation: Int
     ) {
-        guard handoffReplayPending,
-              activeGeneration == generation,
-              !activeWakeHandoffTicketID.isEmpty else {
+        guard activeGeneration == generation,
+              wakeAudioHandoffLifecycle.phase == .draining else {
             return
         }
         let bytesPerChunk =
             inputChunkFrames * MemoryLayout<Int16>.size
-        let chunks = wakeAudioReplayPump.takeAvailableChunks(
-            bytesPerChunk: bytesPerChunk,
-            outboundCount: outboundQueue.count,
-            maximumOutbound: maximumOutboundMessages
+        let safeCapacity = max(
+            0,
+            maximumOutboundMessages
+                - WakeAudioReplayPump.controlQueueReserve
         )
-        for chunk in chunks {
-            enqueueInputPCMChunk(chunk)
-        }
-        guard let remainder =
-            wakeAudioReplayPump.takeRemainderIfBelowChunk(
-                bytesPerChunk: bytesPerChunk
+        while outboundQueue.count < safeCapacity,
+              let chunk = wakeAudioReplayPump.peek(
+                  maximumByteCount: bytesPerChunk
+              ) {
+            guard let binding =
+                wakeAudioHandoffLifecycle.proposedBinding(
+                    byteCount: chunk.count
+                ) else {
+                failWakeAudioHandoff(
+                    "The wake audio handoff chunk identity was invalid",
+                    stage: "wake_audio_handoff_binding"
+                )
+                return
+            }
+            guard enqueueInputPCMChunk(
+                chunk,
+                origin: .wakeHandoff(binding)
             ) else {
+                failWakeAudioHandoff(
+                    "The wake audio handoff could not enter the send queue",
+                    stage: "wake_audio_handoff_send_queue"
+                )
+                return
+            }
+            guard wakeAudioHandoffLifecycle.recordAccepted(binding),
+                  wakeAudioReplayPump.consumeAccepted(
+                      byteCount: chunk.count
+                  ) else {
+                failWakeAudioHandoff(
+                    "The wake audio handoff queue admission was inconsistent",
+                    stage: "wake_audio_handoff_admission"
+                )
+                return
+            }
+        }
+    }
+
+    private func finishWakeAudioHandoffReplay(
+        generation: Int,
+        outcome: WakeAudioHandoffReplayOutcome
+    ) {
+        guard outcome.key.generation == generation,
+              wakeAudioHandoffLifecycle.outcome == outcome else {
+            failWakeAudioHandoff(
+                "The wake audio handoff completion was stale",
+                stage: "wake_audio_handoff_completion"
+            )
             return
         }
-        if !remainder.isEmpty {
-            pendingPCM.append(remainder)
-        }
-        let ticketID = activeWakeHandoffTicketID
         wakeAudioHandoffJournal.finish(
-            ticketID: ticketID,
+            ticketID: outcome.key.ticketID,
             generation: generation
         )
-        activeWakeHandoffTicketID = ""
-        handoffReplayPending = false
+        wakeAudioReplayPump.reset()
         VoiceRelayDiagnostics.flow(
             "wake_audio_handoff_replayed",
             generation: generation,
             fields: [
-                "queued_chunks": String(chunks.count),
-                "remainder_bytes": String(remainder.count),
-                "status": "drained_without_drop",
+                "bytes": String(outcome.byteCount),
+                "chunks": String(outcome.chunkCount),
+                "status": outcome.status.rawValue,
             ]
         )
+        publishListeningReady(
+            generation: generation,
+            handoffOutcome: outcome
+        )
+        pumpPendingInputPCMChunks()
+    }
+
+    private func publishListeningReady(
+        generation: Int,
+        handoffOutcome: WakeAudioHandoffReplayOutcome?
+    ) {
+        guard !listeningReadyReported,
+              activeGeneration == generation,
+              sessionUpdated else {
+            return
+        }
+        if let handoffOutcome {
+            guard handoffOutcome.key.generation == generation,
+                  wakeAudioHandoffLifecycle.outcome
+                    == handoffOutcome else {
+                return
+            }
+        }
+        listeningReadyReported = true
+        let bufferedEvents = bufferedWakeHandoffEvents
+        bufferedWakeHandoffEvents.removeAll(keepingCapacity: false)
+        emitDiagnostic("listening_ready")
+        emitOnMain {
+            self.onListeningReady?(
+                generation,
+                handoffOutcome
+            )
+            for event in bufferedEvents {
+                self.onEvent?(generation, event)
+            }
+        }
+    }
+
+    private func failWakeAudioHandoff(
+        _ message: String,
+        stage: String
+    ) {
+        wakeAudioHandoffLifecycle.fail()
+        wakeAudioReplayPump.reset()
+        bufferedWakeHandoffEvents.removeAll(keepingCapacity: false)
+        fail(message, stage: stage)
     }
 
     private func enqueueInputPCM(_ pcm: Data) {
         guard !pcm.isEmpty else { return }
         pendingPCM.append(pcm)
+        pumpPendingInputPCMChunks()
+    }
+
+    private func pumpPendingInputPCMChunks() {
+        guard !wakeAudioHandoffLifecycle
+            .requiresProtectedContinuity else {
+            return
+        }
         let bytesPerChunk =
             inputChunkFrames * MemoryLayout<Int16>.size
         while pendingPCM.count >= bytesPerChunk {
             let chunk = pendingPCM.prefix(bytesPerChunk)
+            guard enqueueInputPCMChunk(
+                Data(chunk),
+                origin: .liveCapture
+            ) else {
+                return
+            }
             pendingPCM.removeFirst(bytesPerChunk)
-            enqueueInputPCMChunk(Data(chunk))
         }
     }
 
-    private func enqueueInputPCMChunk(_ chunk: Data) {
+    @discardableResult
+    private func enqueueInputPCMChunk(
+        _ chunk: Data,
+        origin: OutboundOrigin
+    ) -> Bool {
         let event: JSONDictionary = [
             "type": "input_audio_buffer.append",
             "audio": chunk.base64EncodedString(),
@@ -2074,9 +2318,9 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         guard let data = try? JSONSerialization.data(
             withJSONObject: event
         ), let text = String(data: data, encoding: .utf8) else {
-            return
+            return false
         }
-        enqueueOutbound(text: text, isAudio: true)
+        return enqueueOutbound(text: text, origin: origin)
     }
 
     private func capturePlaybackReference(
@@ -2651,7 +2895,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
               let text = String(data: data, encoding: .utf8) else {
             return
         }
-        enqueueOutbound(text: text, isAudio: false)
+        enqueueOutbound(text: text, origin: .control)
     }
 
     private func stopCurrent(
@@ -2760,11 +3004,11 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         echoAdmissionPolicy.reset()
         pendingPCM.removeAll(keepingCapacity: false)
         pendingBargeInPCM.removeAll(keepingCapacity: false)
+        wakeAudioHandoffLifecycle.cancel()
         wakeAudioHandoffJournal.cancel()
         wakeAudioReplayPump.reset()
-        activeWakeHandoffTicketID = ""
-        handoffReplayPending = false
-        handoffReplayWasSent = false
+        wakeAudioHandoffLifecycle.reset()
+        bufferedWakeHandoffEvents.removeAll(keepingCapacity: false)
 
         outboundQueue.removeAll(keepingCapacity: false)
         sendInFlight = false
