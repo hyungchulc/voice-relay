@@ -119,6 +119,94 @@ await withSessionFile(async (file) => {
 });
 
 await withSessionFile(async (file) => {
+  const obsoleteFinal = "Obsolete pre-steer final.";
+  const revisedCommentary = "Applying the accepted correction.";
+  const revisedFinalA = "Corrected final A.";
+  const revisedFinalB = "Corrected final B.";
+  append(file, [
+    ...rootEntries(),
+    assistantMessage("obsolete-final", "final_answer", obsoleteFinal),
+  ]);
+  const clock = { now: 0 };
+  const fence = new AcceptedSteerResponseRevisionFence();
+  const messages = [];
+  let sleeps = 0;
+  const result = await streamCodexReplies(
+    streamOptions({
+      file,
+      clock,
+      getAcceptedSteerRevision: () => fence.snapshot(),
+      onMessage: async (message) => messages.push(message),
+      sleepFn: async (milliseconds) => {
+        clock.now += milliseconds;
+        sleeps += 1;
+        if (sleeps === 1) {
+          const acceptedOffset = append(file, [
+            jsonlEntry("event_msg", {
+              type: "user_message",
+              message:
+                "[bridge_followup_request_id: race-steer]\nUse the corrected request.",
+            }),
+          ]);
+          fence.accept({
+            acceptedOffset,
+            requestToken: "race-steer",
+            rootSessionId: ROOT_SESSION_ID,
+            turnId: TURN_ID,
+            sessionFile: file,
+          });
+        } else if (sleeps === 2) {
+          append(file, [
+            assistantMessage(
+              "revised-commentary-race",
+              "commentary",
+              revisedCommentary,
+            ),
+            assistantMessage(
+              "revised-final-a-race",
+              "final_answer",
+              revisedFinalA,
+            ),
+            assistantMessage(
+              "revised-final-b-race",
+              "final_answer",
+              revisedFinalB,
+            ),
+            taskComplete(revisedFinalB),
+          ]);
+        }
+      },
+    }),
+  );
+  assert.equal(
+    result.completedBy,
+    "task_complete",
+    "the accepted correction must close only on authoritative completion",
+  );
+  assert.equal(
+    result.completedResponseRevision,
+    1,
+    "the corrected response must resolve exactly one accepted revision",
+  );
+  assert.deepEqual(
+    messages.map((message) => message.text),
+    [revisedCommentary, `${revisedFinalA}\n\n${revisedFinalB}`],
+    "a buffered final at or before the accepted offset must not cross the response boundary",
+  );
+  assert.ok(
+    !messages.some((message) => message.text.includes(obsoleteFinal)),
+    "the obsolete pre-steer final must never reach the relay callback",
+  );
+  assert.deepEqual(
+    result.messages
+      .filter((message) => message.phase === "final_answer")
+      .map((message) => message.text),
+    [`${revisedFinalA}\n\n${revisedFinalB}`],
+    "the terminal result must contain only ordered finals from the accepted revision",
+  );
+});
+
+await withSessionFile(async (file) => {
   append(file, rootEntries());
   const clock = { now: 0 };
   const fence = new AcceptedSteerResponseRevisionFence();
@@ -147,7 +235,9 @@ await withSessionFile(async (file) => {
           fence.accept({
             acceptedOffset,
             requestToken: "accepted-steer",
+            rootSessionId: ROOT_SESSION_ID,
             turnId: TURN_ID,
+            sessionFile: file,
           });
         } else if (sleeps === 2) {
           append(file, [
@@ -197,6 +287,167 @@ await withSessionFile(async (file) => {
       .map((message) => message.text),
     [`${partialFinal}\n\n${additiveFinal}`],
     "the terminal result must expose the same single ordered combined final",
+  );
+});
+
+await withSessionFile(async (file) => {
+  const repeatedAcrossBoundary = "Same text in the authoritative revision.";
+  append(file, [
+    ...rootEntries(),
+    assistantMessage(
+      "same-text-before-steer",
+      "final_answer",
+      repeatedAcrossBoundary,
+    ),
+  ]);
+  const clock = { now: 0 };
+  const fence = new AcceptedSteerResponseRevisionFence();
+  const messages = [];
+  let sleeps = 0;
+  const result = await streamCodexReplies(
+    streamOptions({
+      file,
+      clock,
+      getAcceptedSteerRevision: () => fence.snapshot(),
+      onMessage: async (message) => messages.push(message),
+      sleepFn: async (milliseconds) => {
+        clock.now += milliseconds;
+        sleeps += 1;
+        if (sleeps === 1) {
+          const acceptedOffset = append(file, [
+            jsonlEntry("event_msg", {
+              type: "user_message",
+              message:
+                "[bridge_followup_request_id: same-text-steer]\nRegenerate it.",
+            }),
+          ]);
+          fence.accept({
+            acceptedOffset,
+            requestToken: "same-text-steer",
+            rootSessionId: ROOT_SESSION_ID,
+            turnId: TURN_ID,
+            sessionFile: file,
+          });
+        } else if (sleeps === 2) {
+          append(file, [
+            assistantMessage(
+              "same-text-after-steer",
+              "final_answer",
+              repeatedAcrossBoundary,
+            ),
+            taskComplete(repeatedAcrossBoundary),
+          ]);
+        }
+      },
+    }),
+  );
+  assert.equal(result.completedResponseRevision, 1);
+  assert.deepEqual(
+    messages
+      .filter((message) => message.phase === "final_answer")
+      .map((message) => message.text),
+    [repeatedAcrossBoundary],
+    "quarantining a prior revision must rebase exact-text deduplication",
+  );
+});
+
+await withSessionFile(async (file) => {
+  const originalFinal = "Revision zero final.";
+  const firstRevisionFinal = "Revision one final.";
+  const secondRevisionFinalA = "Revision two final A.";
+  const secondRevisionFinalB = "Revision two final B.";
+  append(file, [
+    ...rootEntries(),
+    assistantMessage("revision-zero-final", "final_answer", originalFinal),
+  ]);
+  const clock = { now: 0 };
+  const fence = new AcceptedSteerResponseRevisionFence();
+  const messages = [];
+  let sleeps = 0;
+  const result = await streamCodexReplies(
+    streamOptions({
+      file,
+      clock,
+      getAcceptedSteerRevision: () => fence.snapshot(),
+      onMessage: async (message) => messages.push(message),
+      sleepFn: async (milliseconds) => {
+        clock.now += milliseconds;
+        sleeps += 1;
+        if (sleeps === 1) {
+          const acceptedOffset = append(file, [
+            jsonlEntry("event_msg", {
+              type: "user_message",
+              message:
+                "[bridge_followup_request_id: revision-one-steer]\nFirst update.",
+            }),
+          ]);
+          fence.accept({
+            acceptedOffset,
+            requestToken: "revision-one-steer",
+            rootSessionId: ROOT_SESSION_ID,
+            turnId: TURN_ID,
+            sessionFile: file,
+          });
+        } else if (sleeps === 2) {
+          append(file, [
+            assistantMessage(
+              "revision-one-final",
+              "final_answer",
+              firstRevisionFinal,
+            ),
+          ]);
+        } else if (sleeps === 3) {
+          const acceptedOffset = append(file, [
+            jsonlEntry("event_msg", {
+              type: "user_message",
+              message:
+                "[bridge_followup_request_id: revision-two-steer]\nSecond update.",
+            }),
+          ]);
+          fence.accept({
+            acceptedOffset,
+            requestToken: "revision-two-steer",
+            rootSessionId: ROOT_SESSION_ID,
+            turnId: TURN_ID,
+            sessionFile: file,
+          });
+        } else if (sleeps === 4) {
+          append(file, [
+            assistantMessage(
+              "revision-two-final-a",
+              "final_answer",
+              secondRevisionFinalA,
+            ),
+            assistantMessage(
+              "revision-two-final-b",
+              "final_answer",
+              secondRevisionFinalB,
+            ),
+            taskComplete(secondRevisionFinalB),
+          ]);
+        }
+      },
+    }),
+  );
+  assert.equal(
+    result.completedResponseRevision,
+    2,
+    "successive accepted steers must resolve the newest response revision",
+  );
+  assert.deepEqual(
+    messages
+      .filter((message) => message.phase === "final_answer")
+      .map((message) => message.text),
+    [`${secondRevisionFinalA}\n\n${secondRevisionFinalB}`],
+    "a later accepted response revision must quarantine every earlier pending revision",
+  );
+  assert.ok(
+    !messages.some(
+      (message) =>
+        message.text.includes(originalFinal) ||
+        message.text.includes(firstRevisionFinal),
+    ),
+    "no pending final may cross either accepted response boundary",
   );
 });
 
@@ -278,7 +529,9 @@ await withSessionFile(async (file) => {
           fence.accept({
             acceptedOffset,
             requestToken: "duplicate-steer",
+            rootSessionId: ROOT_SESSION_ID,
             turnId: TURN_ID,
+            sessionFile: file,
           });
         } else if (sleeps === 2) {
           append(file, [
@@ -347,7 +600,9 @@ await withSessionFile(async (file) => {
             fence.accept({
               acceptedOffset,
               requestToken: "timeout-steer",
+              rootSessionId: ROOT_SESSION_ID,
               turnId: TURN_ID,
+              sessionFile: file,
             });
             append(file, [
               assistantMessage(
@@ -371,37 +626,78 @@ await withSessionFile(async (file) => {
 });
 
 await withSessionFile(async (file) => {
-  append(file, rootEntries());
+  append(file, [
+    ...rootEntries(),
+    assistantMessage(
+      "abort-pre-steer-final",
+      "final_answer",
+      "Quarantine this before abort.",
+    ),
+  ]);
   const controller = new AbortController();
-  controller.abort();
+  const clock = { now: 0 };
+  const fence = new AcceptedSteerResponseRevisionFence();
+  const messages = [];
+  let sleeps = 0;
   await assert.rejects(
     streamCodexReplies(
       streamOptions({
         file,
-        clock: { now: 0 },
+        clock,
         signal: controller.signal,
-        onMessage: async () => {},
-        sleepFn: async () => {},
+        getAcceptedSteerRevision: () => fence.snapshot(),
+        onMessage: async (message) => messages.push(message),
+        sleepFn: async (milliseconds) => {
+          clock.now += milliseconds;
+          sleeps += 1;
+          if (sleeps === 1) {
+            const acceptedOffset = append(file, [
+              jsonlEntry("event_msg", {
+                type: "user_message",
+                message:
+                  "[bridge_followup_request_id: abort-steer]\nStop this stream.",
+              }),
+            ]);
+            fence.accept({
+              acceptedOffset,
+              requestToken: "abort-steer",
+              rootSessionId: ROOT_SESSION_ID,
+              turnId: TURN_ID,
+              sessionFile: file,
+            });
+            controller.abort();
+          }
+        },
       }),
     ),
     (error) => error?.code === "CODEX_REPLY_STREAM_ABORTED",
     "an aborted response stream must remain fail-closed",
   );
+  assert.deepEqual(
+    messages,
+    [],
+    "abort after accepted steer must not leak a prior-revision final",
+  );
 });
 
 {
   const fence = new AcceptedSteerResponseRevisionFence();
+  const sessionFile = "/tmp/voice-relay-revision-fence.jsonl";
   assert.deepEqual(
     fence.accept({
       acceptedOffset: 10,
       requestToken: "revision-one",
+      rootSessionId: ROOT_SESSION_ID,
       turnId: TURN_ID,
+      sessionFile,
     }),
     {
       acceptedRevision: 1,
       acceptedOffset: 10,
       requestToken: "revision-one",
+      rootSessionId: ROOT_SESSION_ID,
       turnId: TURN_ID,
+      sessionFile,
     },
     "the first accepted steer must create response revision one",
   );
@@ -410,16 +706,32 @@ await withSessionFile(async (file) => {
       fence.accept({
         acceptedOffset: 10,
         requestToken: "duplicate-offset",
+        rootSessionId: ROOT_SESSION_ID,
         turnId: TURN_ID,
+        sessionFile,
       }),
     /must advance/,
     "duplicate or regressive acceptance evidence must fail closed",
+  );
+  await assert.rejects(
+    async () =>
+      fence.accept({
+        acceptedOffset: 20,
+        requestToken: "foreign-turn",
+        rootSessionId: ROOT_SESSION_ID,
+        turnId: "019fb137-fence-7000-8000-000000000002",
+        sessionFile,
+      }),
+    /must remain in one response scope/,
+    "successive revisions must not cross root, turn, or session-file scope",
   );
   assert.equal(
     fence.accept({
       acceptedOffset: 20,
       requestToken: "revision-two",
+      rootSessionId: ROOT_SESSION_ID,
       turnId: TURN_ID,
+      sessionFile,
     }).acceptedRevision,
     2,
     "successive accepted steers must advance one durable response revision",

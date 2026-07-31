@@ -5965,7 +5965,9 @@ assert.deepEqual(
     acceptedRevision: 1,
     acceptedOffset: 21,
     requestToken: justInTimeIdentity,
+    rootSessionId: justInTimeHarness.threadId,
     turnId: justInTimeHarness.turnId,
+    sessionFile: "/tmp/voice-relay-deadline-success.jsonl",
   },
   "terminal steer acceptance must create a durable unresolved response revision",
 );

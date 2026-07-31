@@ -21,13 +21,33 @@ export class AcceptedSteerResponseRevisionFence {
     this.acceptedRevision = 0;
     this.acceptedOffset = null;
     this.requestToken = null;
+    this.rootSessionId = null;
     this.turnId = null;
+    this.sessionFile = null;
   }
 
-  accept({ acceptedOffset, requestToken = "", turnId = "" } = {}) {
+  accept({
+    acceptedOffset,
+    requestToken = "",
+    rootSessionId = "",
+    turnId = "",
+    sessionFile = "",
+  } = {}) {
     const normalizedOffset = Number(acceptedOffset);
+    const normalizedRootSessionId = normalizeSessionId(rootSessionId);
+    const normalizedTurnId = normalizeSessionId(turnId);
+    const normalizedSessionFile = normalizeSessionFile(sessionFile);
     if (!Number.isSafeInteger(normalizedOffset) || normalizedOffset < 0) {
       throw new Error("Accepted steer revision requires a stable session offset");
+    }
+    if (
+      !normalizedRootSessionId ||
+      !normalizedTurnId ||
+      !normalizedSessionFile
+    ) {
+      throw new Error(
+        "Accepted steer revision requires stable root, turn, and session-file scope",
+      );
     }
     if (
       Number.isSafeInteger(this.acceptedOffset) &&
@@ -35,10 +55,20 @@ export class AcceptedSteerResponseRevisionFence {
     ) {
       throw new Error("Accepted steer revisions must advance the session offset");
     }
+    if (
+      this.acceptedRevision > 0 &&
+      (normalizedRootSessionId !== this.rootSessionId ||
+        normalizedTurnId !== this.turnId ||
+        normalizedSessionFile !== this.sessionFile)
+    ) {
+      throw new Error("Accepted steer revisions must remain in one response scope");
+    }
     this.acceptedRevision += 1;
     this.acceptedOffset = normalizedOffset;
     this.requestToken = String(requestToken || "").trim() || null;
-    this.turnId = normalizeSessionId(turnId) || null;
+    this.rootSessionId = normalizedRootSessionId;
+    this.turnId = normalizedTurnId;
+    this.sessionFile = normalizedSessionFile;
     return this.snapshot();
   }
 
@@ -47,7 +77,9 @@ export class AcceptedSteerResponseRevisionFence {
       acceptedRevision: this.acceptedRevision,
       acceptedOffset: this.acceptedOffset,
       requestToken: this.requestToken,
+      rootSessionId: this.rootSessionId,
       turnId: this.turnId,
+      sessionFile: this.sessionFile,
     });
   }
 }
@@ -122,16 +154,30 @@ export async function streamCodexReplies({
     sinceMs,
   });
   const sent = new Set();
-  const observedFinalKeys = new Set();
-  const observedFinalTexts = new Set();
   const pendingFinals = [];
   const lastActivityOffsets = new Map();
   let lastHit = null;
   let settleCandidate = null;
   let completedResponseRevision = 0;
+  let appliedResponseRevision = 0;
   let taskStartedNotified = false;
   let acceptanceNotified = false;
   let pinnedSessionFile = null;
+
+  const reconcileAcceptedResponseRevision = () => {
+    const nextRevision = acceptedSteerRevisionSnapshot(
+      getAcceptedSteerRevision,
+    );
+    if (nextRevision.acceptedRevision < appliedResponseRevision) {
+      throw new Error("Accepted steer response revision regressed");
+    }
+    if (nextRevision.acceptedRevision > appliedResponseRevision) {
+      rebasePendingFinalsForAcceptedRevision(pendingFinals, nextRevision);
+      settleCandidate = null;
+      appliedResponseRevision = nextRevision.acceptedRevision;
+    }
+    return nextRevision;
+  };
 
   while (now() < deadline) {
     throwIfReplyStreamAborted(signal, requestId);
@@ -212,31 +258,36 @@ export async function streamCodexReplies({
         });
         deadline = now() + timeoutMs;
       }
-      const responseRevision = acceptedSteerRevisionSnapshot(
-        getAcceptedSteerRevision,
-      );
-      const unresolvedResponseRevision =
-        responseRevision.acceptedRevision > completedResponseRevision;
+      let responseRevision = reconcileAcceptedResponseRevision();
       for (const message of hit.messages) {
         const key = message.id || `${message.phase}:${message.text}`;
         if (message.phase === "final_answer") {
-          const normalizedText = normalizeFinalText(message.text);
+          responseRevision = reconcileAcceptedResponseRevision();
           if (
-            observedFinalKeys.has(key) ||
-            !normalizedText ||
-            observedFinalTexts.has(normalizedText)
+            finalDispositionForRevision(message, file, responseRevision) !==
+            "current"
           ) {
             continue;
           }
-          observedFinalKeys.add(key);
-          observedFinalTexts.add(normalizedText);
+          const normalizedText = normalizeFinalText(message.text);
+          if (
+            !normalizedText ||
+            pendingFinals.some(
+              (entry) =>
+                entry.key === key || entry.normalizedText === normalizedText,
+            )
+          ) {
+            continue;
+          }
           const pendingFinal = {
             key,
+            normalizedText,
             message: messageWithFile(message, file),
             seenAt: now(),
             finalOffset: Number.isSafeInteger(message.finalOffset)
               ? message.finalOffset
               : null,
+            responseRevision: responseRevision.acceptedRevision,
           };
           pendingFinals.push(pendingFinal);
           settleCandidate = pendingFinal;
@@ -247,6 +298,9 @@ export async function streamCodexReplies({
         await onMessage(messageWithFile(message, file));
         deadline = now() + timeoutMs;
       }
+      responseRevision = reconcileAcceptedResponseRevision();
+      const unresolvedResponseRevision =
+        responseRevision.acceptedRevision > completedResponseRevision;
       if (
         hit.complete &&
         hit.pendingImageGenerationCount === 0 &&
@@ -282,6 +336,7 @@ export async function streamCodexReplies({
       }
     }
     if (rediscoverSessionFile) continue;
+    if (lastHit) reconcileAcceptedResponseRevision();
     if (
       settleCandidate &&
       lastHit?.pendingImageGenerationCount === 0 &&
@@ -318,24 +373,39 @@ function acceptedSteerRevisionSnapshot(getAcceptedSteerRevision) {
       acceptedRevision: 0,
       acceptedOffset: null,
       requestToken: null,
+      rootSessionId: null,
       turnId: null,
+      sessionFile: null,
     };
   }
   const snapshot = getAcceptedSteerRevision() || {};
   const acceptedRevision = Number(snapshot.acceptedRevision);
   const acceptedOffset = Number(snapshot.acceptedOffset);
-  return {
-    acceptedRevision:
-      Number.isSafeInteger(acceptedRevision) && acceptedRevision > 0
-        ? acceptedRevision
-        : 0,
+  const normalizedRevision =
+    Number.isSafeInteger(acceptedRevision) && acceptedRevision > 0
+      ? acceptedRevision
+      : 0;
+  const revision = {
+    acceptedRevision: normalizedRevision,
     acceptedOffset:
       Number.isSafeInteger(acceptedOffset) && acceptedOffset >= 0
         ? acceptedOffset
         : null,
     requestToken: String(snapshot.requestToken || "").trim() || null,
+    rootSessionId: normalizeSessionId(snapshot.rootSessionId) || null,
     turnId: normalizeSessionId(snapshot.turnId) || null,
+    sessionFile: normalizeSessionFile(snapshot.sessionFile),
   };
+  if (
+    normalizedRevision > 0 &&
+    (!Number.isSafeInteger(revision.acceptedOffset) ||
+      !revision.rootSessionId ||
+      !revision.turnId ||
+      !revision.sessionFile)
+  ) {
+    throw new Error("Accepted steer response revision has incomplete scope");
+  }
+  return revision;
 }
 
 function authoritativeCompletionForRevision(hit, responseRevision) {
@@ -343,8 +413,50 @@ function authoritativeCompletionForRevision(hit, responseRevision) {
     Number.isSafeInteger(responseRevision.acceptedOffset) &&
     Number.isSafeInteger(hit.completedOffset) &&
     hit.completedOffset > responseRevision.acceptedOffset &&
-    (!responseRevision.turnId || hit.turnId === responseRevision.turnId)
+    hit.ownerSessionId === responseRevision.rootSessionId &&
+    hit.turnId === responseRevision.turnId &&
+    normalizeSessionFile(hit.file) === responseRevision.sessionFile
   );
+}
+
+function rebasePendingFinalsForAcceptedRevision(
+  pendingFinals,
+  responseRevision,
+) {
+  const retained = [];
+  for (const entry of pendingFinals) {
+    const disposition = finalDispositionForRevision(
+      entry.message,
+      entry.message.file,
+      responseRevision,
+    );
+    if (disposition !== "current") continue;
+    retained.push({
+      ...entry,
+      responseRevision: responseRevision.acceptedRevision,
+    });
+  }
+  pendingFinals.splice(0, pendingFinals.length, ...retained);
+}
+
+function finalDispositionForRevision(message, file, responseRevision) {
+  if (responseRevision.acceptedRevision === 0) return "current";
+  if (
+    message.ownerSessionId !== responseRevision.rootSessionId ||
+    message.turnId !== responseRevision.turnId ||
+    normalizeSessionFile(file) !== responseRevision.sessionFile ||
+    !Number.isSafeInteger(message.finalOffset)
+  ) {
+    return "unbound";
+  }
+  return message.finalOffset <= responseRevision.acceptedOffset
+    ? "prior"
+    : "current";
+}
+
+function normalizeSessionFile(value) {
+  const normalized = String(value || "").trim();
+  return normalized ? path.resolve(normalized) : null;
 }
 
 function normalizeFinalText(value) {
@@ -359,6 +471,13 @@ function normalizeFinalText(value) {
 function combinedPendingFinal(pendingFinals) {
   if (!Array.isArray(pendingFinals) || pendingFinals.length === 0) return null;
   const latest = pendingFinals.at(-1);
+  if (
+    pendingFinals.some(
+      (entry) => entry.responseRevision !== latest.responseRevision,
+    )
+  ) {
+    throw new Error("Pending finals crossed an accepted response revision");
+  }
   return {
     key: `combined_final:${pendingFinals.map((entry) => entry.key).join("|")}`,
     message: {

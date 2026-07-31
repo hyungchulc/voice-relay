@@ -1140,7 +1140,11 @@ export class CodexAppRemoteBackend {
                 acceptedResult.acceptanceEvidence.acceptedOffset,
               requestToken:
                 acceptedResult.acceptanceEvidence.requestToken,
+              rootSessionId:
+                acceptedResult.acceptanceEvidence.rootSessionId,
               turnId: acceptedResult.acceptanceEvidence.turnId,
+              sessionFile:
+                acceptedResult.acceptanceEvidence.sessionFile,
             });
           }
           if (remainingMutationTime() <= 0) {
