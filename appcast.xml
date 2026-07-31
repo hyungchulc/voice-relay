@@ -5,15 +5,15 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <title>Voice Relay</title>
         <item>
             <title>0.5.1</title>
-            <pubDate>Fri, 31 Jul 2026 00:50:53 +0200</pubDate>
-            <link>https://github.com/hyungchulc/voice-relay/releases/tag/v0.5.1-alpha.9</link>
-            <sparkle:version>34</sparkle:version>
+            <pubDate>Fri, 31 Jul 2026 03:12:20 +0200</pubDate>
+            <link>https://github.com/hyungchulc/voice-relay/releases/tag/v0.5.1-alpha.10</link>
+            <sparkle:version>35</sparkle:version>
             <sparkle:shortVersionString>0.5.1</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/hyungchulc/voice-relay/releases/download/v0.5.1-alpha.9/Voice-Relay-0.5.1-alpha.9-update.zip" length="4988681" type="application/octet-stream" sparkle:edSignature="ruOuOVc4W2iMivDULG+VfLs1D1PzyQ+H/fQT24X9wyQyQx/kmFRBfWT0fGm/hlAiOa3blyBuvy+D98jrmdhgAg=="></enclosure>
+            <enclosure url="https://github.com/hyungchulc/voice-relay/releases/download/v0.5.1-alpha.10/Voice-Relay-0.5.1-alpha.10-update.zip" length="5003518" type="application/octet-stream" sparkle:edSignature="iOFGuaCYpWgP7vuPq7s821ZK2su9p8G0VWOllJe8/pB4S3WbbhTRm8PEVlDbag9c4DBE3kgsu8ixVwq+V7GYBA=="></enclosure>
         </item>
     </channel>
 </rss><!-- sparkle-signatures:
-edSignature: SDumkoEJjEDHKR7EzJJczXBZw3EtCybND4Mafo93q0lqfXsM2Kb9y06kIw+fPkl7tHCLRGmmEkP22u24/PIXBw==
-length: 1171
+edSignature: EngHQxdv6o7ososJV94GpI514F7uqY+TKhB15Gymzs1YisQsjqahzpUVZ8ef5q0K58IXvppTrYOMeZ6Z/C0/Dg==
+length: 1174
 -->
