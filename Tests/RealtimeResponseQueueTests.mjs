@@ -80,6 +80,7 @@ runtime.start({
   speechRate: 1.1,
   productName: "Voice Relay",
   assistantName: "Relay",
+  userDisplayName: "John",
   wakePhrases: ["릴레이야"],
   shouldGreet: false,
 });
@@ -102,8 +103,23 @@ assert.match(
 );
 assert.match(
   sessionUpdates().at(-1)?.session?.instructions || "",
-  /Use close_session only when the complete utterance and immediate conversational context clearly express a farewell/,
-  "the session contract must distinguish conversational closure from a receipt",
+  /full immediate dialogue trajectory, conversational tone, and current interaction state/,
+  "the session contract must classify closure from the holistic conversational trajectory",
+);
+assert.match(
+  sessionUpdates().at(-1)?.session?.instructions || "",
+  /assistant role belongs to the configured assistant named "Relay"/,
+  "the generated non-editable identity block must bind the configured assistant to the assistant role",
+);
+assert.match(
+  sessionUpdates().at(-1)?.session?.instructions || "",
+  /user role belongs to the configured user named "John"/,
+  "the generated non-editable identity block must bind the General-settings display name to the user role",
+);
+assert.match(
+  sessionUpdates().at(-1)?.session?.instructions || "",
+  /surface words alone are never dispositive/,
+  "the session contract must not reduce closure to farewell vocabulary",
 );
 assert.doesNotMatch(
   sessionUpdates().at(-1)?.session?.instructions || "",
@@ -230,8 +246,8 @@ assert.match(
 );
 assert.match(
   responseCreates().at(-1).response.instructions || "",
-  /Bare thanks, approval, acknowledgement, or receipt without clear closure stays conversational/,
-  "per-turn routing must preserve bare social receipts without closing",
+  /same social wording can close a completed exchange while remaining conversational during ongoing or open interaction/,
+  "per-turn routing must judge social receipts from the dialogue trajectory instead of closing lexically",
 );
 assert.ok(
   responseCreates().at(-1).response.tools[0]
@@ -4355,6 +4371,7 @@ function makeContractHarness({
     speechRate: 1,
     productName: "Voice Relay",
     assistantName: "Aria",
+    userDisplayName: "John",
     wakePhrases: ["Aria"],
     shouldGreet: false,
     ...startOverrides,
@@ -8225,6 +8242,210 @@ assert.equal(
   "bare thanks without clear closure must remain direct chat",
 );
 
+const configuredIdentityHarness = makeContractHarness({
+  generation: 363,
+  language: "en-US",
+  startOverrides: {
+    productName: "Orbit",
+    assistantName: "Nova",
+    userDisplayName: "John",
+  },
+});
+const configuredIdentitySession =
+  configuredIdentityHarness.outbound().find(event =>
+    event.type === "session.update"
+  );
+assert.match(
+  configuredIdentitySession?.session?.instructions || "",
+  /assistant role belongs to the configured assistant named "Nova"/,
+  "Realtime assistant identity must come from the configured General value",
+);
+assert.match(
+  configuredIdentitySession?.session?.instructions || "",
+  /user role belongs to the configured user named "John"/,
+  "Realtime user identity must come from the configured General value",
+);
+assert.match(
+  configuredIdentitySession?.session?.instructions || "",
+  /configured product name is "Orbit"/,
+  "Realtime product identity must come from the configured General value",
+);
+beginOrdinaryRouteDecision(configuredIdentityHarness, {
+  itemID: "configured-identity-item",
+  text: "Who are we?",
+  callID: "configured-identity-call",
+  kind: "local_identity",
+  spokenLanguage: "en-US",
+  spokenRegister: "neutral",
+});
+const configuredIdentityOutput =
+  configuredIdentityHarness.outbound().findLast(event =>
+    event.type === "conversation.item.create"
+    && event.item?.type === "function_call_output"
+  );
+assert.deepEqual(
+  JSON.parse(configuredIdentityOutput?.item?.output || "{}"),
+  {
+    status: "ok",
+    request: "Who are we?",
+    productName: "Orbit",
+    assistantName: "Nova",
+    userDisplayName: "John",
+  },
+  "local identity answers must use the configured assistant, user, and product values without invented names",
+);
+const incompleteIdentityHarness = makeContractHarness({
+  generation: 383,
+  language: "en-US",
+  startOverrides: {
+    userDisplayName: "",
+  },
+});
+assert.equal(
+  incompleteIdentityHarness.native("error").length,
+  0,
+  "an unset optional General user display name must not break existing sessions",
+);
+assert.match(
+  incompleteIdentityHarness.outbound().find(event =>
+    event.type === "session.update"
+  )?.session?.instructions || "",
+  /user role belongs to the configured user, whose display name is not set\. Do not invent a user name\./,
+  "an unset General user display name must remain explicitly absent without an invented fallback",
+);
+const missingAssistantIdentityHarness = makeContractHarness({
+  generation: 384,
+  language: "en-US",
+  startOverrides: {
+    assistantName: "",
+  },
+});
+assert.equal(
+  missingAssistantIdentityHarness.native("error").length,
+  1,
+  "a missing required General assistant identity must fail closed exactly once",
+);
+assert.equal(
+  missingAssistantIdentityHarness.outbound().length,
+  0,
+  "a missing required General assistant identity must never create a Realtime session with a fallback name",
+);
+
+const completedTrajectoryHarness = makeContractHarness({
+  generation: 364,
+  language: "en-US",
+});
+completeLocalRoutedReply(completedTrajectoryHarness, {
+  itemID: "completed-trajectory-request",
+  text: "Give me the short answer.",
+  callID: "completed-trajectory-request-call",
+  kind: "local_simple",
+  reply: "The short answer is ready.",
+});
+const trajectoryUtterance = "All right.";
+const completedTrajectoryStart =
+  completedTrajectoryHarness.messages.length;
+completedTrajectoryHarness.receive({
+  type: "conversation.item.input_audio_transcription.completed",
+  item_id: "completed-trajectory-social",
+  transcript: trajectoryUtterance,
+});
+const completedTrajectoryRequest =
+  completedTrajectoryHarness.outbound().findLast(event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind === "route_classifier"
+  );
+assert.match(
+  completedTrajectoryRequest?.response?.instructions || "",
+  /"recent_dialogue":\[/,
+  "ordinary closure classification must receive the bounded immediate dialogue trajectory",
+);
+assert.match(
+  completedTrajectoryRequest?.response?.instructions || "",
+  /The short answer is ready\./,
+  "ordinary closure classification must receive the bounded recent dialogue trajectory",
+);
+completedTrajectoryHarness.receive({
+  type: "response.created",
+  response: {
+    id: "completed-trajectory-route",
+    metadata: { voice_relay_kind: "route_classifier" },
+  },
+});
+completedTrajectoryHarness.receive({
+  type: "response.function_call_arguments.done",
+  name: "route_voice_turn",
+  call_id: "completed-trajectory-close-call",
+  arguments: JSON.stringify({
+    kind: "close_session",
+    social_origin: "user_reply",
+    spoken_language: "en-US",
+    spoken_register: "casual",
+    stop_target: "not_applicable",
+    progress_summary: "",
+  }),
+});
+completedTrajectoryHarness.receive({
+  type: "response.done",
+  response: {
+    id: "completed-trajectory-route",
+    status: "completed",
+    metadata: { voice_relay_kind: "route_classifier" },
+    output: [{ type: "function_call" }],
+  },
+});
+assert.equal(
+  completedTrajectoryHarness.messages.slice(completedTrajectoryStart)
+    .filter(message =>
+      message.type === "stopIntent"
+      && message.reason === "semantic_closure"
+    ).length,
+  1,
+  "a semantic closure decision after a completed trajectory must enter the terminal lifecycle",
+);
+
+const ongoingTrajectoryHarness = makeContractHarness({
+  generation: 369,
+  language: "en-US",
+});
+beginContractCodex(
+  ongoingTrajectoryHarness,
+  "Continue reviewing the open work.",
+);
+const ongoingTrajectoryStart = ongoingTrajectoryHarness.messages.length;
+routeContractControl(
+  ongoingTrajectoryHarness,
+  trajectoryUtterance,
+  {
+    action: "acknowledge_only",
+    confidence: "high",
+    spoken_language: "en-US",
+    spoken_register: "casual",
+    stop_target: "not_applicable",
+  },
+);
+const ongoingTrajectoryRequest =
+  ongoingTrajectoryHarness.outbound().findLast(event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind === "active_codex_control"
+  );
+assert.match(
+  ongoingTrajectoryRequest?.response?.tools?.[0]?.description || "",
+  /Classify speech received while a Codex task is running/,
+  "active-work closure classification must preserve the ongoing-task conversational context",
+);
+assert.match(
+  ongoingTrajectoryRequest?.response?.instructions || "",
+  /surface words alone are never dispositive/,
+  "both closure classifiers must share the holistic non-lexical contract",
+);
+assert.equal(
+  ongoingTrajectoryHarness.messages.slice(ongoingTrajectoryStart)
+    .filter(message => message.type === "stopIntent").length,
+  0,
+  "the same social wording may remain conversational while work is still open",
+);
+
 for (const [index, fixture] of [
   {
     text: "조용히 해줘.",
@@ -8351,6 +8572,203 @@ for (const [index, fixture] of [
     "a quiet wide stop must not return to the active Realtime listening state",
   );
 }
+
+const pendingTerminalAckHarness = makeContractHarness({
+  generation: 367,
+  language: "en-US",
+});
+beginOrdinaryRouteDecision(pendingTerminalAckHarness, {
+  itemID: "pending-terminal-stop-item",
+  text: "Please stop now.",
+  callID: "pending-terminal-stop-call",
+  kind: "stop_session",
+  spokenLanguage: "en-US",
+  spokenRegister: "polite",
+  stopTarget: "current_voice_or_codex_work",
+});
+const pendingTerminalAckStart = pendingTerminalAckHarness.messages.length;
+pendingTerminalAckHarness.receive({
+  type: "input_audio_buffer.speech_started",
+  item_id: "repeated-stop-before-create",
+});
+pendingTerminalAckHarness.receive({
+  type: "conversation.item.input_audio_transcription.completed",
+  item_id: "repeated-stop-before-create",
+  transcript: "Stop.",
+});
+const pendingTerminalResponseID = "pending-terminal-ack-response";
+pendingTerminalAckHarness.receive({
+  type: "response.created",
+  response: {
+    id: pendingTerminalResponseID,
+    metadata: { voice_relay_kind: "semantic_stop" },
+  },
+});
+pendingTerminalAckHarness.receive({
+  type: "response.output_audio_transcript.done",
+  response_id: pendingTerminalResponseID,
+  transcript: "Understood.",
+});
+pendingTerminalAckHarness.receive({
+  type: "response.done",
+  response: {
+    id: pendingTerminalResponseID,
+    status: "completed",
+    metadata: { voice_relay_kind: "semantic_stop" },
+    output: [],
+  },
+});
+pendingTerminalAckHarness.runtime.playbackDrained({
+  generation: pendingTerminalAckHarness.generation,
+  responseId: pendingTerminalResponseID,
+});
+const pendingTerminalAckMessages =
+  pendingTerminalAckHarness.messages.slice(pendingTerminalAckStart);
+assert.equal(
+  pendingTerminalAckHarness.outbound().filter(event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind === "semantic_stop"
+  ).length,
+  1,
+  "repeated speech before response.created must not create a second terminal acknowledgement",
+);
+assert.equal(
+  pendingTerminalAckMessages.filter(message =>
+    message.type === "playbackInterrupt"
+  ).length,
+  0,
+  "terminal acknowledgement protection must exist before response.created",
+);
+assert.equal(
+  pendingTerminalAckHarness.outbound().filter(event =>
+    event.type === "response.cancel"
+    && event.response_id === pendingTerminalResponseID
+  ).length,
+  0,
+  "pending terminal acknowledgement must not inherit an earlier preemption",
+);
+assert.equal(
+  pendingTerminalAckMessages.filter(message =>
+    message.type === "stopAcknowledgementFinal"
+    && message.responseId === pendingTerminalResponseID
+  ).length,
+  1,
+  "the pending-create race must retain one audible acknowledgement transaction",
+);
+assert.equal(
+  pendingTerminalAckMessages.filter(message =>
+    message.type === "stopAcknowledgementDrained"
+    && message.responseId === pendingTerminalResponseID
+  ).length,
+  1,
+  "the pending-create race may authorize teardown only after the retained acknowledgement drains",
+);
+
+const activeTerminalAckHarness = makeContractHarness({
+  generation: 368,
+  language: "ko-KR",
+  additionalLanguages: ["en-US"],
+});
+beginOrdinaryRouteDecision(activeTerminalAckHarness, {
+  itemID: "active-terminal-stop-item",
+  text: "이제 멈춰.",
+  callID: "active-terminal-stop-call",
+  kind: "stop_session",
+  spokenLanguage: "ko-KR",
+  spokenRegister: "casual",
+  stopTarget: "current_voice_or_codex_work",
+});
+const activeTerminalResponseID = "active-terminal-ack-response";
+activeTerminalAckHarness.receive({
+  type: "response.created",
+  response: {
+    id: activeTerminalResponseID,
+    metadata: { voice_relay_kind: "semantic_stop" },
+  },
+});
+activeTerminalAckHarness.receive({
+  type: "response.audio.delta",
+  response_id: activeTerminalResponseID,
+  delta: "audio",
+});
+const activeTerminalAckStart = activeTerminalAckHarness.messages.length;
+activeTerminalAckHarness.receive({
+  type: "input_audio_buffer.speech_started",
+  item_id: "repeated-stop-during-playback",
+});
+activeTerminalAckHarness.receive({
+  type: "conversation.item.input_audio_transcription.completed",
+  item_id: "repeated-stop-during-playback",
+  transcript: "멈춰.",
+});
+activeTerminalAckHarness.receive({
+  type: "response.output_audio_transcript.done",
+  response_id: activeTerminalResponseID,
+  transcript: "응.",
+});
+activeTerminalAckHarness.receive({
+  type: "response.done",
+  response: {
+    id: activeTerminalResponseID,
+    status: "completed",
+    metadata: { voice_relay_kind: "semantic_stop" },
+    output: [],
+  },
+});
+activeTerminalAckHarness.runtime.playbackDrained({
+  generation: activeTerminalAckHarness.generation,
+  responseId: activeTerminalResponseID,
+});
+activeTerminalAckHarness.runtime.playbackDrained({
+  generation: activeTerminalAckHarness.generation,
+  responseId: activeTerminalResponseID,
+});
+const activeTerminalAckMessages =
+  activeTerminalAckHarness.messages.slice(activeTerminalAckStart);
+assert.equal(
+  activeTerminalAckMessages.filter(message =>
+    message.type === "playbackInterrupt"
+  ).length,
+  0,
+  "speech during terminal acknowledgement playback must not interrupt the retained delivery",
+);
+assert.equal(
+  activeTerminalAckHarness.outbound().filter(event =>
+    event.type === "response.cancel"
+    && event.response_id === activeTerminalResponseID
+  ).length,
+  0,
+  "active terminal acknowledgement playback must never be cancelled as ordinary barge-in",
+);
+assert.equal(
+  activeTerminalAckMessages.filter(message =>
+    message.type === "terminal_acknowledgement_user_input_ignored"
+  ).length,
+  0,
+  "terminal input suppression must remain a diagnostic rather than a new host route",
+);
+assert.equal(
+  activeTerminalAckMessages.filter(message =>
+    message.type === "diagnostic"
+    && message.stage === "terminal_acknowledgement_user_input_ignored"
+  ).length,
+  2,
+  "speech-start and its repeated completed transcript must be idempotently ignored while stopping",
+);
+assert.equal(
+  activeTerminalAckHarness.native("stopAcknowledgementFinal").filter(event =>
+    event.responseId === activeTerminalResponseID
+  ).length,
+  1,
+  "retained terminal delivery must be mirrored once",
+);
+assert.equal(
+  activeTerminalAckHarness.native("stopAcknowledgementDrained").filter(event =>
+    event.responseId === activeTerminalResponseID
+  ).length,
+  1,
+  "only the first matching authoritative drain may authorize teardown",
+);
 
 function completeSemanticClosure(
   harness,

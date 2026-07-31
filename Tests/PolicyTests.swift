@@ -744,19 +744,43 @@ struct PolicyTests {
             responseID: "codex-progress",
             responseKind: "codex_progress"
         )
+        audioAdmission.register(
+            responseID: "terminal-acknowledgement",
+            responseKind: "semantic_stop"
+        )
         let preemptedAudioResponses =
             audioAdmission.suppressActiveAudioResponses()
         expect(
             preemptedAudioResponses.contains("codex-progress")
+                && !preemptedAudioResponses.contains(
+                    "terminal-acknowledgement"
+                )
                 && !audioAdmission.shouldAdmit(
                     responseID: "codex-progress"
+                )
+                && audioAdmission.shouldAdmit(
+                    responseID: "terminal-acknowledgement"
+                )
+                && audioAdmission.hasActiveTerminalResponse
+                && audioAdmission.activeTerminalResponseIDs
+                    == Set(["terminal-acknowledgement"])
+                && audioAdmission.isTerminalResponse(
+                    responseID: "terminal-acknowledgement"
                 ),
-            "admitted user speech must suppress a created assistant audio response before its first delta"
+            "admitted user speech must suppress ordinary audio without discarding the authoritative terminal acknowledgement"
         )
         audioAdmission.finish(responseID: "codex-progress")
         expect(
             audioAdmission.shouldAdmit(responseID: "codex-progress"),
             "a completed preempted response must leave no stale suppression"
+        )
+        audioAdmission.finish(responseID: "terminal-acknowledgement")
+        expect(
+            !audioAdmission.hasActiveTerminalResponse
+                && !audioAdmission.isTerminalResponse(
+                    responseID: "terminal-acknowledgement"
+                ),
+            "only terminal playback completion may release acknowledgement protection"
         )
         audioAdmission.finish(responseID: "route-response")
         expect(
@@ -788,6 +812,38 @@ struct PolicyTests {
         expect(
             !pendingAudioPreemption.registerCreatedAudioResponse(),
             "a later response must not inherit a stale user-voice preemption"
+        )
+        pendingAudioPreemption.registerOutboundAudioResponseCreate(
+            eventID: "terminal-create",
+            responseKind: "semantic_stop"
+        )
+        pendingAudioPreemption.admitUserSpeech()
+        pendingAudioPreemption.admitUserSpeech()
+        expect(
+            pendingAudioPreemption.hasPendingTerminalResponseCreate
+                && !pendingAudioPreemption
+                    .registerCreatedAudioResponse(
+                        responseKind: "semantic_stop"
+                    )
+                && pendingAudioPreemption.pendingResponseCreates == 0
+                && pendingAudioPreemption.preemptionsOnCreate == 0,
+            "speech admitted before response.created must not poison the pending terminal acknowledgement"
+        )
+        pendingAudioPreemption.registerOutboundAudioResponseCreate(
+            eventID: "ordinary-before-terminal"
+        )
+        pendingAudioPreemption.registerOutboundAudioResponseCreate(
+            eventID: "terminal-created-first",
+            responseKind: "semantic_stop"
+        )
+        pendingAudioPreemption.admitUserSpeech()
+        expect(
+            !pendingAudioPreemption.registerCreatedAudioResponse(
+                responseKind: "semantic_stop"
+            )
+                && pendingAudioPreemption.pendingResponseCreates == 1
+                && pendingAudioPreemption.registerCreatedAudioResponse(),
+            "response creation order must not let an older ordinary preemption suppress a terminal acknowledgement"
         )
         pendingAudioPreemption.registerOutboundAudioResponseCreate(
             eventID: "create-rejected"
@@ -1104,6 +1160,13 @@ struct PolicyTests {
         var stopAcknowledgement = StopAcknowledgementLifecycle()
         stopAcknowledgement.begin(generation: 17)
         expect(
+            stopAcknowledgement.isAwaitingAuthoritativeDrain(
+                generation: 17
+            )
+                && !stopAcknowledgement.isAwaitingAuthoritativeDrain(
+                    generation: 16
+                )
+                &&
             stopAcknowledgement.mirror(
                 generation: 16,
                 responseID: "stop-ack-17",
@@ -1123,7 +1186,7 @@ struct PolicyTests {
                     generation: 17,
                     responseID: "stop-ack-17"
                 ),
-            "stop acknowledgement must fail closed for stale, empty, or drain-before-visible events"
+            "the stop watchdog must stay pending while stale, empty, or drain-before-visible events fail closed"
         )
         let stopAcknowledgementNow = Date(timeIntervalSince1970: 2_000)
         expect(
@@ -1157,6 +1220,9 @@ struct PolicyTests {
                 && !stopAcknowledgement.consumeDrain(
                     generation: 17,
                     responseID: "stop-ack-17"
+                )
+                && !stopAcknowledgement.isAwaitingAuthoritativeDrain(
+                    generation: 17
                 ),
             "only the matching visible acknowledgement may authorize teardown once"
         )
@@ -2164,8 +2230,82 @@ struct PolicyTests {
                 "late \(latePhase.rawValue) must not escape the stopping state"
             )
         }
+        expect(
+            voiceState.canFinishStop(
+                generation: generation,
+                terminalAcknowledgementPending: false
+            )
+                && !voiceState.canFinishStop(
+                    generation: generation - 1,
+                    terminalAcknowledgementPending: false
+                )
+                && !voiceState.canFinishStop(
+                    generation: generation,
+                    terminalAcknowledgementPending: true
+                ),
+            "only the current drained stopping generation may authorize terminal handoff"
+        )
+        expect(
+            !voiceState.canRecoverFromTransientError(
+                generation: generation,
+                terminalAcknowledgementPending: true
+            ),
+            "a transient error must not bypass a pending terminal acknowledgement drain"
+        )
+        var failedStopAcknowledgement =
+            StopAcknowledgementLifecycle()
+        failedStopAcknowledgement.begin(generation: generation)
+        expect(
+            failedStopAcknowledgement.mirror(
+                generation: generation,
+                responseID: "failed-stop-ack",
+                text: "acknowledged"
+            ) != nil
+                && !voiceState.canFinishStop(
+                    generation: generation,
+                    terminalAcknowledgementPending:
+                        failedStopAcknowledgement
+                            .isAwaitingAuthoritativeDrain(
+                                generation: generation
+                            )
+                )
+                && failedStopAcknowledgement.consumeDrain(
+                    generation: generation,
+                    responseID: "failed-stop-ack"
+                )
+                && voiceState.canFinishStop(
+                    generation: generation,
+                    terminalAcknowledgementPending:
+                        failedStopAcknowledgement
+                            .isAwaitingAuthoritativeDrain(
+                                generation: generation
+                            )
+                ),
+            "a transport error between stop intent and drain must remain fenced until the retained acknowledgement drains"
+        )
+        expect(
+            RealtimeTerminalFailurePolicy.shouldDeferTransportTeardown(
+                terminalPlaybackBufferCount: 1
+            )
+                && !RealtimeTerminalFailurePolicy
+                    .shouldDeferTransportTeardown(
+                        terminalPlaybackBufferCount: 0
+                    ),
+            "transport failure must preserve queued terminal acknowledgement playback without mistaking ordinary queued audio for terminal delivery"
+        )
         voiceState.finishStop()
-        expect(voiceState.phase == .dormantWake, "terminal stop should resume wake state")
+        expect(
+            voiceState.phase == .dormantWake
+                && !voiceState.canFinishStop(
+                    generation: generation,
+                    terminalAcknowledgementPending: false
+                )
+                && voiceState.canRecoverFromTransientError(
+                    generation: generation,
+                    terminalAcknowledgementPending: false
+                ),
+            "terminal stop should resume wake state exactly once"
+        )
         var audioStartCancellation = AudioStartCancellationState()
         audioStartCancellation.requestStart(generation: generation)
         expect(

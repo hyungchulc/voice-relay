@@ -1095,6 +1095,15 @@ require_count \
   'semanticSessionClosureRoutingBoundary()' \
   6 \
   "one shared semantic-closure contract must govern ordinary and active-Codex routing"
+require_count \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'immediateDialogueTrajectoryBoundary(' \
+  3 \
+  "ordinary and active-work closure classification must share one bounded dialogue-trajectory contract"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'surface words alone are never dispositive' \
+  "conversational closure must be judged holistically instead of by a phrase matcher"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'if (kind === "close_session") {' \
@@ -1547,7 +1556,7 @@ require_text \
   "onboarding must use a system-aware ambient backdrop"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  '"Use local_identity for questions about your configured assistant name' \
+  '"Use local_identity for questions about the configured assistant, user, or product identity.' \
   "Realtime must semantically route configured identity questions"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
@@ -1577,6 +1586,42 @@ require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'assistantName: session.assistantName' \
   "local identity replies must use the configured assistant name"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'userDisplayName: session.userDisplayName' \
+  "local identity replies must use the configured user display name"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'userDisplayName: config.userDisplayName' \
+  "General settings must be the single source of the Realtime user identity"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"userDisplayName": userDisplayName' \
+  "the configured user identity must reach the generated Realtime start payload"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'The user role belongs to the configured user named' \
+  "the non-editable Realtime identity block must bind the configured user role unambiguously"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'realtime_configured_identity_rejected' \
+  "missing General identity settings must fail closed before Realtime starts"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'payload.productName || "Voice Relay"' \
+  "the Realtime runtime must not create a second product identity source"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'payload.assistantName || "Relay"' \
+  "the Realtime runtime must not create a second assistant identity source"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'payload.userDisplayName || "User"' \
+  "the Realtime runtime must not create a second user identity source"
+reject_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  '.text("Me", "나")' \
+  "the Realtime user identity must not be synthesized outside General settings"
 require_text \
   "$ROOT/Sources/SettingsWindowController.swift" \
   'productNameControl' \
@@ -3140,6 +3185,38 @@ require_text \
   "$ROOT/Sources/VoiceSurfacePolicy.swift" \
   'struct StopAcknowledgementLifecycle' \
   "stop acknowledgement visibility and teardown ordering must remain mechanically guarded"
+require_text \
+  "$ROOT/Sources/RealtimeAudioAdmissionPolicy.swift" \
+  'terminalResponseIDs' \
+  "terminal acknowledgement audio must stay protected through authoritative drain"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'terminal_acknowledgement_barge_in_ignored' \
+  "admitted speech must not discard terminal acknowledgement playback"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'spoken_stop_acknowledgement_pending' \
+  "the spoken-stop watchdog must expose a missing drain without authorizing teardown"
+reject_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'spoken_stop_timeout' \
+  "a spoken-stop timeout must never authorize transport stop or wake standby"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'transport_stop_terminal_fallback' \
+  "transport terminal fallback must still restore wake monitoring after stop was already authorized"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'terminalAcknowledgementPending: terminalAcknowledgementPending' \
+  "duplicate terminal and fallback callbacks must not schedule wake monitoring more than once"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'terminal_acknowledgement_error_recovery_blocked' \
+  "generic error recovery must not bypass a missing authoritative acknowledgement drain"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'terminal_acknowledgement_failure_teardown_deferred' \
+  "transport failure must retain queued terminal acknowledgement playback through drain"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'private var stoppingGenerations = Set<Int>()' \

@@ -171,6 +171,10 @@ struct StopAcknowledgementLifecycle {
         return max(0, retainUntil.timeIntervalSince(now))
     }
 
+    func isAwaitingAuthoritativeDrain(generation: Int) -> Bool {
+        self.generation == generation && !completionConsumed
+    }
+
     mutating func reset(generation: Int? = nil) {
         guard generation == nil || self.generation == generation else { return }
         self = StopAcknowledgementLifecycle()
@@ -1055,6 +1059,23 @@ struct VoiceSurfaceReducer {
     mutating func requestStop() {
         guard phase.isSessionActive else { return }
         phase = .stopping
+    }
+
+    func canFinishStop(
+        generation incomingGeneration: Int,
+        terminalAcknowledgementPending: Bool
+    ) -> Bool {
+        incomingGeneration == generation
+            && phase == .stopping
+            && !terminalAcknowledgementPending
+    }
+
+    func canRecoverFromTransientError(
+        generation incomingGeneration: Int,
+        terminalAcknowledgementPending: Bool
+    ) -> Bool {
+        incomingGeneration == generation
+            && !(phase == .stopping && terminalAcknowledgementPending)
     }
 
     mutating func finishStop() {

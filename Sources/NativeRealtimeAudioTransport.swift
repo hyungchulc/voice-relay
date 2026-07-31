@@ -72,6 +72,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private var sessionUpdated = false
     private var listeningReadyReported = false
     private var stopping = false
+    private var deferredTerminalFailureGeneration: Int?
     private var openTimeout: DispatchWorkItem?
 
     private var outboundQueue: [OutboundMessage] = []
@@ -315,10 +316,14 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 return
             }
             if Self.isOutboundAudioResponseCreate(event),
-               let eventID = event["event_id"] as? String {
+               let eventID = event["event_id"] as? String,
+               let response = event["response"] as? JSONDictionary {
+                let metadata = response["metadata"] as? JSONDictionary
                 self.pendingAudioPreemptionPolicy
                     .registerOutboundAudioResponseCreate(
-                        eventID: eventID
+                        eventID: eventID,
+                        responseKind:
+                            metadata?["voice_relay_kind"] as? String ?? ""
                     )
             }
             self.enqueueOutbound(text: jsonEvent, isAudio: false)
@@ -738,7 +743,9 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 responseKind: responseKind
             )
             if isAudioResponse,
-               pendingAudioPreemptionPolicy.registerCreatedAudioResponse() {
+               pendingAudioPreemptionPolicy.registerCreatedAudioResponse(
+                   responseKind: responseKind
+               ) {
                 audioAdmissionPolicy.suppressAudioResponse(
                     responseID: responseID
                 )
@@ -816,11 +823,22 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             completedAudioResponseID = responseID
         } else if type == "input_audio_buffer.speech_started" {
             if shouldForwardInputEvent {
-                discardedAudioResponseIDs.formUnion(
-                    audioAdmissionPolicy.suppressActiveAudioResponses()
-                )
-                pendingAudioPreemptionPolicy.admitUserSpeech()
-                interruptPlaybackForBargeIn()
+                let terminalAcknowledgementProtected =
+                    audioAdmissionPolicy.hasActiveTerminalResponse
+                    || pendingAudioPreemptionPolicy
+                        .hasPendingTerminalResponseCreate
+                if terminalAcknowledgementProtected {
+                    resumeProvisionallyPausedPlayback()
+                    emitDiagnostic(
+                        "terminal_acknowledgement_barge_in_ignored"
+                    )
+                } else {
+                    discardedAudioResponseIDs.formUnion(
+                        audioAdmissionPolicy.suppressActiveAudioResponses()
+                    )
+                    pendingAudioPreemptionPolicy.admitUserSpeech()
+                    interruptPlaybackForBargeIn()
+                }
             } else {
                 emitDiagnostic("unadmitted_playback_turn_suppressed")
             }
@@ -828,7 +846,11 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         if type == "response.done",
            let response = event["response"] as? JSONDictionary {
             let responseID = response["id"] as? String ?? ""
-            audioAdmissionPolicy.finish(responseID: responseID)
+            if !audioAdmissionPolicy.isTerminalResponse(
+                responseID: responseID
+            ) {
+                audioAdmissionPolicy.finish(responseID: responseID)
+            }
         }
 
         if shouldForwardInputEvent {
@@ -2339,6 +2361,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             generation: generation,
             fields: ["responseID": responseID]
         )
+        audioAdmissionPolicy.finish(responseID: responseID)
         emitOnMain {
             self.onPlaybackDrained?(generation, responseID)
         }
@@ -2671,6 +2694,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             mediaEpoch &+= 1
         }
         stopping = true
+        deferredTerminalFailureGeneration = nil
         openTimeout?.cancel()
         openTimeout = nil
         audioRecoveryWorkItem?.cancel()
@@ -2843,6 +2867,30 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             "Realtime transport failed stage=\(stage, privacy: .public) generation=\(generation) established=\(established) message=\(safeMessage, privacy: .public)"
         )
         emitDiagnostic("failed_\(stage)")
+        let terminalPlaybackResponseIDs =
+            audioAdmissionPolicy.activeTerminalResponseIDs
+                .filter {
+                    (playbackBuffersByResponseID[$0] ?? 0) > 0
+                }
+        let terminalPlaybackBufferCount =
+            terminalPlaybackResponseIDs.reduce(0) {
+                $0 + (playbackBuffersByResponseID[$1] ?? 0)
+            }
+        if RealtimeTerminalFailurePolicy.shouldDeferTransportTeardown(
+            terminalPlaybackBufferCount: terminalPlaybackBufferCount
+        ) {
+            completedAudioResponseIDs.formUnion(
+                terminalPlaybackResponseIDs
+            )
+            guard deferredTerminalFailureGeneration != generation else {
+                return
+            }
+            deferredTerminalFailureGeneration = generation
+            emitDiagnostic(
+                "terminal_acknowledgement_failure_teardown_deferred"
+            )
+            return
+        }
         stopCurrent(
             emitClosed: false,
             reason: "failure_\(stage)",

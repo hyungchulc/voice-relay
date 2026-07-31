@@ -50,12 +50,8 @@ private struct AppConfig {
         return AppConfig(
             productName: settings.productName,
             assistantName: settings.assistantName,
-            userDisplayName: SettingsStore.normalizedDisplayName(
-                settings.userDisplayName,
-                fallback: AppCopy(
-                    preference: settings.appDisplayLanguage
-                ).text("Me", "나")
-            ),
+            userDisplayName: settings.userDisplayName
+                .trimmingCharacters(in: .whitespacesAndNewlines),
             appearanceMode: AppAppearanceMode.parse(settings.appearanceMode),
             autoSpeak: boolValue(
                 env["VOICE_RELAY_SPEAK"],
@@ -891,6 +887,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         additionalLanguages: config.additionalSpeechLocales,
         productName: config.productName,
         assistantName: config.assistantName,
+        userDisplayName: config.userDisplayName,
         wakePhrases: config.wakePhrases
     )
     private let mediaPlaybackDetector = SystemMediaPlaybackDetector()
@@ -2811,6 +2808,12 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             let wasEstablished = voiceState.phase != .starting
             let interruptedAnswer = realtimeDraft
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            let terminalAcknowledgementPending =
+                voiceState.phase == .stopping
+                && stopAcknowledgementLifecycle
+                    .isAwaitingAuthoritativeDrain(
+                        generation: generation
+                    )
             isWaitingForReply = false
             voiceIdleWorkItem?.cancel()
             assistantOutputLifecycle.cancelAll(generation: generation)
@@ -2828,11 +2831,13 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 wasEstablished: wasEstablished,
                 interruptedAnswer: interruptedAnswer
             )
-            realtimeController.stop(
-                generation: generation,
-                reason: "realtime_error",
-                preserveCaptureForWake: false
-            )
+            if !terminalAcknowledgementPending {
+                realtimeController.stop(
+                    generation: generation,
+                    reason: "realtime_error",
+                    preserveCaptureForWake: false
+                )
+            }
         default:
             break
         }
@@ -3173,12 +3178,19 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         let fallback = DispatchWorkItem { [weak self] in
             guard let self,
                   self.voiceState.generation == generation,
-                  self.voiceState.phase == .stopping else {
+                  self.voiceState.phase == .stopping,
+                  self.stopAcknowledgementLifecycle
+                    .isAwaitingAuthoritativeDrain(
+                        generation: generation
+                    ) else {
                 return
             }
-            self.requestVoiceSessionStop(
+            VoiceRelayDiagnostics.flow(
+                "spoken_stop_acknowledgement_pending",
                 generation: generation,
-                reason: "spoken_stop_timeout"
+                fields: [
+                    "reason": "authoritative_drain_missing",
+                ]
             )
         }
         realtimeStopAcknowledgementFallbackWorkItem = fallback
@@ -3224,7 +3236,19 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         generation: Int,
         audioHandoffReady: Bool
     ) {
-        guard voiceState.generation == generation else { return }
+        let terminalAcknowledgementPending =
+            stopAcknowledgementLifecycle.isAwaitingAuthoritativeDrain(
+                generation: generation
+            )
+        guard voiceState.canFinishStop(
+            generation: generation,
+            terminalAcknowledgementPending: terminalAcknowledgementPending
+        ) else {
+            return
+        }
+        errorCollapseWorkItem?.cancel()
+        errorCollapseWorkItem = nil
+        isShowingTransientError = false
         realtimeStopAcknowledgementFallbackWorkItem?.cancel()
         realtimeStopAcknowledgementFallbackWorkItem = nil
         stopAcknowledgementLifecycle.reset(generation: generation)
@@ -3242,11 +3266,11 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         collapseEmptyVoiceSurfaceAfterStop(forceHoverExit: false)
         updateVoiceSurface()
         scheduleConversationCollapse(delay: max(config.collapseDelay, 1.1))
-        if audioHandoffReady {
-            resumeWakePhraseSoon(
-                reason: "persistent_capture_handoff_ready"
-            )
-        }
+        resumeWakePhraseSoon(
+            reason: audioHandoffReady
+                ? "persistent_capture_handoff_ready"
+                : "transport_stop_terminal_fallback"
+        )
     }
 
     private func collapseEmptyVoiceSurfaceAfterStop(
@@ -3711,6 +3735,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         wasEstablished: Bool = false,
         interruptedAnswer: String = ""
     ) {
+        let errorGeneration = voiceState.generation
         errorCollapseWorkItem?.cancel()
         isShowingTransientError = true
         isHoverPreviewVisible = false
@@ -3760,6 +3785,28 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
+            let terminalAcknowledgementPending =
+                self.stopAcknowledgementLifecycle
+                    .isAwaitingAuthoritativeDrain(
+                        generation: errorGeneration
+                    )
+            guard self.voiceState.canRecoverFromTransientError(
+                generation: errorGeneration,
+                terminalAcknowledgementPending:
+                    terminalAcknowledgementPending
+            ) else {
+                self.errorCollapseWorkItem = nil
+                if terminalAcknowledgementPending {
+                    VoiceRelayDiagnostics.flow(
+                        "terminal_acknowledgement_error_recovery_blocked",
+                        generation: errorGeneration,
+                        fields: [
+                            "reason": "authoritative_drain_missing",
+                        ]
+                    )
+                }
+                return
+            }
             self.isShowingTransientError = false
             self.errorCollapseWorkItem = nil
             self.voiceState.finishStop()

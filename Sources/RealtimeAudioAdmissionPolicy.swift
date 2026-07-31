@@ -4,6 +4,7 @@ struct RealtimeAudioAdmissionPolicy {
     private var suppressedResponseIDs: Set<String> = []
     private var reportedSuppressionIDs: Set<String> = []
     private var activeAudioResponseIDs: Set<String> = []
+    private var terminalResponseIDs: Set<String> = []
 
     @discardableResult
     mutating func register(
@@ -25,12 +26,33 @@ struct RealtimeAudioAdmissionPolicy {
             return false
         }
         activeAudioResponseIDs.insert(normalizedID)
+        if responseKind == "semantic_stop" {
+            terminalResponseIDs.insert(normalizedID)
+        }
         return true
     }
 
     mutating func suppressActiveAudioResponses() -> Set<String> {
-        suppressedResponseIDs.formUnion(activeAudioResponseIDs)
-        return activeAudioResponseIDs
+        let suppressibleResponseIDs =
+            activeAudioResponseIDs.subtracting(terminalResponseIDs)
+        suppressedResponseIDs.formUnion(suppressibleResponseIDs)
+        return suppressibleResponseIDs
+    }
+
+    var hasActiveTerminalResponse: Bool {
+        !activeTerminalResponseIDs.isEmpty
+    }
+
+    var activeTerminalResponseIDs: Set<String> {
+        activeAudioResponseIDs.intersection(terminalResponseIDs)
+    }
+
+    func isTerminalResponse(responseID: String) -> Bool {
+        terminalResponseIDs.contains(
+            responseID.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+        )
     }
 
     mutating func suppressAudioResponse(responseID: String) {
@@ -69,50 +91,80 @@ struct RealtimeAudioAdmissionPolicy {
         suppressedResponseIDs.remove(normalizedID)
         reportedSuppressionIDs.remove(normalizedID)
         activeAudioResponseIDs.remove(normalizedID)
+        terminalResponseIDs.remove(normalizedID)
     }
 
     mutating func reset() {
         suppressedResponseIDs.removeAll()
         reportedSuppressionIDs.removeAll()
         activeAudioResponseIDs.removeAll()
+        terminalResponseIDs.removeAll()
     }
 }
 
 struct RealtimePendingAudioPreemptionPolicy {
-    private var pendingResponseCreateEventIDs: [String] = []
+    private struct PendingResponseCreate {
+        let eventID: String
+        let terminal: Bool
+    }
+
+    private var pendingCreates: [PendingResponseCreate] = []
     private var preemptedResponseCreateEventIDs: Set<String> = []
 
     var pendingResponseCreates: Int {
-        pendingResponseCreateEventIDs.count
+        pendingCreates.count
     }
 
     var preemptionsOnCreate: Int {
         preemptedResponseCreateEventIDs.count
     }
 
+    var hasPendingTerminalResponseCreate: Bool {
+        pendingCreates.contains(where: \.terminal)
+    }
+
     mutating func registerOutboundAudioResponseCreate(
-        eventID: String
+        eventID: String,
+        responseKind: String = ""
     ) {
         let normalizedID = eventID.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
         guard !normalizedID.isEmpty,
-              !pendingResponseCreateEventIDs.contains(normalizedID) else {
+              !pendingCreates.contains(where: {
+                  $0.eventID == normalizedID
+              }) else {
             return
         }
-        pendingResponseCreateEventIDs.append(normalizedID)
+        pendingCreates.append(
+            PendingResponseCreate(
+                eventID: normalizedID,
+                terminal: responseKind == "semantic_stop"
+            )
+        )
     }
 
     mutating func admitUserSpeech() {
         preemptedResponseCreateEventIDs.formUnion(
-            pendingResponseCreateEventIDs
+            pendingCreates
+                .filter { !$0.terminal }
+                .map(\.eventID)
         )
     }
 
-    mutating func registerCreatedAudioResponse() -> Bool {
-        guard !pendingResponseCreateEventIDs.isEmpty else { return false }
-        let eventID = pendingResponseCreateEventIDs.removeFirst()
-        return preemptedResponseCreateEventIDs.remove(eventID) != nil
+    mutating func registerCreatedAudioResponse(
+        responseKind: String = ""
+    ) -> Bool {
+        guard !pendingCreates.isEmpty else { return false }
+        let terminal = responseKind == "semantic_stop"
+        let matchingIndex = pendingCreates.firstIndex {
+            $0.terminal == terminal
+        } ?? pendingCreates.startIndex
+        let pending = pendingCreates.remove(at: matchingIndex)
+        let wasPreempted = preemptedResponseCreateEventIDs.remove(
+            pending.eventID
+        ) != nil
+        return !terminal && wasPreempted
     }
 
     mutating func rejectOutboundAudioResponseCreate(
@@ -122,14 +174,22 @@ struct RealtimePendingAudioPreemptionPolicy {
             in: .whitespacesAndNewlines
         )
         guard !normalizedID.isEmpty else { return }
-        pendingResponseCreateEventIDs.removeAll {
-            $0 == normalizedID
+        pendingCreates.removeAll {
+            $0.eventID == normalizedID
         }
         preemptedResponseCreateEventIDs.remove(normalizedID)
     }
 
     mutating func reset() {
-        pendingResponseCreateEventIDs.removeAll()
+        pendingCreates.removeAll()
         preemptedResponseCreateEventIDs.removeAll()
+    }
+}
+
+enum RealtimeTerminalFailurePolicy {
+    static func shouldDeferTransportTeardown(
+        terminalPlaybackBufferCount: Int
+    ) -> Bool {
+        terminalPlaybackBufferCount > 0
     }
 }
