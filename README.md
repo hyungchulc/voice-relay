@@ -24,7 +24,7 @@ key to copy, embed, or store, and no separate task-owning agent stack.
 | Capability | What Voice Relay does |
 | --- | --- |
 | Full Codex desktop runtime | The Codex/ChatGPT desktop app remains the owner of tools, approvals, Browser Use, Computer Use, skills, connectors, and session state, subject to your app configuration and permissions. |
-| Exact Codex model and thinking passthrough | Choose the model and thinking level in Codex. Voice Relay reads the effective `config.toml` profile through the desktop app, validates the model and reasoning effort against `model/list`, and runs its dedicated task with those exact choices. |
+| Direct Codex profile control | Choose Inherit or a supported model, Thinking level, and Fast mode inside Voice Relay. Inherit re-resolves the current desktop `config.toml` profile for every request; explicit choices are validated against live `model/list` capabilities and applied to the dedicated Voice task. |
 | OAuth, not API-key setup | Voice Relay uses the signed-in desktop session and keeps its short-lived Realtime credential in memory. It never asks for or bundles an OpenAI API key. |
 | Direct Realtime Voice | Microphone capture, WebSocket transport, transcript display, and audio playback stay on a native low-latency Realtime path. |
 | Persistent task continuity | Use an existing Session ID or let Voice Relay create and persist a dedicated task that keeps context across voice turns and restarts. |
@@ -70,7 +70,7 @@ does not claim to match GPT-Live-1's conversational model behavior.
 | Best fit | The integrated first-party default for eligible ChatGPT users | An open, customizable, Mac-first control surface around one dedicated Codex task |
 | Voice experience | Built-in ChatGPT Voice. The Live option provides continuous GPT-Live full-duplex listening and speaking on supported accounts | Direct Realtime speech plus a semantic handoff to Codex for substantive work |
 | Task coordination | Can start, prioritize, interrupt, redirect, and coordinate multiple agents across active conversations and projects | Keeps voice work pinned to one explicit existing or app-created persistent Session ID |
-| Model and thinking control | ChatGPT Voice offers Instant, Medium, and High reasoning choices. GPT-Live can delegate deeper work to a background frontier model that OpenAI updates over time | Reads the human-selected Codex model and thinking level from the effective `config.toml`, validates both, and keeps the dedicated task on that explicit profile |
+| Model and thinking control | ChatGPT Voice offers Instant, Medium, and High reasoning choices. GPT-Live can delegate deeper work to a background frontier model that OpenAI updates over time | Lets the user inherit the current Codex profile or choose a supported model, Thinking level, and Fast mode inside Voice Relay, then validates and applies that profile to the same dedicated task |
 | Surface | Built into the ChatGPT desktop app on macOS and Windows, with paired iOS remote access | macOS notch or movable Orb, local wake phrases, launch at login, and an always-ready surface outside the main app window |
 | Personal context | Uses available project context and supported connected tools | Adds opt-in Authority Packs and bounded Additional Context Providers |
 | Extensibility | First-party product behavior and workspace controls | GPLv3 source that can be inspected, modified, and self-hosted |
@@ -91,12 +91,24 @@ Official references
 - [ChatGPT Voice](https://help.openai.com/en/articles/20001274)
 - [ChatGPT Work and Codex](https://help.openai.com/en/articles/20001275-chatgpt-work-and-codex)
 
-## Planned next
+## Codex profile controls
 
-- **Direct Codex profile picker**
-  Choose the Codex model and thinking level inside Voice Relay. This is planned,
-  not part of the current public alpha. The current build inherits the
-  human-selected values from the desktop app's effective `config.toml`.
+Voice Relay reads the available models, supported Thinking levels, and service
+tiers from the paired desktop runtime. Settings can inherit the current Codex
+profile or select an exact supported model, Thinking level, and Fast-mode
+combination for Voice Relay's dedicated task.
+
+Inherit is resolved again from the effective desktop `config.toml` profile for
+every request instead of caching an older value. Explicit selections are
+validated before saving and applied to the existing app-managed task before the
+next Codex turn. Voice Relay fails before dispatch rather than silently running
+an unsupported or mismatched profile.
+
+Fast mode requests the runtime's `priority` service tier only when the selected
+model reports that capability. Turning Fast mode off explicitly clears Voice
+Relay's priority override, including when an earlier Voice turn used Fast mode.
+Profile-only changes take effect on subsequent Codex-bound requests without
+rebuilding the active Realtime voice session.
 
 ## Requirements
 
@@ -178,10 +190,11 @@ wake phrases; the main conversation still uses the selected Realtime voice and
 the paired Codex task.
 
 Open Settings later with `⌘,`. Settings exposes product and assistant names,
-permissions, the optional editable Session ID, wake phrases, system or custom
-speech languages, a user-facing latest SpeechAnalyzer preference, a documented
-Realtime voice selector, the Realtime prompt, an optional Authority Pack,
-presence preferences, Reset, and Quit. Marin and Cedar appear first as
+permissions, the optional editable Session ID, Codex model, Thinking, and Fast
+mode controls, wake phrases, system or custom speech languages, a user-facing
+latest SpeechAnalyzer preference, a documented Realtime voice selector, the
+Realtime prompt, an optional Authority Pack, presence preferences, Reset, and
+Quit. Marin and Cedar appear first as
 the recommended voices; a change takes effect when the next Realtime session
 starts. On macOS 26 or newer, the latest analyzer is used only when every
 selected speech locale is available; otherwise the complete wake-phrase session
