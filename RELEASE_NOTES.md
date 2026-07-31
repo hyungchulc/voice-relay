@@ -1,10 +1,11 @@
-This alpha preserves the complete first utterance when wake detection hands audio to Realtime.
+This alpha separates session transport from microphone input and adds supported Codex profile controls to Settings.
 
-- Capture admission now waits for the Realtime session to commit before replay can finish or clear the wake journal.
-- The replay journal has one owner, and replay pumping is non-destructive until the handoff outcome is committed.
-- WebSocket send completion is recorded against the immutable ticket and generation so late callbacks cannot finish a newer handoff.
-- Failed or stale admissions remain retryable instead of silently dropping the committed audio tail.
-- Regression coverage now exercises the capture barrier, replay ownership, stale generations, send completion, and retry behavior.
-- Build 36 is the signed update target for installed Voice Relay preview-channel builds.
+- The expanded overlay now keeps exactly three controls in order: Settings, microphone input, and Play or Stop.
+- Microphone mute stops capture and recognition without stopping playback, the active voice session, or the current Codex task, and unmute resumes the appropriate input path.
+- Settings now persist Model, Thinking level, and Fast mode selections discovered from the live Codex capability surface.
+- Unsupported profile combinations fail closed, while Fast mode maps to the supported accelerated service tier and the default path omits any tier override.
+- Selected profile values propagate through task preparation, session resume, new turns, and same-task follow-ups instead of remaining UI-only state.
+- Regression coverage protects control ordering, independent microphone state, preference persistence, capability gating, and actual request propagation.
+- Build 37 is the signed update target for installed Voice Relay preview-channel builds.
 
 This public build is Apple Development signed and is not notarized.

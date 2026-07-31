@@ -21,9 +21,9 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.5.1</string>
 	<key>CFBundleVersion</key>
-	<string>36</string>
+	<string>37</string>
 	<key>VoiceRelayReleaseTag</key>
-	<string>v0.5.1-alpha.11</string>
+	<string>v0.5.1-alpha.12</string>
 	<key>VoiceRelayDistributionChannel</key>
 	<string>prerelease</string>
 	<key>SUFeedURL</key>
