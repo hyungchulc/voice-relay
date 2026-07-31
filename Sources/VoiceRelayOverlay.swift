@@ -865,7 +865,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private let answerScrollView = NSScrollView()
     private let answerTextView = NSTextView()
     private let bottomActionBar = NSStackView()
-    private let voiceButton = ShadowIconButton(frame: .zero)
+    private let transportButton = ShadowIconButton(frame: .zero)
+    private let microphoneButton = ShadowIconButton(frame: .zero)
     private let settingsButton = ShadowIconButton(frame: .zero)
     private lazy var wakePhrase = WakePhraseController(
         localeIdentifiers: [config.speechLocale] + config.additionalSpeechLocales,
@@ -924,6 +925,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private var surfaceAnimationGeneration = 0
     private var panelAnimationGeneration = 0
     private var voiceState = VoiceSurfaceReducer()
+    private var microphoneInputEnabled = true
     private var lastNotchActivityLayoutState: Bool?
     private var conversationTranscript = ConversationTranscriptState()
     private var userTurnDisplayRegistry =
@@ -1237,8 +1239,9 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             workspacePath: workspacePath,
             preferredThreadID: liveSettings.codexThreadID,
             preferredThreadTitle: liveSettings.codexThreadTitle,
-            model: config.codexModel,
-            reasoningEffort: config.codexReasoningEffort,
+            model: liveSettings.codexModel,
+            reasoningEffort: liveSettings.codexReasoningEffort,
+            serviceTier: liveSettings.codexFastMode ? "priority" : nil,
             sandbox: config.codexSandbox,
             approvalPolicy: config.codexApprovalPolicy,
             additionalContext: nil,
@@ -1300,6 +1303,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             preferredThreadTitle: connection.preferredThreadTitle,
             model: connection.model,
             reasoningEffort: connection.reasoningEffort,
+            serviceTier: connection.serviceTier,
             sandbox: connection.sandbox,
             approvalPolicy: connection.approvalPolicy,
             additionalContext: context,
@@ -1570,6 +1574,64 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         } else {
             startRealtimeVoice()
         }
+    }
+
+    @objc private func toggleMicrophoneInput() {
+        let transition = MicrophoneInputControlPolicy.transition(
+            from: microphoneInputEnabled,
+            voiceSessionActive: voiceState.phase.isSessionActive
+        )
+        let enabling = transition.targetEnabled
+        let generation = voiceState.phase.isSessionActive
+            ? voiceState.generation
+            : nil
+        if enabling {
+            guard realtimeController.setMicrophoneInputEnabled(
+                true,
+                generation: generation
+            ) else {
+                showError(
+                    AppCopy(
+                        preference: SettingsStore.shared.load()
+                            .appDisplayLanguage
+                    ).text(
+                        "Microphone input could not resume.",
+                        "마이크 입력을 다시 시작하지 못했습니다."
+                    )
+                )
+                return
+            }
+            microphoneInputEnabled = true
+            if transition.shouldResumeWakeMonitoring {
+                resumeWakePhraseSoon(
+                    reason: "microphone_unmuted",
+                    delay: 0
+                )
+            }
+        } else {
+            wakeResumeWorkItem?.cancel()
+            wakeResumeWorkItem = nil
+            guard realtimeController.setMicrophoneInputEnabled(
+                false,
+                generation: generation
+            ) else {
+                showError(
+                    AppCopy(
+                        preference: SettingsStore.shared.load()
+                            .appDisplayLanguage
+                    ).text(
+                        "Microphone input could not stop.",
+                        "마이크 입력을 중지하지 못했습니다."
+                    )
+                )
+                return
+            }
+            microphoneInputEnabled = false
+            if transition.shouldPauseWakeMonitoring {
+                wakePhrase.pause(reason: "microphone_muted")
+            }
+        }
+        updateVoiceSurface()
     }
 
     private func handleOrbPrimaryClick() {
@@ -2128,14 +2190,22 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         toastLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         configureIconButton(
-            voiceButton,
-            symbol: "mic.fill",
+            transportButton,
+            symbol: "play.fill",
             color: actionIconColor,
             action: #selector(toggleVoiceInput)
         )
-        voiceButton.toolTip = copy.text(
-            "Start or stop voice",
-            "Voice 시작 또는 종료"
+        transportButton.toolTip = copy.text("Play", "시작")
+
+        configureIconButton(
+            microphoneButton,
+            symbol: "mic.fill",
+            color: actionIconColor,
+            action: #selector(toggleMicrophoneInput)
+        )
+        microphoneButton.toolTip = copy.text(
+            "Mute microphone input",
+            "마이크 입력 끄기"
         )
 
         configureIconButton(
@@ -2153,13 +2223,16 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         bottomActionBar.addArrangedSubview(toastLabel)
         bottomActionBar.addArrangedSubview(NSView())
         bottomActionBar.addArrangedSubview(settingsButton)
-        bottomActionBar.addArrangedSubview(voiceButton)
+        bottomActionBar.addArrangedSubview(microphoneButton)
+        bottomActionBar.addArrangedSubview(transportButton)
 
         NSLayoutConstraint.activate([
             settingsButton.widthAnchor.constraint(equalToConstant: 26),
             settingsButton.heightAnchor.constraint(equalToConstant: 26),
-            voiceButton.widthAnchor.constraint(equalToConstant: 26),
-            voiceButton.heightAnchor.constraint(equalToConstant: 26),
+            transportButton.widthAnchor.constraint(equalToConstant: 26),
+            transportButton.heightAnchor.constraint(equalToConstant: 26),
+            microphoneButton.widthAnchor.constraint(equalToConstant: 26),
+            microphoneButton.heightAnchor.constraint(equalToConstant: 26),
         ])
     }
 
@@ -2850,7 +2923,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         activationReason: String? = nil,
         wakeActivation: WakeActivationContext? = nil
     ) -> Bool {
-        guard !voiceState.phase.isSessionActive,
+        guard microphoneInputEnabled,
+              !voiceState.phase.isSessionActive,
               Date() >= nextVoiceStartAllowedAt else {
             VoiceRelayDiagnostics.flow(
                 "realtime_start_suppressed",
@@ -2978,11 +3052,13 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         reason: String = "voice_session_completed",
         delay: TimeInterval = WakeMonitoringResumePolicy.activationDelay
     ) {
-        guard config.wakePhraseEnabled else { return }
+        guard config.wakePhraseEnabled,
+              microphoneInputEnabled else { return }
         wakeResumeWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.wakeResumeWorkItem = nil
+            guard self.microphoneInputEnabled else { return }
             let captureDecision = self.wakeCaptureDecision(reason: reason)
             let captureBlocked = captureDecision != .start
             guard WakeMonitoringResumePolicy.shouldStart(
@@ -3584,11 +3660,33 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                     ? colors.accent
                     : colors.secondaryText
         }
-        voiceButton.setSymbol(
-            symbol,
-            color: voiceButtonColor,
-            accessibilityDescription: accessibilityDescription
+        let controlsState = ExpandedVoiceControlsPolicy.resolve(
+            voiceSessionActive: voiceState.phase.isSessionActive,
+            microphoneInputEnabled: microphoneInputEnabled
         )
+        transportButton.setSymbol(
+            controlsState.transportSymbolName,
+            color: voiceButtonColor,
+            accessibilityDescription: voiceState.phase.isSessionActive
+                ? copy.text("Stop", "중지")
+                : copy.text("Play", "시작")
+        )
+        microphoneButton.setSymbol(
+            controlsState.microphoneSymbolName,
+            color: microphoneInputEnabled
+                ? voiceButtonColor
+                : .systemOrange,
+            accessibilityDescription: microphoneInputEnabled
+                ? copy.text("Mute microphone input", "마이크 입력 끄기")
+                : copy.text("Resume microphone input", "마이크 입력 켜기")
+        )
+        transportButton.isEnabled = controlsState.transportEnabled
+        transportButton.toolTip = voiceState.phase.isSessionActive
+            ? copy.text("Stop", "중지")
+            : copy.text("Play", "시작")
+        microphoneButton.toolTip = microphoneInputEnabled
+            ? copy.text("Mute microphone input", "마이크 입력 끄기")
+            : copy.text("Resume microphone input", "마이크 입력 켜기")
         if resolvedAnchor == .notch {
             notchVoiceButton.setSymbol(
                 symbol,
@@ -4922,11 +5020,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
-        settingsController.onSave = { [weak self] in
+        settingsController.onSave = { [weak self] requiresOverlayRebuild in
             self?.installMainMenu()
             self?.installStatusItem()
-            self?.rebuildOverlay(show: true)
-            self?.overlayController?.startWakePhraseAfterSettingsSave()
+            if requiresOverlayRebuild {
+                self?.rebuildOverlay(show: true)
+                self?.overlayController?.startWakePhraseAfterSettingsSave()
+            }
         }
         settingsController.onReset = { [weak self] in
             self?.overlayController?.closeForRebuild()

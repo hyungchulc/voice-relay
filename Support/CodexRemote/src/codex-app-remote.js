@@ -228,6 +228,7 @@ export class CodexAppRemoteBackend {
     cwd = "/tmp/voice-relay-unconfigured",
     model = "gpt-5.6-sol",
     reasoningEffort = "xhigh",
+    serviceTier = null,
     statePath = "",
     invokeCommand = null,
     streamReplies = streamCodexReplies,
@@ -241,6 +242,7 @@ export class CodexAppRemoteBackend {
     this.cwd = cwd;
     this.model = normalizeModelForConfig(model) || "gpt-5.6-sol";
     this.reasoningEffort = normalizeReasoningForConfig(reasoningEffort) || "xhigh";
+    this.serviceTier = normalizeServiceTierForConfig(serviceTier);
     this.statePath = statePath;
     this.threadId = String(threadId || restoredState?.threadId || "").trim();
     this.streamReplies = streamReplies;
@@ -262,6 +264,7 @@ export class CodexAppRemoteBackend {
     this.desiredState = {
       modelText: this.model,
       reasoningText: this.reasoningEffort,
+      serviceTier: this.serviceTier,
       backend: "app-remote",
       updatedAt: new Date(this.now()).toISOString(),
     };
@@ -291,6 +294,7 @@ export class CodexAppRemoteBackend {
           cwd,
           model: this.model,
           reasoningEffort: this.reasoningEffort,
+          serviceTier: this.serviceTier,
           now: this.now,
         })
       : null;
@@ -380,19 +384,25 @@ export class CodexAppRemoteBackend {
     }
     const configured = findModelProfile(result, this.model);
     const efforts = supportedReasoningEfforts(configured);
+    const serviceTiers = supportedServiceTierIDs(configured);
+    const serviceTierAvailable = !this.serviceTier
+      || serviceTiers.includes(this.serviceTier);
     return {
       ok: Boolean(
         transport?.ok &&
           configured &&
-          efforts.includes(this.reasoningEffort),
+          efforts.includes(this.reasoningEffort) &&
+          serviceTierAvailable,
       ),
       backend: "app-remote",
       transport: "remote-controller",
       threadId: this.threadId || null,
       model: this.model,
       reasoningEffort: this.reasoningEffort,
+      serviceTier: this.serviceTier,
       modelAvailable: Boolean(configured),
       reasoningEffortAvailable: efforts.includes(this.reasoningEffort),
+      serviceTierAvailable,
       controller: transport,
       threadResidency,
       targetCount: 0,
@@ -679,7 +689,7 @@ export class CodexAppRemoteBackend {
         prompt,
         model: this.model,
         reasoningEffort: this.reasoningEffort,
-        serviceTier: null,
+        serviceTier: this.serviceTier,
         messageMetadata: { source: "voice_relay_remote" },
         inputItems: normalizeAppInputItems(inputItems),
         ...(lifecycle?.exactBinding?.expectedClosedTurnId
@@ -711,6 +721,7 @@ export class CodexAppRemoteBackend {
         cwd: this.cwd,
         model: this.model,
         reasoningEffort: this.reasoningEffort,
+        serviceTier: this.serviceTier,
         inputItems,
       }),
       { timeoutMs: 60_000 },
@@ -735,7 +746,7 @@ export class CodexAppRemoteBackend {
         conversationId: this.threadId,
         model: this.model,
         reasoningEffort: this.reasoningEffort,
-        serviceTier: null,
+        serviceTier: this.serviceTier,
         workspaceRoots: [this.cwd],
         collaborationMode: null,
         permissions: FULL_ACCESS_PERMISSIONS,
@@ -755,6 +766,7 @@ export class CodexAppRemoteBackend {
         threadSettings: lockedThreadSettings({
           model: this.model,
           reasoningEffort: this.reasoningEffort,
+          serviceTier: this.serviceTier,
         }),
       },
       { timeoutMs: 60_000 },
@@ -1046,7 +1058,7 @@ export class CodexAppRemoteBackend {
             prompt: `[bridge_followup_request_id: ${requestId}]\n${prompt}`,
             model: this.model,
             reasoningEffort: this.reasoningEffort,
-            serviceTier: null,
+            serviceTier: this.serviceTier,
             messageMetadata: { source: "voice_relay_remote_steer" },
           },
           {
@@ -1245,6 +1257,7 @@ export class CodexAppRemoteBackend {
       status: "set",
       requestId: `voice-relay-reasoning-app-remote-${this.now()}`,
       reasoningText: this.reasoningEffort,
+      serviceTier: this.serviceTier,
       backend: "app-remote",
       appliesTo: "next_turn",
     };
@@ -1306,6 +1319,7 @@ export class CodexAppRemoteBackend {
       threadId: this.threadId || null,
       model: this.model,
       reasoningEffort: this.reasoningEffort,
+      serviceTier: this.serviceTier,
       backend: "app-remote",
       updatedAt: new Date(this.now()).toISOString(),
     };
@@ -1368,9 +1382,14 @@ export class CodexAppRemoteBackend {
     }
     const configured = findModelProfile(result, this.model);
     const availableEfforts = supportedReasoningEfforts(configured);
-    if (!configured || !availableEfforts.includes(this.reasoningEffort)) {
+    const availableServiceTiers = supportedServiceTierIDs(configured);
+    if (
+      !configured
+      || !availableEfforts.includes(this.reasoningEffort)
+      || (this.serviceTier && !availableServiceTiers.includes(this.serviceTier))
+    ) {
       throw new Error(
-        `Configured app Remote profile is unavailable: ${this.model}/${this.reasoningEffort}`,
+        `Configured app Remote profile is unavailable: ${this.model}/${this.reasoningEffort}/${this.serviceTier || "default"}`,
       );
     }
   }
@@ -1400,6 +1419,7 @@ export class RemoteControlCommandDispatcher {
     cwd = "/tmp/voice-relay-unconfigured",
     model = "gpt-5.6-sol",
     reasoningEffort = "xhigh",
+    serviceTier = null,
     now = () => Date.now(),
   } = {}) {
     if (!client || typeof client.request !== "function") {
@@ -1410,6 +1430,7 @@ export class RemoteControlCommandDispatcher {
     this.defaultModel = normalizeModelForConfig(model) || "gpt-5.6-sol";
     this.defaultReasoningEffort =
       normalizeReasoningForConfig(reasoningEffort) || "xhigh";
+    this.defaultServiceTier = normalizeServiceTierForConfig(serviceTier);
     this.now = now;
     this.nextSettingsByThread = new Map();
     this.threadResidencyById = new Map();
@@ -1468,6 +1489,9 @@ export class RemoteControlCommandDispatcher {
     const reasoningEffort =
       normalizeReasoningForConfig(params.reasoningEffort) ||
       this.defaultReasoningEffort;
+    const serviceTier =
+      normalizeServiceTierForConfig(params.serviceTier)
+      ?? this.defaultServiceTier;
     const cwd = firstWorkspaceRoot(params.workspaceRoots) || this.cwd;
     const residency = this.currentThreadResidency({
       threadId,
@@ -1541,6 +1565,7 @@ export class RemoteControlCommandDispatcher {
           model_reasoning_effort: reasoningEffort,
         },
         model,
+        serviceTier,
       },
       {
         timeoutMs: this.boundedCommandTimeout(
@@ -1738,6 +1763,7 @@ export class RemoteControlCommandDispatcher {
       params.threadSettings,
       this.defaultModel,
       this.defaultReasoningEffort,
+      this.defaultServiceTier,
     );
     this.nextSettingsByThread.set(threadId, settings);
     return {
@@ -1816,6 +1842,7 @@ export class RemoteControlCommandDispatcher {
                 conversationId: threadId,
                 model: settings.model,
                 reasoningEffort: settings.reasoningEffort,
+                serviceTier: settings.serviceTier,
                 workspaceRoots: [this.cwd],
                 forceResume: true,
                 requireReconciliation: true,
@@ -2007,6 +2034,7 @@ export class RemoteControlCommandDispatcher {
         approvalPolicy: "never",
         model: settings.model,
         effort: settings.reasoningEffort,
+        serviceTier: settings.serviceTier,
       },
       { timeoutMs },
     );
@@ -2020,6 +2048,9 @@ export class RemoteControlCommandDispatcher {
       normalizeReasoningForConfig(
         params.reasoningEffort || params.config?.model_reasoning_effort,
       ) || this.defaultReasoningEffort;
+    const serviceTier =
+      normalizeServiceTierForConfig(params.serviceTier)
+      ?? this.defaultServiceTier;
     const cwd = nonEmptyString(params.cwd) || this.cwd;
     const started = await this.client.request(
       "thread/start",
@@ -2032,6 +2063,7 @@ export class RemoteControlCommandDispatcher {
           model_reasoning_effort: reasoningEffort,
         },
         model,
+        serviceTier,
         threadSource: "user",
       },
       { timeoutMs },
@@ -2043,6 +2075,7 @@ export class RemoteControlCommandDispatcher {
     this.nextSettingsByThread.set(threadId, {
       model,
       reasoningEffort,
+      serviceTier,
       approvalPolicy: "never",
       sandbox: "danger-full-access",
     });
@@ -2055,6 +2088,7 @@ export class RemoteControlCommandDispatcher {
         approvalPolicy: "never",
         model,
         effort: reasoningEffort,
+        serviceTier,
       },
       { timeoutMs },
     );
@@ -2062,6 +2096,7 @@ export class RemoteControlCommandDispatcher {
       threadId,
       model,
       reasoningEffort,
+      serviceTier,
       cwd,
       threadSource: "thread_start",
     });
@@ -2109,6 +2144,9 @@ export class RemoteControlCommandDispatcher {
     const reasoningEffort =
       normalizeReasoningForConfig(params.reasoningEffort) ||
       this.defaultReasoningEffort;
+    const serviceTier =
+      normalizeServiceTierForConfig(params.serviceTier)
+      ?? this.defaultServiceTier;
     const catalog = await this.client.request(
       "model/list",
       { cursor: null, includeHidden: true, limit: 100 },
@@ -2116,20 +2154,29 @@ export class RemoteControlCommandDispatcher {
     );
     const profile = findModelProfile(catalog, model);
     const efforts = supportedReasoningEfforts(profile);
-    if (!profile || !efforts.includes(reasoningEffort)) {
+    const serviceTiers = supportedServiceTierIDs(profile);
+    if (
+      !profile
+      || !efforts.includes(reasoningEffort)
+      || (serviceTier && !serviceTiers.includes(serviceTier))
+    ) {
       throw new Error(
         "Configured Remote controller profile is unavailable: " +
           model +
           "/" +
-          reasoningEffort,
+          reasoningEffort +
+          "/" +
+          (serviceTier || "default"),
       );
     }
     this.defaultModel = model;
     this.defaultReasoningEffort = reasoningEffort;
+    this.defaultServiceTier = serviceTier;
     return {
       status: "set",
       model,
       reasoningEffort,
+      serviceTier,
       appliesTo: "next_turn",
     };
   }
@@ -2353,11 +2400,22 @@ export class RemoteControlCommandDispatcher {
         normalizeReasoningForConfig(
           params.reasoningEffort || stored.reasoningEffort,
         ) || this.defaultReasoningEffort,
+      serviceTier:
+        normalizeServiceTierForConfig(
+          params.serviceTier ?? stored.serviceTier,
+        ) ?? this.defaultServiceTier,
     };
   }
 }
 
-export function startConversationParams({ prompt, cwd, model, reasoningEffort, inputItems = null }) {
+export function startConversationParams({
+  prompt,
+  cwd,
+  model,
+  reasoningEffort,
+  serviceTier = null,
+  inputItems = null,
+}) {
   return {
     hostId: "local",
     input: [
@@ -2372,6 +2430,7 @@ export function startConversationParams({ prompt, cwd, model, reasoningEffort, i
     workspaceKind: "project",
     model,
     reasoningEffort,
+    serviceTier: normalizeServiceTierForConfig(serviceTier),
     config: { model, model_reasoning_effort: reasoningEffort },
     permissions: FULL_ACCESS_PERMISSIONS,
     approvalsReviewer: "user",
@@ -2399,6 +2458,16 @@ export function supportedReasoningEfforts(profile) {
         .map((entry) =>
           typeof entry === "string" ? entry : entry?.reasoningEffort,
         )
+        .filter(Boolean),
+    ),
+  );
+}
+
+export function supportedServiceTierIDs(profile) {
+  return Array.from(
+    new Set(
+      (profile?.serviceTiers || [])
+        .map((entry) => String(entry?.id || "").trim())
         .filter(Boolean),
     ),
   );
@@ -2466,10 +2535,15 @@ export async function invokeAppCommand(
   );
 }
 
-export function lockedThreadSettings({ model, reasoningEffort } = {}) {
+export function lockedThreadSettings({
+  model,
+  reasoningEffort,
+  serviceTier = null,
+} = {}) {
   return {
     model: normalizeModelForConfig(model) || "gpt-5.6-sol",
     effort: normalizeReasoningForConfig(reasoningEffort) || "xhigh",
+    serviceTier: normalizeServiceTierForConfig(serviceTier),
     approvalPolicy: "never",
     approvalsReviewer: "user",
     permissions: ":danger-full-access",
@@ -2556,6 +2630,7 @@ function normalizeLockedSettings(
   settings,
   fallbackModel,
   fallbackReasoningEffort,
+  fallbackServiceTier = null,
 ) {
   return {
     model:
@@ -2568,9 +2643,16 @@ function normalizeLockedSettings(
       ) ||
       normalizeReasoningForConfig(fallbackReasoningEffort) ||
       "xhigh",
+    serviceTier:
+      normalizeServiceTierForConfig(settings?.serviceTier)
+      ?? normalizeServiceTierForConfig(fallbackServiceTier),
     approvalPolicy: "never",
     sandbox: "danger-full-access",
   };
+}
+
+export function normalizeServiceTierForConfig(value) {
+  return String(value || "").trim() === "priority" ? "priority" : null;
 }
 
 function firstWorkspaceRoot(value) {

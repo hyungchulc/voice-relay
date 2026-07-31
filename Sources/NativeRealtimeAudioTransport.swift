@@ -124,6 +124,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private let wakeAudioHealthInterval: TimeInterval = 1.0
     private var voiceProcessingEnabled = false
     private var captureTapInstalled = false
+    private var microphoneInputEnabled = true
     private var playbackReferenceTapInstalled = false
     private var audioConfigurationObserver: NSObjectProtocol?
     private var audioRecoveryWorkItem: DispatchWorkItem?
@@ -436,6 +437,90 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
     }
 
+    @discardableResult
+    func setMicrophoneInputEnabled(
+        _ enabled: Bool,
+        generation: Int?
+    ) -> Bool {
+        stateQueue.sync {
+            if let generation,
+               let activeGeneration,
+               activeGeneration != generation {
+                return false
+            }
+            guard microphoneInputEnabled != enabled else { return true }
+            microphoneInputEnabled = enabled
+            advanceCaptureRoutingEpoch()
+            if !wakeAudioHandoffLifecycle.requiresProtectedContinuity {
+                pendingPCM.removeAll(keepingCapacity: false)
+            }
+            pendingBargeInPCM.removeAll(keepingCapacity: false)
+            captureTimingHealth.reset()
+            if !enabled {
+                cancelWakeAudioHealthCheck()
+                wakeAudioConsumer = nil
+                wakeAudioFailureHandler = nil
+                if captureTapInstalled, let audioEngine {
+                    audioEngine.inputNode.removeTap(onBus: 0)
+                    captureTapInstalled = false
+                }
+                if let activeGeneration {
+                    emitOnMain {
+                        self.onInputLevel?(activeGeneration, 0)
+                    }
+                }
+                VoiceRelayDiagnostics.flow(
+                    "microphone_input_muted",
+                    generation: activeGeneration,
+                    fields: [
+                        "capture": "stopped",
+                        "playback": "preserved",
+                        "session": "preserved",
+                    ]
+                )
+                return true
+            }
+            guard let audioEngine, voiceProcessingEnabled else {
+                VoiceRelayDiagnostics.flow(
+                    "microphone_input_unmuted",
+                    generation: activeGeneration,
+                    fields: ["capture": "awaiting_audio_graph"]
+                )
+                return true
+            }
+            if !audioEngine.isRunning {
+                do {
+                    try restartFullDuplexEngineInPlace(
+                        engine: audioEngine,
+                        generation: activeGeneration
+                    )
+                } catch {
+                    microphoneInputEnabled = false
+                    return false
+                }
+            } else if !captureTapInstalled {
+                let input = audioEngine.inputNode
+                let captureFormat = input.outputFormat(forBus: 0)
+                guard captureFormat.sampleRate > 0,
+                      captureFormat.channelCount > 0 else {
+                    microphoneInputEnabled = false
+                    return false
+                }
+                installCaptureTap(on: input, format: captureFormat)
+            }
+            VoiceRelayDiagnostics.flow(
+                "microphone_input_unmuted",
+                generation: activeGeneration,
+                fields: [
+                    "capture": "resumed",
+                    "playback": "preserved",
+                    "session": "preserved",
+                ]
+            )
+            return true
+        }
+    }
+
     func shutdown() {
         stateQueue.sync {
             self.stopCurrent(
@@ -449,6 +534,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     var wakeAudioFormat: AVAudioFormat? {
         stateQueue.sync {
             guard activeGeneration == nil,
+                  microphoneInputEnabled,
                   audioEngine != nil,
                   voiceProcessingEnabled else {
                 return nil
@@ -469,10 +555,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     @discardableResult
     func prepareWakeAudioCapture() -> Bool {
         stateQueue.sync {
-            guard activeGeneration == nil else { return false }
+            guard activeGeneration == nil,
+                  microphoneInputEnabled else { return false }
             if let audioEngine,
                voiceProcessingEnabled,
-               captureTapInstalled,
                playbackReferenceTapInstalled {
                 if !audioEngine.isRunning {
                     do {
@@ -487,6 +573,14 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                         )
                         return false
                     }
+                } else if !captureTapInstalled {
+                    let input = audioEngine.inputNode
+                    let captureFormat = input.outputFormat(forBus: 0)
+                    guard captureFormat.sampleRate > 0,
+                          captureFormat.channelCount > 0 else {
+                        return false
+                    }
+                    installCaptureTap(on: input, format: captureFormat)
                 }
                 return true
             }
@@ -525,8 +619,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             audioRecoveryStableWorkItem?.cancel()
             audioRecoveryStableWorkItem = nil
             guard activeGeneration == nil,
+                  microphoneInputEnabled,
                   let audioEngine,
-                  voiceProcessingEnabled else {
+                  voiceProcessingEnabled,
+                  captureTapInstalled else {
                 return false
             }
             wakeAudioHandoffJournal.beginWake()
@@ -1103,18 +1199,22 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 "sink": "macos_system_default_output",
             ]
         )
-        installCaptureTap(
-            on: input,
-            format: captureFormat
-        )
+        if microphoneInputEnabled {
+            installCaptureTap(
+                on: input,
+                format: captureFormat
+            )
+        }
         try installPlaybackReferenceTap(
             on: engine.mainMixerNode
         )
         guard generation.map({
             !isStartCancelled(generation: $0)
         }) ?? true else {
-            input.removeTap(onBus: 0)
-            captureTapInstalled = false
+            if captureTapInstalled {
+                input.removeTap(onBus: 0)
+                captureTapInstalled = false
+            }
             engine.mainMixerNode.removeTap(onBus: 0)
             playbackReferenceTapInstalled = false
             throw AudioLifecycleError.startCancelled
@@ -1123,8 +1223,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         do {
             try engine.start()
         } catch {
-            input.removeTap(onBus: 0)
-            captureTapInstalled = false
+            if captureTapInstalled {
+                input.removeTap(onBus: 0)
+                captureTapInstalled = false
+            }
             engine.mainMixerNode.removeTap(onBus: 0)
             playbackReferenceTapInstalled = false
             engine.stop()
@@ -1134,8 +1236,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         guard generation.map({
             !isStartCancelled(generation: $0)
         }) ?? true else {
-            input.removeTap(onBus: 0)
-            captureTapInstalled = false
+            if captureTapInstalled {
+                input.removeTap(onBus: 0)
+                captureTapInstalled = false
+            }
             engine.mainMixerNode.removeTap(onBus: 0)
             playbackReferenceTapInstalled = false
             engine.stop()
@@ -1647,8 +1751,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         mediaEpoch &+= 1
         advanceCaptureRoutingEpoch()
         cancelWakeAudioHealthCheck()
-        input.removeTap(onBus: 0)
-        captureTapInstalled = false
+        if captureTapInstalled {
+            input.removeTap(onBus: 0)
+            captureTapInstalled = false
+        }
         if playbackReferenceTapInstalled {
             engine.mainMixerNode.removeTap(onBus: 0)
             playbackReferenceTapInstalled = false
@@ -1671,10 +1777,12 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 ]
             )
         }
-        installCaptureTap(
-            on: input,
-            format: captureFormat
-        )
+        if microphoneInputEnabled {
+            installCaptureTap(
+                on: input,
+                format: captureFormat
+            )
+        }
         try installPlaybackReferenceTap(
             on: engine.mainMixerNode
         )
@@ -1682,8 +1790,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         try engine.start()
         if let generation,
            isStartCancelled(generation: generation) {
-            input.removeTap(onBus: 0)
-            captureTapInstalled = false
+            if captureTapInstalled {
+                input.removeTap(onBus: 0)
+                captureTapInstalled = false
+            }
             engine.mainMixerNode.removeTap(onBus: 0)
             playbackReferenceTapInstalled = false
             engine.stop()
@@ -1808,7 +1918,8 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                     return
                 }
                 let mediaProgressed =
-                    self.capturedChunks
+                    !self.microphoneInputEnabled
+                    || self.capturedChunks
                         > self.audioRecoveryStableCapturedBaseline
                     || self.renderedChunks
                         > self.audioRecoveryStableRenderedBaseline
@@ -1906,6 +2017,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             self.stateQueue.async {
                 defer { self.releaseCaptureSlot() }
                 guard self.mediaEpoch == epoch,
+                      self.microphoneInputEnabled,
                       self.isCurrentCaptureRoutingToken(routingToken) else {
                     return
                 }

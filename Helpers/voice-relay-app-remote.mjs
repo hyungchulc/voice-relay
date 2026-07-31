@@ -284,6 +284,7 @@ async function inspectConnection() {
     accountDescription: accountDescription(accountResult),
     effectiveConfig: config,
     availableModels: modelIDs(modelResult),
+    models: modelCapabilities(modelResult),
     threadID: readPersistedThreadID(),
   };
 }
@@ -315,6 +316,7 @@ async function ask(params, requestId) {
       String(params.reasoningEffort || "").trim() === "inherit"
         ? config.reasoningEffort
         : String(params.reasoningEffort || config.reasoningEffort);
+    const serviceTier = normalizeServiceTier(params.serviceTier);
     if (model === "unknown" || reasoningEffort === "unknown") {
       const error = new Error(
         "Codex host model configuration is unavailable",
@@ -330,6 +332,7 @@ async function ask(params, requestId) {
       preferredThreadID,
       model,
       reasoningEffort,
+      serviceTier,
     });
     const threadID = await ensureBoundThread(
       {
@@ -337,6 +340,7 @@ async function ask(params, requestId) {
         preferredThreadID,
         model,
         reasoningEffort,
+        serviceTier,
       },
       requestId,
     );
@@ -520,7 +524,24 @@ async function interrupt() {
 }
 
 async function prepareThread(params, requestId) {
-  const threadID = await ensureBoundThread(params, requestId);
+  const config = await remoteEffectiveConfig();
+  const model =
+    String(params.model || "").trim() === "inherit"
+      ? config.model
+      : String(params.model || config.model);
+  const reasoningEffort =
+    String(params.reasoningEffort || "").trim() === "inherit"
+      ? config.reasoningEffort
+      : String(params.reasoningEffort || config.reasoningEffort);
+  const threadID = await ensureBoundThread(
+    {
+      ...params,
+      model,
+      reasoningEffort,
+      serviceTier: normalizeServiceTier(params.serviceTier),
+    },
+    requestId,
+  );
   return {
     status: "ready",
     threadID,
@@ -549,7 +570,12 @@ async function realtimeStop() {
   return { status: "stopped" };
 }
 
-async function ensureBackend({ preferredThreadID, model, reasoningEffort }) {
+async function ensureBackend({
+  preferredThreadID,
+  model,
+  reasoningEffort,
+  serviceTier,
+}) {
   await controller.start();
   if (!backend) {
     backend = new backendModule.CodexAppRemoteBackend({
@@ -558,6 +584,7 @@ async function ensureBackend({ preferredThreadID, model, reasoningEffort }) {
       cwd: workspacePath,
       model,
       reasoningEffort,
+      serviceTier,
       statePath: backendStatePath,
       responseTimeoutMs: 10 * 60_000,
     });
@@ -576,9 +603,12 @@ async function ensureBackend({ preferredThreadID, model, reasoningEffort }) {
   );
   backend.model = model;
   backend.reasoningEffort = reasoningEffort;
+  backend.serviceTier = normalizeServiceTier(serviceTier);
   if (backend.commandDispatcher) {
     backend.commandDispatcher.defaultModel = model;
     backend.commandDispatcher.defaultReasoningEffort = reasoningEffort;
+    backend.commandDispatcher.defaultServiceTier =
+      normalizeServiceTier(serviceTier);
   }
   return backend;
 }
@@ -605,6 +635,7 @@ async function resolveBoundThread(params, requestId) {
     preferredThreadID,
     model: params.model,
     reasoningEffort: params.reasoningEffort,
+    serviceTier: params.serviceTier,
   });
   let threadID = createNewThreadIfUnset
     ? ""
@@ -625,7 +656,16 @@ async function resolveBoundThread(params, requestId) {
       try {
         await controller.request(
           "thread/resume",
-          { threadId: threadID, cwd: workspacePath },
+          {
+            threadId: threadID,
+            cwd: workspacePath,
+            model: params.model,
+            serviceTier: normalizeServiceTier(params.serviceTier),
+            config: {
+              model: params.model,
+              model_reasoning_effort: params.reasoningEffort,
+            },
+          },
           { timeoutMs: 60_000 },
         );
       } catch {
@@ -634,11 +674,11 @@ async function resolveBoundThread(params, requestId) {
           requestId,
           stage: "saved_thread_unavailable_creating_replacement",
         });
-        threadID = await startVoiceRelayThread();
+        threadID = await startVoiceRelayThread(params);
       }
     }
   } else {
-    threadID = await startVoiceRelayThread();
+    threadID = await startVoiceRelayThread(params);
   }
 
   activeBackend.threadId = threadID;
@@ -651,10 +691,20 @@ async function resolveBoundThread(params, requestId) {
   return threadID;
 }
 
-async function startVoiceRelayThread() {
+async function startVoiceRelayThread(params) {
+  const serviceTier = normalizeServiceTier(params.serviceTier);
   const started = await controller.request(
     "thread/start",
-    { cwd: workspacePath, threadSource: "user" },
+    {
+      cwd: workspacePath,
+      model: params.model,
+      serviceTier,
+      config: {
+        model: params.model,
+        model_reasoning_effort: params.reasoningEffort,
+      },
+      threadSource: "user",
+    },
     { timeoutMs: 60_000 },
   );
   const threadID = String(started?.thread?.id || "").trim();
@@ -765,6 +815,42 @@ function modelIDs(value) {
   return entries
     .map((entry) => String(entry?.id || entry?.model || "").trim())
     .filter(Boolean);
+}
+
+function modelCapabilities(value) {
+  const entries = Array.isArray(value?.data)
+    ? value.data
+    : Array.isArray(value?.models)
+      ? value.models
+      : [];
+  return entries.flatMap((entry) => {
+    const id = String(entry?.id || entry?.model || "").trim();
+    if (!id) return [];
+    const supportedReasoningEfforts = Array.from(new Set(
+      (Array.isArray(entry?.supportedReasoningEfforts)
+        ? entry.supportedReasoningEfforts
+        : [])
+        .map((value) =>
+          String(value?.reasoningEffort || value || "").trim(),
+        )
+        .filter(Boolean),
+    ));
+    const serviceTierIDs = Array.from(new Set(
+      (Array.isArray(entry?.serviceTiers) ? entry.serviceTiers : [])
+        .map((value) => String(value?.id || "").trim())
+        .filter(Boolean),
+    ));
+    return [{
+      id,
+      displayName: String(entry?.displayName || entry?.name || id).trim(),
+      supportedReasoningEfforts,
+      serviceTierIDs,
+    }];
+  });
+}
+
+function normalizeServiceTier(value) {
+  return String(value || "").trim() === "priority" ? "priority" : null;
 }
 
 function finalAnswer(reply) {

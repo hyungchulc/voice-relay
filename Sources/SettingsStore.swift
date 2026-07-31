@@ -154,6 +154,7 @@ struct AppSettings: Equatable {
     var codexThreadTitle: String
     var codexModel: String
     var codexReasoningEffort: String
+    var codexFastMode: Bool
     var codexSandbox: String
     var codexApprovalPolicy: String
 
@@ -212,6 +213,7 @@ struct AppSettings: Equatable {
             codexThreadTitle: "",
             codexModel: "inherit",
             codexReasoningEffort: "inherit",
+            codexFastMode: false,
             codexSandbox: "inherit",
             codexApprovalPolicy: "inherit",
             includeAuthorityPack: false,
@@ -254,7 +256,7 @@ final class SettingsStore {
         "shimmer",
         "verse",
     ]
-    static let currentSchemaVersion = 19
+    static let currentSchemaVersion = 20
     private static let legacyDefaultRealtimeInstructionFingerprints:
         Set<UInt64> = [
             0x01a7718371a87c1c,
@@ -375,6 +377,7 @@ final class SettingsStore {
         static let codexThreadTitle = "voiceRelay.codex.threadTitle"
         static let codexModel = "voiceRelay.codex.model"
         static let codexReasoningEffort = "voiceRelay.codex.reasoningEffort"
+        static let codexFastMode = "voiceRelay.codex.fastMode"
         static let codexSandbox = "voiceRelay.codex.sandbox"
         static let codexApprovalPolicy = "voiceRelay.codex.approvalPolicy"
         static let includeAuthorityPack = "voiceRelay.injection.enabled"
@@ -530,6 +533,10 @@ final class SettingsStore {
             ),
             codexReasoningEffort: Self.normalizedCodexReasoningEffort(
                 defaults.string(forKey: Key.codexReasoningEffort) ?? fallback.codexReasoningEffort
+            ),
+            codexFastMode: boolValue(
+                forKey: Key.codexFastMode,
+                fallback: fallback.codexFastMode
             ),
             codexSandbox: Self.normalizedCodexSandbox(
                 defaults.string(forKey: Key.codexSandbox) ?? fallback.codexSandbox
@@ -761,6 +768,7 @@ final class SettingsStore {
             Self.normalizedCodexReasoningEffort(settings.codexReasoningEffort),
             forKey: Key.codexReasoningEffort
         )
+        defaults.set(settings.codexFastMode, forKey: Key.codexFastMode)
         defaults.set(Self.normalizedCodexSandbox(settings.codexSandbox), forKey: Key.codexSandbox)
         defaults.set(
             Self.normalizedCodexApprovalPolicy(settings.codexApprovalPolicy),

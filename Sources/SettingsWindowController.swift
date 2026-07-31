@@ -176,6 +176,14 @@ final class SettingsWindowController:
     private let pairingCodeControl = NSTextField()
     private let taskStatus = NSTextField(labelWithString: "")
     private let threadIDControl = NSTextField()
+    private let codexModelControl = NSPopUpButton()
+    private let codexReasoningControl = NSPopUpButton()
+    private let codexFastModeControl = NSButton(
+        checkboxWithTitle: "Fast mode",
+        target: nil,
+        action: nil
+    )
+    private let codexProfileStatus = NSTextField(wrappingLabelWithString: "")
     private let productNameControl = NSTextField()
     private let assistantNameControl = NSTextField()
     private let userDisplayNameControl = NSTextField()
@@ -254,8 +262,11 @@ final class SettingsWindowController:
     private var displayedAppearanceMode: AppAppearanceMode
     private var loadedThreadID = ""
     private var explicitThreadBindingEditRequested = false
+    private var codexModels: [CodexModelCapability] = []
+    private var codexEffectiveModel = ""
+    private var codexCapabilitiesAvailable = false
 
-    var onSave: (() -> Void)?
+    var onSave: ((Bool) -> Void)?
     var onReset: (() -> Void)?
     var onConnectionRecoveryWillBegin: (() -> Void)?
     var onConnectionRecoveryDidEnd: (() -> Void)?
@@ -383,6 +394,16 @@ final class SettingsWindowController:
         )
         taskStatus.font = .systemFont(ofSize: 11.5)
         taskStatus.textColor = .secondaryLabelColor
+        codexModelControl.target = self
+        codexModelControl.action = #selector(codexModelSelectionChanged)
+        codexReasoningControl.target = self
+        codexReasoningControl.action = #selector(codexProfileSelectionChanged)
+        codexFastModeControl.title = "Fast mode"
+        codexFastModeControl.target = self
+        codexFastModeControl.action = #selector(codexProfileSelectionChanged)
+        codexProfileStatus.maximumNumberOfLines = 3
+        codexProfileStatus.font = .systemFont(ofSize: 11.5)
+        codexProfileStatus.textColor = .secondaryLabelColor
 
         productNameControl.placeholderString = "Voice Relay"
         assistantNameControl.placeholderString = "Relay"
@@ -615,6 +636,24 @@ final class SettingsWindowController:
                     button(localizedCopy.text("Check again", "다시 확인"), #selector(refreshConnections))
                 ),
                 settingsRow("Realtime", voiceStatus),
+                divider(),
+                fieldLabel(
+                    localizedCopy.text("Codex execution", "Codex 실행"),
+                    detail: localizedCopy.text(
+                        "These settings apply to subsequent Codex requests.",
+                        "이 설정은 다음 Codex 요청부터 적용됩니다."
+                    )
+                ),
+                settingsRow(
+                    localizedCopy.text("Model", "모델"),
+                    codexModelControl
+                ),
+                settingsRow(
+                    localizedCopy.text("Thinking level", "Thinking 수준"),
+                    codexReasoningControl
+                ),
+                codexFastModeControl,
+                codexProfileStatus,
                 divider(),
                 fieldLabel(
                     "Session ID",
@@ -1361,6 +1400,11 @@ final class SettingsWindowController:
         loadedThreadID = settings.codexThreadID
         explicitThreadBindingEditRequested = false
         threadIDControl.stringValue = settings.codexThreadID
+        populateCodexProfileControls(
+            settings: settings,
+            preferredReasoningEffort: settings.codexReasoningEffort,
+            preferredFastMode: settings.codexFastMode
+        )
         taskStatus.stringValue = settings.codexThreadID.isEmpty
             ? localizedCopy.text(
                 "A new dedicated session will be created when voice starts.",
@@ -1568,12 +1612,30 @@ final class SettingsWindowController:
                       self.probeGeneration == generation else { return }
                 switch result {
                 case let .success(snapshot):
+                    self.codexModels = snapshot.models
+                    self.codexEffectiveModel = snapshot.effectiveConfig.model
+                    self.codexCapabilitiesAvailable = !snapshot.models.isEmpty
+                    let settings = self.store.load()
+                    self.populateCodexProfileControls(
+                        settings: settings,
+                        preferredReasoningEffort:
+                            settings.codexReasoningEffort,
+                        preferredFastMode: settings.codexFastMode
+                    )
                     self.codexStatus.stringValue =
                         self.localizedCopy.text("Connected", "연결됨")
                         + " · \(snapshot.accountDescription)\n" +
                         snapshot.effectiveConfig.summary
                     self.codexStatus.textColor = .systemGreen
                 case let .failure(error):
+                    self.codexCapabilitiesAvailable = false
+                    self.codexModels = []
+                    self.codexEffectiveModel = ""
+                    self.populateCodexProfileControls(
+                        settings: self.store.load(),
+                        preferredReasoningEffort: nil,
+                        preferredFastMode: nil
+                    )
                     self.codexStatus.stringValue = error.localizedDescription
                     self.codexStatus.textColor = .systemRed
                 }
@@ -1781,6 +1843,7 @@ final class SettingsWindowController:
 
     @objc private func save() {
         var settings = store.load()
+        let previousSettings = settings
         let previousThreadID = settings.codexThreadID
         let taskID = threadIDControl.stringValue
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1858,8 +1921,25 @@ final class SettingsWindowController:
                 settings.codexThreadTitle = settings.productName
             }
         }
-        settings.codexModel = "inherit"
-        settings.codexReasoningEffort = "inherit"
+        if codexCapabilitiesAvailable {
+            let model = selectedCodexModel()
+            let reasoningEffort = selectedCodexReasoningEffort()
+            let fastMode = codexFastModeControl.state == .on
+            let resolution = CodexProfileSelectionPolicy.resolve(
+                model: model,
+                reasoningEffort: reasoningEffort,
+                fastMode: fastMode,
+                effectiveModel: codexEffectiveModel,
+                capabilities: codexModels
+            )
+            guard resolution.isSupported else {
+                updateCodexProfileStatus()
+                return
+            }
+            settings.codexModel = model
+            settings.codexReasoningEffort = reasoningEffort
+            settings.codexFastMode = fastMode
+        }
         settings.codexSandbox = "inherit"
         settings.codexApprovalPolicy = "inherit"
         do {
@@ -1875,7 +1955,12 @@ final class SettingsWindowController:
             displayedAppearanceMode = builtAppearanceMode
             stopProbe()
             window?.orderOut(nil)
-            onSave?()
+            onSave?(
+                SettingsSaveImpactPolicy.requiresOverlayRebuild(
+                    previous: previousSettings,
+                    updated: settings
+                )
+            )
         } catch {
             present(error)
         }
@@ -1980,6 +2065,151 @@ final class SettingsWindowController:
                 == SettingsStore.defaultRealtimeInstructions
             ? localizedCopy.text("Default prompt", "기본 프롬프트")
             : localizedCopy.text("Custom prompt", "사용자 프롬프트")
+    }
+
+    private func selectedCodexModel() -> String {
+        codexModelControl.selectedItem?.representedObject as? String
+            ?? "inherit"
+    }
+
+    private func selectedCodexReasoningEffort() -> String {
+        codexReasoningControl.selectedItem?.representedObject as? String
+            ?? "inherit"
+    }
+
+    private func populateCodexProfileControls(
+        settings: AppSettings,
+        preferredReasoningEffort: String?,
+        preferredFastMode: Bool?
+    ) {
+        let requestedModel = settings.codexModel
+        codexModelControl.removeAllItems()
+        codexModelControl.addItem(
+            withTitle: localizedCopy.text("Default", "기본값")
+        )
+        codexModelControl.lastItem?.representedObject = "inherit"
+        for model in codexModels {
+            codexModelControl.addItem(withTitle: model.displayName)
+            codexModelControl.lastItem?.representedObject = model.id
+        }
+        if let item = codexModelControl.itemArray.first(where: {
+            $0.representedObject as? String == requestedModel
+        }) {
+            codexModelControl.select(item)
+        } else if requestedModel != "inherit" {
+            codexModelControl.addItem(
+                withTitle: localizedCopy.text(
+                    "Unavailable: \(requestedModel)",
+                    "사용 불가: \(requestedModel)"
+                )
+            )
+            codexModelControl.lastItem?.representedObject = requestedModel
+            codexModelControl.select(codexModelControl.lastItem)
+        } else {
+            codexModelControl.selectItem(at: 0)
+        }
+        populateCodexReasoningControl(
+            preferred: preferredReasoningEffort
+                ?? settings.codexReasoningEffort
+        )
+        codexFastModeControl.state = (
+            preferredFastMode ?? settings.codexFastMode
+        ) ? .on : .off
+        codexModelControl.isEnabled = codexCapabilitiesAvailable
+        codexReasoningControl.isEnabled = codexCapabilitiesAvailable
+        updateCodexProfileStatus()
+    }
+
+    private func populateCodexReasoningControl(preferred: String) {
+        let resolvedModel = selectedCodexModel() == "inherit"
+            ? codexEffectiveModel
+            : selectedCodexModel()
+        let efforts = codexModels.first(where: {
+            $0.id == resolvedModel
+        })?.supportedReasoningEfforts ?? []
+        codexReasoningControl.removeAllItems()
+        codexReasoningControl.addItem(
+            withTitle: localizedCopy.text("Default", "기본값")
+        )
+        codexReasoningControl.lastItem?.representedObject = "inherit"
+        for effort in efforts {
+            codexReasoningControl.addItem(
+                withTitle: effort.prefix(1).uppercased() + effort.dropFirst()
+            )
+            codexReasoningControl.lastItem?.representedObject = effort
+        }
+        if let item = codexReasoningControl.itemArray.first(where: {
+            $0.representedObject as? String == preferred
+        }) {
+            codexReasoningControl.select(item)
+        } else if preferred != "inherit" {
+            codexReasoningControl.addItem(
+                withTitle: localizedCopy.text(
+                    "Unavailable: \(preferred)",
+                    "사용 불가: \(preferred)"
+                )
+            )
+            codexReasoningControl.lastItem?.representedObject = preferred
+            codexReasoningControl.select(codexReasoningControl.lastItem)
+        } else {
+            codexReasoningControl.selectItem(at: 0)
+        }
+    }
+
+    @objc private func codexModelSelectionChanged() {
+        populateCodexReasoningControl(preferred: "inherit")
+        updateCodexProfileStatus()
+    }
+
+    @objc private func codexProfileSelectionChanged() {
+        updateCodexProfileStatus()
+    }
+
+    private func updateCodexProfileStatus() {
+        guard codexCapabilitiesAvailable else {
+            codexFastModeControl.isEnabled = false
+            codexProfileStatus.stringValue = localizedCopy.text(
+                "Codex profile controls are read-only until capabilities are available. Existing settings will be preserved.",
+                "기능 정보를 확인할 때까지 Codex 프로필은 읽기 전용입니다. 기존 설정은 유지됩니다."
+            )
+            codexProfileStatus.textColor = .secondaryLabelColor
+            saveButton.isEnabled = true
+            return
+        }
+        let resolution = CodexProfileSelectionPolicy.resolve(
+            model: selectedCodexModel(),
+            reasoningEffort: selectedCodexReasoningEffort(),
+            fastMode: codexFastModeControl.state == .on,
+            effectiveModel: codexEffectiveModel,
+            capabilities: codexModels
+        )
+        let selectedCapability = codexModels.first {
+            $0.id == resolution.resolvedModelID
+        }
+        let supportsFast = selectedCapability?.serviceTierIDs.contains(
+            "priority"
+        ) == true
+        codexFastModeControl.isEnabled = supportsFast
+            || codexFastModeControl.state == .on
+        saveButton.isEnabled = resolution.isSupported
+        if resolution.isSupported {
+            codexProfileStatus.stringValue = codexFastModeControl.state == .on
+                ? localizedCopy.text(
+                    "Fast mode will use the supported accelerated service tier.",
+                    "Fast mode는 지원되는 가속 서비스 tier를 사용합니다."
+                )
+                : localizedCopy.text(
+                    "Supported. The normal inherited service tier is preserved.",
+                    "지원됩니다. 기본 service tier를 그대로 사용합니다."
+                )
+            codexProfileStatus.textColor = .secondaryLabelColor
+        } else {
+            codexProfileStatus.stringValue = localizedCopy.text(
+                "This model, thinking level, and Fast mode combination is not supported.",
+                "이 모델, Thinking 수준, Fast mode 조합은 지원되지 않습니다."
+            )
+            codexProfileStatus.textColor = .systemOrange
+        }
     }
 
     private func populateAppLanguages() {

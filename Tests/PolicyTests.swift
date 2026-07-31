@@ -371,6 +371,124 @@ struct PolicyTests {
             "an unowned persistent graph must not start speculative recovery"
         )
 
+        let dormantControls = ExpandedVoiceControlsPolicy.resolve(
+            voiceSessionActive: false,
+            microphoneInputEnabled: true
+        )
+        let activeMutedControls = ExpandedVoiceControlsPolicy.resolve(
+            voiceSessionActive: true,
+            microphoneInputEnabled: false
+        )
+        let dormantMutedControls = ExpandedVoiceControlsPolicy.resolve(
+            voiceSessionActive: false,
+            microphoneInputEnabled: false
+        )
+        expect(
+            dormantControls.transportEnabled
+                && dormantControls.transportSymbolName == "play.fill"
+                && dormantControls.microphoneSymbolName == "mic.fill"
+                && activeMutedControls.transportEnabled
+                && activeMutedControls.transportSymbolName == "stop.fill"
+                && activeMutedControls.microphoneSymbolName
+                    == "mic.slash.fill"
+                && !dormantMutedControls.transportEnabled
+                && dormantMutedControls.transportSymbolName == "play.fill",
+            "the stateful transport and microphone controls must expose independent state"
+        )
+        let muteActive = MicrophoneInputControlPolicy.transition(
+            from: true,
+            voiceSessionActive: true
+        )
+        let unmuteDormant = MicrophoneInputControlPolicy.transition(
+            from: false,
+            voiceSessionActive: false
+        )
+        let unmuteActive = MicrophoneInputControlPolicy.transition(
+            from: false,
+            voiceSessionActive: true
+        )
+        expect(
+            !muteActive.targetEnabled
+                && muteActive.shouldPauseWakeMonitoring
+                && muteActive.preservesVoiceSession
+                && muteActive.preservesPlayback
+                && muteActive.preservesCodexWork
+                && unmuteDormant.shouldResumeWakeMonitoring
+                && !unmuteActive.shouldResumeWakeMonitoring,
+            "microphone mute must isolate capture while preserving the active session, playback, and Codex work"
+        )
+
+        let profileCapabilities = [
+            CodexModelCapability(
+                id: "model-a",
+                displayName: "Model A",
+                supportedReasoningEfforts: ["high", "xhigh"],
+                serviceTierIDs: ["priority"]
+            ),
+            CodexModelCapability(
+                id: "model-b",
+                displayName: "Model B",
+                supportedReasoningEfforts: ["low"],
+                serviceTierIDs: []
+            ),
+        ]
+        let supportedFastProfile = CodexProfileSelectionPolicy.resolve(
+            model: "inherit",
+            reasoningEffort: "xhigh",
+            fastMode: true,
+            effectiveModel: "model-a",
+            capabilities: profileCapabilities
+        )
+        let supportedDefaultTierProfile = CodexProfileSelectionPolicy.resolve(
+            model: "model-a",
+            reasoningEffort: "inherit",
+            fastMode: false,
+            effectiveModel: "model-a",
+            capabilities: profileCapabilities
+        )
+        let unsupportedReasoningProfile = CodexProfileSelectionPolicy.resolve(
+            model: "model-b",
+            reasoningEffort: "xhigh",
+            fastMode: false,
+            effectiveModel: "model-a",
+            capabilities: profileCapabilities
+        )
+        let unsupportedFastProfile = CodexProfileSelectionPolicy.resolve(
+            model: "model-b",
+            reasoningEffort: "low",
+            fastMode: true,
+            effectiveModel: "model-a",
+            capabilities: profileCapabilities
+        )
+        expect(
+            supportedFastProfile.isSupported
+                && supportedFastProfile.resolvedModelID == "model-a"
+                && supportedFastProfile.serviceTier == "priority"
+                && supportedDefaultTierProfile.isSupported
+                && supportedDefaultTierProfile.serviceTier == nil
+                && !unsupportedReasoningProfile.isSupported
+                && !unsupportedFastProfile.isSupported,
+            "Codex profile selection must use runtime capabilities and fail closed for unsupported thinking or Fast combinations"
+        )
+        let previousSettings = AppSettings.defaults
+        var profileOnlySettings = previousSettings
+        profileOnlySettings.codexModel = "model-a"
+        profileOnlySettings.codexReasoningEffort = "high"
+        profileOnlySettings.codexFastMode = true
+        var voiceChangedSettings = profileOnlySettings
+        voiceChangedSettings.realtimeVoice = "cedar"
+        expect(
+            !SettingsSaveImpactPolicy.requiresOverlayRebuild(
+                previous: previousSettings,
+                updated: profileOnlySettings
+            )
+                && SettingsSaveImpactPolicy.requiresOverlayRebuild(
+                    previous: previousSettings,
+                    updated: voiceChangedSettings
+                ),
+            "Codex profile-only saves must apply to subsequent requests without rebuilding the active voice session"
+        )
+
         let echoReference = (0..<4_800).map { index in
             Float(sin(Double(index) * 2 * .pi * 440 / 24_000)) * 0.20
         }
@@ -3184,6 +3302,9 @@ struct PolicyTests {
         explicitSettings.preferModernSpeechAnalyzer = false
         explicitSettings.voiceIdleTimeoutMinutes = 15
         explicitSettings.realtimeSpeechRate = 1.1
+        explicitSettings.codexModel = "model-a"
+        explicitSettings.codexReasoningEffort = "high"
+        explicitSettings.codexFastMode = true
         explicitSettings.realtimeInstructions = "Use a short custom greeting."
         explicitSettings.productName = "  Orbit  "
         explicitSettings.assistantName = "  Nova  "
@@ -3219,7 +3340,10 @@ struct PolicyTests {
         expect(
             savedVoiceSettings.voiceIdleTimeoutMinutes == 15
                 && abs(savedVoiceSettings.realtimeSpeechRate - 1.1)
-                    < 0.000_001,
+                    < 0.000_001
+                && savedVoiceSettings.codexModel == "model-a"
+                && savedVoiceSettings.codexReasoningEffort == "high"
+                && savedVoiceSettings.codexFastMode,
             "the configurable voice inactivity timeout and speech speed must round-trip"
         )
         expect(

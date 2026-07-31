@@ -53,6 +53,7 @@ final class DirectRealtimeController: NSObject {
     private var wakeHandoffTicketIDsByGeneration: [Int: String] = [:]
     private var activeGeneration: Int?
     private var stoppingGenerations = Set<Int>()
+    private var microphoneInputEnabled = true
     private var codexRequestDispatchRegistry =
         VoiceCodexRequestDispatchRegistry()
     private var startupRetryState = RealtimeStartupRetryState()
@@ -375,6 +376,23 @@ final class DirectRealtimeController: NSObject {
         webView?.stopLoading()
         webView?.removeFromSuperview()
         webView = nil
+    }
+
+    @discardableResult
+    func setMicrophoneInputEnabled(
+        _ enabled: Bool,
+        generation: Int?
+    ) -> Bool {
+        if let generation, activeGeneration != generation {
+            return false
+        }
+        microphoneInputEnabled = enabled
+        return transport.setMicrophoneInputEnabled(
+            enabled,
+            generation: activeGeneration == generation
+                ? generation
+                : nil
+        )
     }
 
     private func flushPendingStartIfReady() {

@@ -6,9 +6,13 @@ import { fileURLToPath } from "node:url";
 import {
   awaitSteerMutationResultBeforeDeadline,
   CodexAppRemoteBackend,
+  lockedThreadSettings,
+  normalizeServiceTierForConfig,
   RemoteControlCommandDispatcher,
   SerializedSteerMutationQueue,
+  startConversationParams,
   steerFailureErrorForResult,
+  supportedServiceTierIDs,
   validatedSteerSuccessReceiptForSerialization,
 } from "../Support/CodexRemote/src/codex-app-remote.js";
 import {
@@ -9160,6 +9164,90 @@ assert.equal(
     .filter(message => message.type === "codexSteer").length,
   0,
   "completion-race closure must never silently become a new request or steer",
+);
+
+assert.equal(normalizeServiceTierForConfig("priority"), "priority");
+assert.equal(normalizeServiceTierForConfig("fast"), null);
+assert.deepEqual(
+  supportedServiceTierIDs({
+    serviceTiers: [
+      { id: "priority", name: "Fast" },
+      { id: "priority", name: "Fast duplicate" },
+    ],
+  }),
+  ["priority"],
+  "Fast capability gating must come from model/list service-tier ids",
+);
+assert.equal(
+  lockedThreadSettings({
+    model: "gpt-5.6-sol",
+    reasoningEffort: "xhigh",
+    serviceTier: "priority",
+  }).serviceTier,
+  "priority",
+  "the next-turn settings lock must retain the Fast service tier",
+);
+
+const profileRequests = [];
+const profileClient = {
+  streamGeneration: 1,
+  async request(method, params) {
+    profileRequests.push({ method, params });
+    if (method === "thread/start") {
+      return { thread: { id: "thread-profile" } };
+    }
+    if (method === "turn/start") {
+      return { turn: { id: "turn-profile" } };
+    }
+    if (method === "model/list") {
+      return {
+        data: [{
+          id: "gpt-5.6-sol",
+          supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+          serviceTiers: [],
+        }],
+      };
+    }
+    return {};
+  },
+};
+const profileDispatcher = new RemoteControlCommandDispatcher({
+  client: profileClient,
+  cwd: "/tmp/voice-relay-profile-test",
+  model: "gpt-5.6-sol",
+  reasoningEffort: "xhigh",
+});
+await profileDispatcher.startConversation(
+  startConversationParams({
+    prompt: "test",
+    cwd: "/tmp/voice-relay-profile-test",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "xhigh",
+    serviceTier: "priority",
+  }),
+  { timeoutMs: 1_000 },
+);
+const profileThreadStart = profileRequests.find(
+  request => request.method === "thread/start",
+);
+const profileTurnStart = profileRequests.find(
+  request => request.method === "turn/start",
+);
+assert.equal(profileThreadStart?.params?.serviceTier, "priority");
+assert.equal(profileTurnStart?.params?.serviceTier, "priority");
+assert.equal(profileTurnStart?.params?.model, "gpt-5.6-sol");
+assert.equal(profileTurnStart?.params?.effort, "xhigh");
+await assert.rejects(
+  profileDispatcher.setDefaultModelConfig(
+    {
+      model: "gpt-5.6-sol",
+      reasoningEffort: "xhigh",
+      serviceTier: "priority",
+    },
+    { timeoutMs: 1_000 },
+  ),
+  /profile is unavailable/u,
+  "unsupported model-thinking-Fast combinations must fail closed",
 );
 
 console.log("Realtime response queue tests passed");

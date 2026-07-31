@@ -1,11 +1,22 @@
 import Darwin
 import Foundation
 
+struct CodexModelCapability: Equatable {
+    let id: String
+    let displayName: String
+    let supportedReasoningEfforts: [String]
+    let serviceTierIDs: [String]
+}
+
 struct CodexConnectionSnapshot {
     let accountDescription: String
-    let availableModels: [String]
+    let models: [CodexModelCapability]
     let effectiveConfig: CodexEffectiveConfig
     let threadID: String
+
+    var availableModels: [String] {
+        models.map(\.id)
+    }
 }
 
 struct CodexEffectiveConfig: Equatable {
@@ -25,6 +36,7 @@ struct CodexTurnOptions {
     let preferredThreadTitle: String
     let model: String
     let reasoningEffort: String
+    let serviceTier: String?
     let sandbox: String
     let approvalPolicy: String
     let additionalContext: [String: [String: String]]?
@@ -299,6 +311,9 @@ final class CodexAppRemoteClient {
             "sandbox": options.sandbox,
             "approvalPolicy": options.approvalPolicy,
         ]
+        if let serviceTier = options.serviceTier {
+            params["serviceTier"] = serviceTier
+        }
         if let context = options.additionalContext {
             params["additionalContext"] = context
         }
@@ -407,14 +422,18 @@ final class CodexAppRemoteClient {
         options: CodexTurnOptions,
         completion: @escaping (Result<String, Error>) -> Void = { _ in }
     ) {
+        var params: JSONDictionary = [
+            "preferredThreadID": options.preferredThreadID,
+            "createNewThreadIfUnset": options.preferredThreadID.isEmpty,
+            "model": options.model,
+            "reasoningEffort": options.reasoningEffort,
+        ]
+        if let serviceTier = options.serviceTier {
+            params["serviceTier"] = serviceTier
+        }
         request(
             command: "prepareThread",
-            params: [
-                "preferredThreadID": options.preferredThreadID,
-                "createNewThreadIfUnset": options.preferredThreadID.isEmpty,
-                "model": options.model,
-                "reasoningEffort": options.reasoningEffort,
-            ],
+            params: params,
             timeout: 90
         ) { [weak self] result in
             completion(result.flatMap { value in
@@ -1003,10 +1022,35 @@ final class CodexAppRemoteClient {
                 CodexAppRemoteError.invalidResponse("Missing configuration")
             )
         }
+        let modelObjects = value["models"] as? [JSONDictionary] ?? []
+        let models = modelObjects.compactMap { model -> CodexModelCapability? in
+            guard let id = model["id"] as? String, !id.isEmpty else {
+                return nil
+            }
+            let efforts = (model["supportedReasoningEfforts"] as? [String] ?? [])
+                .filter { !$0.isEmpty }
+            let serviceTierIDs = (model["serviceTierIDs"] as? [String] ?? [])
+                .filter { !$0.isEmpty }
+            return CodexModelCapability(
+                id: id,
+                displayName: model["displayName"] as? String ?? id,
+                supportedReasoningEfforts: Array(Set(efforts)).sorted(),
+                serviceTierIDs: Array(Set(serviceTierIDs)).sorted()
+            )
+        }
+        let fallbackModels = (value["availableModels"] as? [String] ?? [])
+            .map {
+                CodexModelCapability(
+                    id: $0,
+                    displayName: $0,
+                    supportedReasoningEfforts: [],
+                    serviceTierIDs: []
+                )
+            }
         let snapshot = CodexConnectionSnapshot(
             accountDescription: value["accountDescription"] as? String
                 ?? "ChatGPT",
-            availableModels: value["availableModels"] as? [String] ?? [],
+            models: models.isEmpty ? fallbackModels : models,
             effectiveConfig: CodexEffectiveConfig(
                 model: config["model"] as? String ?? "unknown",
                 reasoningEffort: config["reasoningEffort"] as? String ?? "unknown",

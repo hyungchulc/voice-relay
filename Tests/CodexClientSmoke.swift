@@ -28,6 +28,7 @@ struct CodexClientSmoke {
                     preferredThreadTitle: "Voice Relay Remote Smoke",
                     model: "inherit",
                     reasoningEffort: "low",
+                    serviceTier: nil,
                     sandbox: "read-only",
                     approvalPolicy: "on-request",
                     additionalContext: nil,

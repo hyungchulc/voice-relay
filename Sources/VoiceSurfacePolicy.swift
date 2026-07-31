@@ -999,6 +999,120 @@ enum WakeMonitoringResumePolicy {
     }
 }
 
+struct ExpandedVoiceControlsState: Equatable {
+    let transportEnabled: Bool
+    let transportSymbolName: String
+    let microphoneSymbolName: String
+}
+
+enum ExpandedVoiceControlsPolicy {
+    static func resolve(
+        voiceSessionActive: Bool,
+        microphoneInputEnabled: Bool
+    ) -> ExpandedVoiceControlsState {
+        ExpandedVoiceControlsState(
+            transportEnabled: voiceSessionActive || microphoneInputEnabled,
+            transportSymbolName: voiceSessionActive
+                ? "stop.fill"
+                : "play.fill",
+            microphoneSymbolName: microphoneInputEnabled
+                ? "mic.fill"
+                : "mic.slash.fill"
+        )
+    }
+}
+
+struct MicrophoneInputTransition: Equatable {
+    let targetEnabled: Bool
+    let shouldPauseWakeMonitoring: Bool
+    let shouldResumeWakeMonitoring: Bool
+    let preservesVoiceSession: Bool
+    let preservesPlayback: Bool
+    let preservesCodexWork: Bool
+}
+
+enum MicrophoneInputControlPolicy {
+    static func transition(
+        from enabled: Bool,
+        voiceSessionActive: Bool
+    ) -> MicrophoneInputTransition {
+        let targetEnabled = !enabled
+        return MicrophoneInputTransition(
+            targetEnabled: targetEnabled,
+            shouldPauseWakeMonitoring: !targetEnabled,
+            shouldResumeWakeMonitoring:
+                targetEnabled && !voiceSessionActive,
+            preservesVoiceSession: true,
+            preservesPlayback: true,
+            preservesCodexWork: true
+        )
+    }
+}
+
+struct CodexProfileSelectionResolution: Equatable {
+    let resolvedModelID: String
+    let fastModeEnabled: Bool
+    let isModelSupported: Bool
+    let isReasoningEffortSupported: Bool
+    let isFastModeSupported: Bool
+
+    var isSupported: Bool {
+        isModelSupported
+            && isReasoningEffortSupported
+            && isFastModeSupported
+    }
+
+    var serviceTier: String? {
+        fastModeEnabled && isFastModeSupported ? "priority" : nil
+    }
+}
+
+enum CodexProfileSelectionPolicy {
+    static func resolve(
+        model: String,
+        reasoningEffort: String,
+        fastMode: Bool,
+        effectiveModel: String,
+        capabilities: [CodexModelCapability]
+    ) -> CodexProfileSelectionResolution {
+        let requestedModel = model.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let resolvedModelID = requestedModel == "inherit"
+            ? effectiveModel.trimmingCharacters(in: .whitespacesAndNewlines)
+            : requestedModel
+        let capability = capabilities.first { $0.id == resolvedModelID }
+        let isModelSupported = capability != nil
+        let isReasoningEffortSupported = reasoningEffort == "inherit"
+            || capability?.supportedReasoningEfforts.contains(
+                reasoningEffort
+            ) == true
+        let isFastModeSupported = !fastMode
+            || capability?.serviceTierIDs.contains("priority") == true
+        return CodexProfileSelectionResolution(
+            resolvedModelID: resolvedModelID,
+            fastModeEnabled: fastMode,
+            isModelSupported: isModelSupported,
+            isReasoningEffortSupported: isReasoningEffortSupported,
+            isFastModeSupported: isFastModeSupported
+        )
+    }
+}
+
+enum SettingsSaveImpactPolicy {
+    static func requiresOverlayRebuild(
+        previous: AppSettings,
+        updated: AppSettings
+    ) -> Bool {
+        var normalizedPrevious = previous
+        normalizedPrevious.codexModel = updated.codexModel
+        normalizedPrevious.codexReasoningEffort =
+            updated.codexReasoningEffort
+        normalizedPrevious.codexFastMode = updated.codexFastMode
+        return normalizedPrevious != updated
+    }
+}
+
 enum WakeAudioHandoffPolicy {
     static let retiredEngineReleaseDelay: TimeInterval = 0.08
     static let postReleaseSettleDelay: TimeInterval = 0.18

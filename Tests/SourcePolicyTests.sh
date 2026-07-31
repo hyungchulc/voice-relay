@@ -438,8 +438,8 @@ require_text \
   "stale saved tasks must be replaced instead of failing startup"
 require_text \
   "$ROOT/Helpers/voice-relay-app-remote.mjs" \
-  'threadID = await startVoiceRelayThread();' \
-  "the Remote helper must create a dedicated replacement task"
+  'threadID = await startVoiceRelayThread(params);' \
+  "the Remote helper must create a profile-bound dedicated replacement task"
 require_text \
   "$ROOT/Helpers/voice-relay-app-remote.mjs" \
   'backend.threadId = "";' \
@@ -651,8 +651,60 @@ require_text \
   "expanded answers must place Settings in the bottom action bar"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  'bottomActionBar.addArrangedSubview(voiceButton)' \
-  "expanded answers must place Voice in the bottom action bar"
+  'bottomActionBar.addArrangedSubview(transportButton)' \
+  "expanded answers must place one stateful Play/Stop control in the bottom action bar"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'bottomActionBar.addArrangedSubview(microphoneButton)' \
+  "expanded answers must place one stateful microphone control in the bottom action bar"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  $'bottomActionBar.addArrangedSubview(settingsButton)\n        bottomActionBar.addArrangedSubview(microphoneButton)\n        bottomActionBar.addArrangedSubview(transportButton)' \
+  "expanded controls must remain ordered Settings, microphone, then Play/Stop"
+reject_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'private let playButton =' \
+  "the expanded overlay must not render a separate Play button"
+reject_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'private let stopButton =' \
+  "the expanded overlay must not render a separate Stop button"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'action: #selector(toggleVoiceInput)' \
+  "the single transport control must switch Play and Stop actions from session state"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'action: #selector(toggleMicrophoneInput)' \
+  "the microphone toggle must own microphone input independently"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '"playback": "preserved"' \
+  "microphone mute must preserve playback"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '"session": "preserved"' \
+  "microphone mute must preserve the active voice session"
+require_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  'codexFastModeControl.title = "Fast mode"' \
+  "Settings must present priority service as Fast mode"
+reject_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  'checkboxWithTitle: "priority"' \
+  "Settings must not expose the internal priority identifier as the primary label"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'serviceTier: liveSettings.codexFastMode ? "priority" : nil' \
+  "subsequent Voice Relay Codex requests must map Fast mode to priority"
+require_text \
+  "$ROOT/Helpers/voice-relay-app-remote.mjs" \
+  'serviceTier: normalizeServiceTier(params.serviceTier)' \
+  "the helper must propagate the selected service tier into session creation"
+require_text \
+  "$ROOT/Support/CodexRemote/src/codex-app-remote.js" \
+  'serviceTier: settings.serviceTier' \
+  "the Remote dispatcher must propagate the selected service tier into turn creation"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'prewarmVoiceBackend()' \
@@ -1752,7 +1804,7 @@ require_text \
   "onboarding must mechanically block progress until pairing is verified"
 require_text \
   "$ROOT/Sources/SettingsStore.swift" \
-  'static let currentSchemaVersion = 19' \
+  'static let currentSchemaVersion = 20' \
   "Voice Relay preference migrations must be schema-gated"
 require_text \
   "$ROOT/Sources/SettingsStore.swift" \
@@ -2357,11 +2409,11 @@ reject_text \
   "surface layout must not recreate hover tracking and emit duplicate transitions"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  'voiceButton.setSymbol(' \
-  "voice phase changes must update the custom symbol instead of adding a second button image"
+  'microphoneButton.setSymbol(' \
+  "microphone state changes must update the custom native symbol"
 reject_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  'voiceButton.image =' \
+  'microphoneButton.image =' \
   "voice controls must never stack the inherited NSButton image over the custom symbol"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
@@ -4037,7 +4089,7 @@ for (const filename of expected) {
 NODE
 require_text \
   "$ROOT/Sources/SettingsStore.swift" \
-  'static let currentSchemaVersion = 19' \
+  'static let currentSchemaVersion = 20' \
   "Authority Pack settings must use the current schema"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
