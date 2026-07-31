@@ -6081,6 +6081,7 @@ private extension DirectRealtimeController {
         });
         const didFail = Boolean(payload.error);
         const speechOutput = codexSpeechText(payload.output || "");
+        const failureNotice = "That request couldn't be completed. Please try again.";
         if (!didFail) {
           rememberCanonicalFinal(
             payload.output,
@@ -6089,7 +6090,7 @@ private extension DirectRealtimeController {
           );
         }
         const output = JSON.stringify(didFail
-          ? { status: "error" }
+          ? { status: "error", answer: failureNotice }
           : { status: "ok", answer: speechOutput });
         dataSend({
           type: "conversation.item.create",
@@ -6103,13 +6104,7 @@ private extension DirectRealtimeController {
           "codex_final",
           didFail
             ? [
-                spokenDeliveryBoundary(
-                  session.activeUserTurn?.spokenLanguage
-                    || preferredConfiguredLanguageTag(),
-                  session.activeUserTurn?.spokenRegister || "neutral"
-                ),
-                "Give one brief natural notice that this request could not be completed and invite the user to try again.",
-                "Do not expose error details, internal state, tools, routing, or implementation."
+                "Read the answer field from the immediately preceding route_voice_turn function result exactly as written. Do not add, omit, paraphrase, summarize, translate, reinterpret, or answer from the conversation. This response is playback of a bounded failure notice only."
               ].join(" ")
             : [
                 "Read the answer field from the immediately preceding route_voice_turn function result exactly as written. Do not add, omit, paraphrase, summarize, translate, reinterpret, or answer from the conversation. This response is playback of Codex output only.",
@@ -6118,7 +6113,7 @@ private extension DirectRealtimeController {
           {
             marksAwaitingFinal: true,
             detached: false,
-            displayText: String(payload.output || ""),
+            displayText: didFail ? failureNotice : String(payload.output || ""),
             requestID: String(payload.callId || "")
           }
         );

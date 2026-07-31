@@ -311,9 +311,7 @@ final class CodexAppRemoteClient {
             "sandbox": options.sandbox,
             "approvalPolicy": options.approvalPolicy,
         ]
-        if let serviceTier = options.serviceTier {
-            params["serviceTier"] = serviceTier
-        }
+        params["serviceTier"] = options.serviceTier ?? NSNull()
         if let context = options.additionalContext {
             params["additionalContext"] = context
         }
@@ -428,9 +426,7 @@ final class CodexAppRemoteClient {
             "model": options.model,
             "reasoningEffort": options.reasoningEffort,
         ]
-        if let serviceTier = options.serviceTier {
-            params["serviceTier"] = serviceTier
-        }
+        params["serviceTier"] = options.serviceTier ?? NSNull()
         request(
             command: "prepareThread",
             params: params,

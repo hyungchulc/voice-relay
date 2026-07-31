@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
@@ -9,6 +10,7 @@ import {
   lockedThreadSettings,
   normalizeServiceTierForConfig,
   RemoteControlCommandDispatcher,
+  resolveVoiceTurnProfileSelection,
   SerializedSteerMutationQueue,
   startConversationParams,
   steerFailureErrorForResult,
@@ -2170,8 +2172,11 @@ const failureOutputEvent = codexFailureEvents.find(event =>
 );
 assert.deepEqual(
   JSON.parse(failureOutputEvent?.item?.output || "{}"),
-  { status: "error" },
-  "raw Codex diagnostics must never be given back to Realtime to explain",
+  {
+    status: "error",
+    answer: "That request couldn't be completed. Please try again.",
+  },
+  "Codex failure output must expose only the bounded playback notice",
 );
 const failureSpeech = codexFailureEvents.find(event =>
   event.type === "response.create"
@@ -2179,13 +2184,13 @@ const failureSpeech = codexFailureEvents.find(event =>
 );
 assert.match(
   failureSpeech?.response?.instructions || "",
-  /brief natural notice that this request could not be completed/i,
-  "Codex failure speech must use a language-neutral semantic response contract",
+  /Read the answer field.*exactly as written/i,
+  "Codex failure speech must use exact playback instead of semantic generation",
 );
 assert.doesNotMatch(
   failureSpeech?.response?.instructions || "",
-  /Say exactly|I couldn't complete|완료하지 못/,
-  "Codex failure speech must not use an exact per-language reply table",
+  /Give one brief|natural notice/i,
+  "Codex failure speech must not invite Realtime to compose from the request",
 );
 assert.doesNotMatch(
   failureSpeech?.response?.instructions || "",
@@ -9183,12 +9188,299 @@ assert.deepEqual(
 assert.equal(
   lockedThreadSettings({
     model: "gpt-5.6-sol",
-    reasoningEffort: "xhigh",
+    reasoningEffort: "medium",
     serviceTier: "priority",
-  }).serviceTier,
-  "priority",
-  "the next-turn settings lock must retain the Fast service tier",
+  }).effort,
+  "medium",
+  "the next-turn settings lock must preserve every runtime-supported thinking level",
 );
+
+const inheritedXHigh = resolveVoiceTurnProfileSelection(
+  {
+    model: "inherit",
+    reasoningEffort: "inherit",
+    serviceTier: null,
+  },
+  {
+    model: "gpt-5.6-sol",
+    reasoningEffort: "xhigh",
+    serviceTier: "default",
+  },
+);
+const inheritedMedium = resolveVoiceTurnProfileSelection(
+  {
+    model: "inherit",
+    reasoningEffort: "inherit",
+    serviceTier: null,
+  },
+  {
+    model: "gpt-5.6-sol",
+    reasoningEffort: "medium",
+    serviceTier: "default",
+  },
+);
+assert.equal(inheritedXHigh.reasoningEffort, "xhigh");
+assert.equal(inheritedMedium.reasoningEffort, "medium");
+assert.equal(inheritedMedium.provenance.reasoningEffort, "inherit");
+assert.notEqual(
+  inheritedXHigh.reasoningEffort,
+  inheritedMedium.reasoningEffort,
+  "inherited Voice settings must re-resolve the current host config without caching",
+);
+const explicitMedium = resolveVoiceTurnProfileSelection(
+  {
+    model: "gpt-5.6-sol",
+    reasoningEffort: "medium",
+    serviceTier: null,
+  },
+  {
+    model: "gpt-5.6-sol",
+    reasoningEffort: "xhigh",
+    serviceTier: "default",
+  },
+);
+assert.equal(explicitMedium.reasoningEffort, "medium");
+assert.equal(explicitMedium.provenance.reasoningEffort, "explicit");
+const fastOnProfile = resolveVoiceTurnProfileSelection(
+  { model: "inherit", reasoningEffort: "inherit", serviceTier: "priority" },
+  { model: "gpt-5.6-sol", reasoningEffort: "xhigh", serviceTier: "default" },
+);
+const fastOffProfile = resolveVoiceTurnProfileSelection(
+  { model: "inherit", reasoningEffort: "inherit", serviceTier: null },
+  { model: "gpt-5.6-sol", reasoningEffort: "xhigh", serviceTier: "default" },
+);
+const fastOffInheritedPriority = resolveVoiceTurnProfileSelection(
+  { model: "inherit", reasoningEffort: "inherit", serviceTier: null },
+  { model: "gpt-5.6-sol", reasoningEffort: "xhigh", serviceTier: "priority" },
+);
+assert.equal(fastOnProfile.serviceTier, "priority");
+assert.equal(fastOffProfile.serviceTier, null);
+assert.equal(fastOffProfile.expectedServiceTier, null);
+assert.equal(fastOffProfile.provenance.serviceTier, "inherit");
+assert.equal(
+  fastOffInheritedPriority.serviceTier,
+  null,
+  "Fast off must clear the Voice priority override even when the host default is priority",
+);
+assert.equal(
+  fastOffInheritedPriority.expectedServiceTier,
+  "priority",
+  "Fast off must validate the freshly inherited host tier rather than a cached Voice override",
+);
+
+const appliedProfileRequests = [];
+const appliedProfileClient = {
+  streamGeneration: 7,
+  environmentId: "profile-test",
+  async request(method, params) {
+    appliedProfileRequests.push({ method, params });
+    if (method === "thread/read") {
+      return { thread: { id: "thread-existing", turns: [] } };
+    }
+    if (method === "thread/resume") {
+      return {
+        thread: { id: "thread-existing", turns: [] },
+        model: "gpt-5.6-sol",
+        reasoningEffort: "medium",
+        serviceTier: null,
+      };
+    }
+    if (method === "turn/start") return { turn: { id: "turn-medium" } };
+    return {};
+  },
+};
+const appliedProfileDispatcher = new RemoteControlCommandDispatcher({
+  client: appliedProfileClient,
+  cwd: "/tmp/voice-relay-applied-profile-test",
+  model: "gpt-5.6-sol",
+  reasoningEffort: "xhigh",
+  serviceTier: "priority",
+});
+await appliedProfileDispatcher.updateThreadSettings(
+  {
+    conversationId: "thread-existing",
+    threadSettings: lockedThreadSettings({
+      model: "gpt-5.6-sol",
+      reasoningEffort: "medium",
+      serviceTier: null,
+      expectedServiceTier: null,
+    }),
+  },
+  { timeoutMs: 1_000 },
+);
+await appliedProfileDispatcher.sendFollowup(
+  {
+    conversationId: "thread-existing",
+    prompt: "profile test",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "medium",
+    serviceTier: null,
+  },
+  { timeoutMs: 1_000 },
+);
+const appliedMethods = appliedProfileRequests.map(request => request.method);
+assert.ok(
+  appliedMethods.indexOf("thread/settings/update")
+    < appliedMethods.indexOf("thread/resume")
+    && appliedMethods.indexOf("thread/resume")
+      < appliedMethods.indexOf("turn/start"),
+  "an existing Voice task must apply, verify, then start the requested profile",
+);
+const clearedSettingsRequest = appliedProfileRequests.find(
+  request => request.method === "thread/settings/update",
+);
+const clearedTurnRequest = appliedProfileRequests.find(
+  request => request.method === "turn/start",
+);
+assert.equal(clearedSettingsRequest?.params?.effort, "medium");
+assert.equal(clearedSettingsRequest?.params?.serviceTier, null);
+assert.equal(clearedTurnRequest?.params?.effort, "medium");
+assert.equal(clearedTurnRequest?.params?.serviceTier, null);
+assert.equal(
+  appliedProfileRequests.some(request =>
+    request.params?.serviceTier === "priority"
+  ),
+  false,
+  "Fast off must not leak a stale priority request",
+);
+
+const mismatchedProfileRequests = [];
+const mismatchedProfileDispatcher = new RemoteControlCommandDispatcher({
+  client: {
+    streamGeneration: 8,
+    environmentId: "profile-mismatch-test",
+    async request(method, params) {
+      mismatchedProfileRequests.push({ method, params });
+      if (method === "thread/read") {
+        return { thread: { id: "thread-mismatch", turns: [] } };
+      }
+      if (method === "thread/resume") {
+        return {
+          thread: { id: "thread-mismatch", turns: [] },
+          model: "gpt-5.6-sol",
+          reasoningEffort: "xhigh",
+          serviceTier: "priority",
+        };
+      }
+      return {};
+    },
+  },
+  cwd: "/tmp/voice-relay-profile-mismatch-test",
+});
+await assert.rejects(
+  mismatchedProfileDispatcher.updateThreadSettings(
+    {
+      conversationId: "thread-mismatch",
+      threadSettings: lockedThreadSettings({
+        model: "gpt-5.6-sol",
+        reasoningEffort: "medium",
+        serviceTier: null,
+      }),
+    },
+    { timeoutMs: 1_000 },
+  ),
+  error =>
+    error?.code === "APP_REMOTE_PROFILE_MISMATCH"
+    && /expected gpt-5\.6-sol\/medium\/default/u.test(error.message)
+    && /actual gpt-5\.6-sol\/xhigh\/priority/u.test(error.message),
+  "a profile mismatch must fail before prompt dispatch with expected and actual values",
+);
+assert.equal(
+  mismatchedProfileRequests.some(request =>
+    request.method === "turn/start" || request.method === "turn/steer"
+  ),
+  false,
+  "an unapplied profile must never dispatch or steer a user prompt",
+);
+
+const busyRootRequests = [];
+const busyRootDispatcher = new RemoteControlCommandDispatcher({
+  client: {
+    streamGeneration: 9,
+    environmentId: "busy-root-test",
+    async request(method, params) {
+      busyRootRequests.push({ method, params });
+      if (method === "thread/read") {
+        return {
+          thread: {
+            id: "thread-busy-root",
+            turns: [{ id: "turn-active", status: "inProgress" }],
+          },
+        };
+      }
+      return {};
+    },
+  },
+  cwd: "/tmp/voice-relay-busy-root-test",
+});
+await assert.rejects(
+  busyRootDispatcher.sendFollowup(
+    {
+      conversationId: "thread-busy-root",
+      prompt: "new root request",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "medium",
+      serviceTier: null,
+    },
+    { timeoutMs: 1_000 },
+  ),
+  error => error?.code === "APP_REMOTE_BUSY" && error?.preDispatch === true,
+  "a root ask must fail busy instead of becoming a profile-less steer",
+);
+assert.equal(
+  busyRootRequests.some(request => request.method === "turn/steer"),
+  false,
+  "only the dedicated correction path may steer an active turn",
+);
+
+const acceptedProfileFixtureRoot = fs.mkdtempSync(
+  path.join(os.tmpdir(), "voice-relay-accepted-profile-"),
+);
+try {
+  const acceptedProfileSession = path.join(
+    acceptedProfileFixtureRoot,
+    "session.jsonl",
+  );
+  fs.writeFileSync(
+    acceptedProfileSession,
+    `${JSON.stringify({
+      type: "turn_context",
+      payload: {
+        turn_id: "turn-accepted-profile",
+        model: "gpt-5.6-sol",
+        effort: "xhigh",
+        approval_policy: "never",
+        sandbox_policy: { type: "danger-full-access" },
+      },
+    })}\n`,
+  );
+  const acceptedProfileBackend = new CodexAppRemoteBackend({
+    invokeCommand: async () => ({}),
+    model: "gpt-5.6-sol",
+    reasoningEffort: "xhigh",
+  });
+  assert.throws(
+    () => acceptedProfileBackend.assertAcceptedTurnProfile(
+      {
+        sessionFile: acceptedProfileSession,
+        turnId: "turn-accepted-profile",
+      },
+      {
+        model: "gpt-5.6-sol",
+        reasoningEffort: "medium",
+        serviceTier: null,
+        expectedServiceTier: null,
+      },
+    ),
+    error =>
+      error?.code === "APP_REMOTE_ACCEPTED_PROFILE_MISMATCH"
+      && /expected gpt-5\.6-sol\/medium/u.test(error.message)
+      && /actual gpt-5\.6-sol\/xhigh/u.test(error.message),
+    "accepted validation must use the immutable dispatch snapshot and report both profiles",
+  );
+} finally {
+  fs.rmSync(acceptedProfileFixtureRoot, { recursive: true, force: true });
+}
 
 const profileRequests = [];
 const profileClient = {
@@ -9196,7 +9488,12 @@ const profileClient = {
   async request(method, params) {
     profileRequests.push({ method, params });
     if (method === "thread/start") {
-      return { thread: { id: "thread-profile" } };
+      return {
+        thread: { id: "thread-profile" },
+        model: "gpt-5.6-sol",
+        reasoningEffort: "xhigh",
+        serviceTier: "priority",
+      };
     }
     if (method === "turn/start") {
       return { turn: { id: "turn-profile" } };

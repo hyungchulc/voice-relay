@@ -709,14 +709,31 @@ require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'serviceTier: liveSettings.codexFastMode ? "priority" : nil' \
   "subsequent Voice Relay Codex requests must map Fast mode to priority"
+require_count \
+  "$ROOT/Sources/CodexAppRemoteClient.swift" \
+  'params["serviceTier"] = options.serviceTier ?? NSNull()' \
+  2 \
+  "Fast off must cross both Swift helper boundaries as an explicit null"
 require_text \
   "$ROOT/Helpers/voice-relay-app-remote.mjs" \
-  'serviceTier: normalizeServiceTier(params.serviceTier)' \
-  "the helper must propagate the selected service tier into session creation"
+  'resolveVoiceTurnProfileSelection' \
+  "the helper must resolve explicit and inherited profile provenance per request"
+require_text \
+  "$ROOT/Support/CodexRemote/src/codex-app-remote.js" \
+  '"thread/settings/update"' \
+  "the Remote dispatcher must apply profile settings before starting a turn"
 require_text \
   "$ROOT/Support/CodexRemote/src/codex-app-remote.js" \
   'serviceTier: settings.serviceTier' \
   "the Remote dispatcher must propagate the selected service tier into turn creation"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'This response is playback of a bounded failure notice only.' \
+  "Codex failures must use deterministic exact playback"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'Give one brief natural notice that this request could not be completed' \
+  "Codex failures must not invite Realtime to invent an answer"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'prewarmVoiceBackend()' \
@@ -4047,12 +4064,8 @@ require_text \
   "runtime provider dispatch must not repeat strict Settings-save validation"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'Give one brief natural notice that this request could not be completed and invite the user to try again.' \
-  "Codex failure speech must use one English semantic generation contract"
-reject_text \
-  "$ROOT/Sources/DirectRealtimeController.swift" \
-  '"I couldn'\''t complete that request. Please try again."' \
-  "Codex failure speech must not restore an exact English reply candidate"
+  'const failureNotice = "That request couldn'\''t be completed. Please try again.";' \
+  "Codex failure speech must use one sanitized deterministic notice"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'If status is error, give one short friendly retry suggestion' \

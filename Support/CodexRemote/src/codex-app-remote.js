@@ -4,7 +4,6 @@ import path from "node:path";
 import { CodexDesktopCdp } from "./codex-cdp.js";
 import {
   normalizeModelForConfig,
-  normalizeReasoningForConfig,
 } from "./codex-control-command.js";
 import {
   CodexRemoteControlClient,
@@ -229,6 +228,8 @@ export class CodexAppRemoteBackend {
     model = "gpt-5.6-sol",
     reasoningEffort = "xhigh",
     serviceTier = null,
+    expectedServiceTier = serviceTier,
+    profileProvenance = null,
     statePath = "",
     invokeCommand = null,
     streamReplies = streamCodexReplies,
@@ -243,6 +244,10 @@ export class CodexAppRemoteBackend {
     this.model = normalizeModelForConfig(model) || "gpt-5.6-sol";
     this.reasoningEffort = normalizeReasoningForConfig(reasoningEffort) || "xhigh";
     this.serviceTier = normalizeServiceTierForConfig(serviceTier);
+    this.expectedServiceTier = normalizeServiceTierForConfig(
+      expectedServiceTier,
+    );
+    this.profileProvenance = normalizeProfileProvenance(profileProvenance);
     this.statePath = statePath;
     this.threadId = String(threadId || restoredState?.threadId || "").trim();
     this.streamReplies = streamReplies;
@@ -510,6 +515,13 @@ export class CodexAppRemoteBackend {
     const prompt = `${prefix}[${requestTag}: ${requestId}]\n${body}`.trim();
     const sinceMs = this.now();
     const acceptance = createDeferred();
+    const dispatchProfile = immutableDispatchProfile({
+      model: this.model,
+      reasoningEffort: this.reasoningEffort,
+      serviceTier: this.serviceTier,
+      expectedServiceTier: this.expectedServiceTier,
+      provenance: this.profileProvenance,
+    });
     const lifecycle = {
       requestId,
       threadId: this.threadId || null,
@@ -526,6 +538,7 @@ export class CodexAppRemoteBackend {
       phase: "preparing",
       acceptance,
       exactBinding,
+      dispatchProfile,
     };
     const streamAbortController = new AbortController();
     let replyPromise = null;
@@ -545,7 +558,7 @@ export class CodexAppRemoteBackend {
             requestId,
           });
         }
-        this.assertAcceptedTurnProfile(evidence);
+        this.assertAcceptedTurnProfile(evidence, dispatchProfile);
       } catch (error) {
         lifecycle.cancelRequested = true;
         lifecycle.terminalError = error;
@@ -586,7 +599,7 @@ export class CodexAppRemoteBackend {
     };
     this.activeTurn = lifecycle;
     try {
-      await this.assertProfileAvailable();
+      await this.assertProfileAvailable(dispatchProfile);
       this.throwIfCancelled(lifecycle);
       const threadId = await this.submitPrompt(prompt, inputItems, lifecycle, {
         onDispatching: startReplyStream,
@@ -653,9 +666,22 @@ export class CodexAppRemoteBackend {
     lifecycle = this.activeTurn,
     { onDispatching = null } = {},
   ) {
+    const dispatchProfile = lifecycle?.dispatchProfile
+      || immutableDispatchProfile({
+        model: this.model,
+        reasoningEffort: this.reasoningEffort,
+        serviceTier: this.serviceTier,
+        expectedServiceTier: this.expectedServiceTier,
+        provenance: this.profileProvenance,
+      });
     if (!this.threadId) {
       if (lifecycle?.exactBinding) throw exactAppBindingError("wrong_thread");
-      return this.startNewConversation(prompt, inputItems, lifecycle);
+      return this.startNewConversation(
+        prompt,
+        inputItems,
+        lifecycle,
+        dispatchProfile,
+      );
     }
 
     lifecycle.phase = "resuming";
@@ -669,15 +695,24 @@ export class CodexAppRemoteBackend {
       this.threadId = "";
       lifecycle.threadId = null;
       this.persistStateBestEffort();
-      return this.startNewConversation(prompt, inputItems, lifecycle);
+      return this.startNewConversation(
+        prompt,
+        inputItems,
+        lifecycle,
+        dispatchProfile,
+      );
     }
     this.throwIfCancelled(lifecycle);
     if (lifecycle?.exactBinding) {
       await this.refreshExactAppBinding(lifecycle.exactBinding, resumeResult);
       this.throwIfCancelled(lifecycle);
+    } else if (normalizeSessionId(resumeResult?.activeTurnId)) {
+      throw appRemoteBusyError(
+        "The Voice task already has an active turn; the new request was not dispatched",
+      );
     }
     lifecycle.phase = "locking_profile";
-    await this.lockThreadSettingsForNextTurn();
+    await this.lockThreadSettingsForNextTurn(dispatchProfile);
     this.throwIfCancelled(lifecycle);
     lifecycle.phase = "dispatching";
     onDispatching?.(this.threadId);
@@ -687,9 +722,9 @@ export class CodexAppRemoteBackend {
         hostId: "local",
         conversationId: this.threadId,
         prompt,
-        model: this.model,
-        reasoningEffort: this.reasoningEffort,
-        serviceTier: this.serviceTier,
+        model: dispatchProfile.model,
+        reasoningEffort: dispatchProfile.reasoningEffort,
+        serviceTier: dispatchProfile.serviceTier,
         messageMetadata: { source: "voice_relay_remote" },
         inputItems: normalizeAppInputItems(inputItems),
         ...(lifecycle?.exactBinding?.expectedClosedTurnId
@@ -711,7 +746,12 @@ export class CodexAppRemoteBackend {
     return this.threadId;
   }
 
-  async startNewConversation(prompt, inputItems, lifecycle) {
+  async startNewConversation(
+    prompt,
+    inputItems,
+    lifecycle,
+    dispatchProfile = lifecycle?.dispatchProfile,
+  ) {
     this.throwIfCancelled(lifecycle);
     lifecycle.phase = "dispatching";
     const threadId = await this.invokeCommand(
@@ -719,9 +759,10 @@ export class CodexAppRemoteBackend {
       startConversationParams({
         prompt,
         cwd: this.cwd,
-        model: this.model,
-        reasoningEffort: this.reasoningEffort,
-        serviceTier: this.serviceTier,
+        model: dispatchProfile.model,
+        reasoningEffort: dispatchProfile.reasoningEffort,
+        serviceTier: dispatchProfile.serviceTier,
+        expectedServiceTier: dispatchProfile.expectedServiceTier,
         inputItems,
       }),
       { timeoutMs: 60_000 },
@@ -758,15 +799,24 @@ export class CodexAppRemoteBackend {
     );
   }
 
-  async lockThreadSettingsForNextTurn() {
+  async lockThreadSettingsForNextTurn(
+    dispatchProfile = immutableDispatchProfile({
+      model: this.model,
+      reasoningEffort: this.reasoningEffort,
+      serviceTier: this.serviceTier,
+      expectedServiceTier: this.expectedServiceTier,
+      provenance: this.profileProvenance,
+    }),
+  ) {
     return this.invokeCommand(
       "update-thread-settings-for-next-turn",
       {
         conversationId: this.threadId,
         threadSettings: lockedThreadSettings({
-          model: this.model,
-          reasoningEffort: this.reasoningEffort,
-          serviceTier: this.serviceTier,
+          model: dispatchProfile.model,
+          reasoningEffort: dispatchProfile.reasoningEffort,
+          serviceTier: dispatchProfile.serviceTier,
+          expectedServiceTier: dispatchProfile.expectedServiceTier,
         }),
       },
       { timeoutMs: 60_000 },
@@ -1321,9 +1371,6 @@ export class CodexAppRemoteBackend {
     if (!this.statePath) return;
     const state = {
       threadId: this.threadId || null,
-      model: this.model,
-      reasoningEffort: this.reasoningEffort,
-      serviceTier: this.serviceTier,
       backend: "app-remote",
       updatedAt: new Date(this.now()).toISOString(),
     };
@@ -1361,7 +1408,15 @@ export class CodexAppRemoteBackend {
     }
   }
 
-  async assertProfileAvailable() {
+  async assertProfileAvailable(
+    dispatchProfile = immutableDispatchProfile({
+      model: this.model,
+      reasoningEffort: this.reasoningEffort,
+      serviceTier: this.serviceTier,
+      expectedServiceTier: this.expectedServiceTier,
+      provenance: this.profileProvenance,
+    }),
+  ) {
     let result;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
@@ -1384,35 +1439,49 @@ export class CodexAppRemoteBackend {
         );
       }
     }
-    const configured = findModelProfile(result, this.model);
+    const configured = findModelProfile(result, dispatchProfile.model);
     const availableEfforts = supportedReasoningEfforts(configured);
     const availableServiceTiers = supportedServiceTierIDs(configured);
     if (
       !configured
-      || !availableEfforts.includes(this.reasoningEffort)
-      || (this.serviceTier && !availableServiceTiers.includes(this.serviceTier))
+      || !availableEfforts.includes(dispatchProfile.reasoningEffort)
+      || (dispatchProfile.serviceTier
+        && !availableServiceTiers.includes(dispatchProfile.serviceTier))
     ) {
       throw new Error(
-        `Configured app Remote profile is unavailable: ${this.model}/${this.reasoningEffort}/${this.serviceTier || "default"}`,
+        `Configured app Remote profile is unavailable: ${dispatchProfile.model}/${dispatchProfile.reasoningEffort}/${dispatchProfile.serviceTier || "default"}`,
       );
     }
   }
 
-  assertAcceptedTurnProfile({ sessionFile, turnId } = {}) {
+  assertAcceptedTurnProfile(
+    { sessionFile, turnId } = {},
+    dispatchProfile = immutableDispatchProfile({
+      model: this.model,
+      reasoningEffort: this.reasoningEffort,
+      serviceTier: this.serviceTier,
+      expectedServiceTier: this.expectedServiceTier,
+      provenance: this.profileProvenance,
+    }),
+  ) {
     const context = readTurnContext(sessionFile, turnId);
     if (!context) throw new Error("Accepted app Remote turn context was not found");
     const actualSandbox = context.sandbox_policy?.type;
     if (
-      context.model !== this.model ||
-      context.effort !== this.reasoningEffort ||
+      context.model !== dispatchProfile.model ||
+      context.effort !== dispatchProfile.reasoningEffort ||
       context.approval_policy !== "never" ||
       actualSandbox !== "danger-full-access"
     ) {
-      throw new Error(
-        `Accepted app Remote turn profile mismatch: ${context.model}/${context.effort}/${
-          context.approval_policy
-        }/${actualSandbox}`,
-      );
+      throw acceptedTurnProfileMismatchError({
+        expected: dispatchProfile,
+        actual: {
+          model: context.model,
+          reasoningEffort: context.effort,
+          approvalPolicy: context.approval_policy,
+          sandbox: actualSandbox,
+        },
+      });
     }
   }
 }
@@ -1458,7 +1527,7 @@ export class RemoteControlCommandDispatcher {
       case "probe-thread-residency":
         return this.probeThreadResidency(params, { timeoutMs });
       case "update-thread-settings-for-next-turn":
-        return this.updateThreadSettings(params);
+        return this.updateThreadSettings(params, { timeoutMs });
       case "send-follow-up-message":
         return this.sendFollowup(params, {
           timeoutMs,
@@ -1493,9 +1562,9 @@ export class RemoteControlCommandDispatcher {
     const reasoningEffort =
       normalizeReasoningForConfig(params.reasoningEffort) ||
       this.defaultReasoningEffort;
-    const serviceTier =
-      normalizeServiceTierForConfig(params.serviceTier)
-      ?? this.defaultServiceTier;
+    const serviceTier = Object.hasOwn(params, "serviceTier")
+      ? normalizeServiceTierForConfig(params.serviceTier)
+      : this.defaultServiceTier;
     const cwd = firstWorkspaceRoot(params.workspaceRoots) || this.cwd;
     const residency = this.currentThreadResidency({
       threadId,
@@ -1657,7 +1726,7 @@ export class RemoteControlCommandDispatcher {
     };
   }
 
-  currentThreadResidency({ threadId, model, reasoningEffort, cwd }) {
+  currentThreadResidency({ threadId, cwd }) {
     const residency = this.threadResidencyById.get(threadId);
     const streamGeneration = normalizedRemoteStreamGeneration(
       this.client.streamGeneration,
@@ -1667,8 +1736,6 @@ export class RemoteControlCommandDispatcher {
       streamGeneration === null ||
       residency.streamGeneration !== streamGeneration ||
       residency.environmentId !== nonEmptyString(this.client.environmentId) ||
-      residency.model !== model ||
-      residency.reasoningEffort !== reasoningEffort ||
       residency.cwd !== cwd
     ) {
       return null;
@@ -1678,8 +1745,6 @@ export class RemoteControlCommandDispatcher {
 
   markThreadResident({
     threadId,
-    model,
-    reasoningEffort,
     cwd,
     threadSource = "",
   }) {
@@ -1694,8 +1759,6 @@ export class RemoteControlCommandDispatcher {
       threadId,
       streamGeneration,
       environmentId: nonEmptyString(this.client.environmentId),
-      model,
-      reasoningEffort,
       cwd,
       threadSource: nonEmptyString(threadSource) || "remote-control",
       establishedAtMs: this.now(),
@@ -1758,7 +1821,7 @@ export class RemoteControlCommandDispatcher {
     };
   }
 
-  updateThreadSettings(params) {
+  async updateThreadSettings(params, { timeoutMs }) {
     const threadId = requiredString(
       params.conversationId,
       "Remote controller conversation id",
@@ -1769,11 +1832,51 @@ export class RemoteControlCommandDispatcher {
       this.defaultReasoningEffort,
       this.defaultServiceTier,
     );
+    const before = await this.readThread(threadId, {
+      timeoutMs,
+      phase: "pre_profile_update_reconciliation",
+    });
+    if (activeThreadTurn(before)?.id) {
+      throw appRemoteBusyError(
+        "The Voice task already has an active turn; profile settings were not changed",
+      );
+    }
+    await this.client.request(
+      "thread/settings/update",
+      {
+        threadId,
+        model: settings.model,
+        effort: settings.reasoningEffort,
+        serviceTier: settings.serviceTier,
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        permissions: ":danger-full-access",
+      },
+      { timeoutMs },
+    );
+    const resumed = await this.client.request(
+      "thread/resume",
+      { threadId, excludeTurns: true },
+      { timeoutMs },
+    );
+    const activeTurnId = normalizeSessionId(
+      activeThreadTurn(resumed?.thread)?.id,
+    );
+    if (activeTurnId) {
+      throw appRemoteBusyError(
+        "The Voice task became active before the requested profile could be dispatched",
+      );
+    }
+    assertResolvedThreadProfile({
+      expected: settings,
+      actual: resolvedThreadProfile(resumed),
+    });
     this.nextSettingsByThread.set(threadId, settings);
     return {
       status: "updated",
       threadId,
       threadSettings: settings,
+      resolvedProfile: resolvedThreadProfile(resumed),
     };
   }
 
@@ -1970,6 +2073,7 @@ export class RemoteControlCommandDispatcher {
             conversationId: threadId,
             model: settings.model,
             reasoningEffort: settings.reasoningEffort,
+            serviceTier: settings.serviceTier,
             workspaceRoots: [this.cwd],
             forceResume: true,
             requireReconciliation: true,
@@ -2019,14 +2123,8 @@ export class RemoteControlCommandDispatcher {
       });
     }
     if (reconciledActiveTurnId && !expectedClosedTurnId) {
-      return this.client.request(
-        "turn/steer",
-        {
-          threadId,
-          expectedTurnId: reconciledActiveTurnId,
-          input,
-        },
-        { timeoutMs },
+      throw appRemoteBusyError(
+        "The Voice task already has an active turn; the new root request was not dispatched",
       );
     }
     return this.client.request(
@@ -2052,9 +2150,12 @@ export class RemoteControlCommandDispatcher {
       normalizeReasoningForConfig(
         params.reasoningEffort || params.config?.model_reasoning_effort,
       ) || this.defaultReasoningEffort;
-    const serviceTier =
-      normalizeServiceTierForConfig(params.serviceTier)
-      ?? this.defaultServiceTier;
+    const serviceTier = Object.hasOwn(params, "serviceTier")
+      ? normalizeServiceTierForConfig(params.serviceTier)
+      : this.defaultServiceTier;
+    const expectedServiceTier = Object.hasOwn(params, "expectedServiceTier")
+      ? normalizeServiceTierForConfig(params.expectedServiceTier)
+      : serviceTier;
     const cwd = nonEmptyString(params.cwd) || this.cwd;
     const started = await this.client.request(
       "thread/start",
@@ -2076,10 +2177,19 @@ export class RemoteControlCommandDispatcher {
     if (!threadId) {
       throw new Error("Remote controller thread/start did not return a thread id");
     }
+    assertResolvedThreadProfile({
+      expected: {
+        model,
+        reasoningEffort,
+        expectedServiceTier,
+      },
+      actual: resolvedThreadProfile(started),
+    });
     this.nextSettingsByThread.set(threadId, {
       model,
       reasoningEffort,
       serviceTier,
+      expectedServiceTier,
       approvalPolicy: "never",
       sandbox: "danger-full-access",
     });
@@ -2148,9 +2258,9 @@ export class RemoteControlCommandDispatcher {
     const reasoningEffort =
       normalizeReasoningForConfig(params.reasoningEffort) ||
       this.defaultReasoningEffort;
-    const serviceTier =
-      normalizeServiceTierForConfig(params.serviceTier)
-      ?? this.defaultServiceTier;
+    const serviceTier = Object.hasOwn(params, "serviceTier")
+      ? normalizeServiceTierForConfig(params.serviceTier)
+      : this.defaultServiceTier;
     const catalog = await this.client.request(
       "model/list",
       { cursor: null, includeHidden: true, limit: 100 },
@@ -2404,10 +2514,11 @@ export class RemoteControlCommandDispatcher {
         normalizeReasoningForConfig(
           params.reasoningEffort || stored.reasoningEffort,
         ) || this.defaultReasoningEffort,
-      serviceTier:
-        normalizeServiceTierForConfig(
-          params.serviceTier ?? stored.serviceTier,
-        ) ?? this.defaultServiceTier,
+      serviceTier: Object.hasOwn(params, "serviceTier")
+        ? normalizeServiceTierForConfig(params.serviceTier)
+        : Object.hasOwn(stored, "serviceTier")
+          ? normalizeServiceTierForConfig(stored.serviceTier)
+          : this.defaultServiceTier,
     };
   }
 }
@@ -2418,6 +2529,7 @@ export function startConversationParams({
   model,
   reasoningEffort,
   serviceTier = null,
+  expectedServiceTier = serviceTier,
   inputItems = null,
 }) {
   return {
@@ -2435,6 +2547,7 @@ export function startConversationParams({
     model,
     reasoningEffort,
     serviceTier: normalizeServiceTierForConfig(serviceTier),
+    expectedServiceTier: normalizeServiceTierForConfig(expectedServiceTier),
     config: { model, model_reasoning_effort: reasoningEffort },
     permissions: FULL_ACCESS_PERMISSIONS,
     approvalsReviewer: "user",
@@ -2543,11 +2656,13 @@ export function lockedThreadSettings({
   model,
   reasoningEffort,
   serviceTier = null,
+  expectedServiceTier = serviceTier,
 } = {}) {
   return {
     model: normalizeModelForConfig(model) || "gpt-5.6-sol",
     effort: normalizeReasoningForConfig(reasoningEffort) || "xhigh",
     serviceTier: normalizeServiceTierForConfig(serviceTier),
+    expectedServiceTier: normalizeServiceTierForConfig(expectedServiceTier),
     approvalPolicy: "never",
     approvalsReviewer: "user",
     permissions: ":danger-full-access",
@@ -2636,6 +2751,10 @@ function normalizeLockedSettings(
   fallbackReasoningEffort,
   fallbackServiceTier = null,
 ) {
+  const hasServiceTier = Object.hasOwn(Object(settings), "serviceTier");
+  const serviceTier = hasServiceTier
+    ? normalizeServiceTierForConfig(settings.serviceTier)
+    : normalizeServiceTierForConfig(fallbackServiceTier);
   return {
     model:
       normalizeModelForConfig(settings?.model) ||
@@ -2647,9 +2766,13 @@ function normalizeLockedSettings(
       ) ||
       normalizeReasoningForConfig(fallbackReasoningEffort) ||
       "xhigh",
-    serviceTier:
-      normalizeServiceTierForConfig(settings?.serviceTier)
-      ?? normalizeServiceTierForConfig(fallbackServiceTier),
+    serviceTier,
+    expectedServiceTier: Object.hasOwn(
+      Object(settings),
+      "expectedServiceTier",
+    )
+      ? normalizeServiceTierForConfig(settings.expectedServiceTier)
+      : serviceTier,
     approvalPolicy: "never",
     sandbox: "danger-full-access",
   };
@@ -2657,6 +2780,81 @@ function normalizeLockedSettings(
 
 export function normalizeServiceTierForConfig(value) {
   return String(value || "").trim() === "priority" ? "priority" : null;
+}
+
+export function resolveVoiceTurnProfileSelection(
+  request = {},
+  hostConfig = {},
+) {
+  const requestedModel = String(request.model || "inherit").trim();
+  const requestedReasoningEffort = String(
+    request.reasoningEffort || "inherit",
+  ).trim();
+  const modelInherited = !requestedModel || requestedModel === "inherit";
+  const reasoningInherited =
+    !requestedReasoningEffort || requestedReasoningEffort === "inherit";
+  const fastModeEnabled =
+    normalizeServiceTierForConfig(request.serviceTier) === "priority";
+  return Object.freeze({
+    model: normalizeModelForConfig(
+      modelInherited ? hostConfig.model : requestedModel,
+    ),
+    reasoningEffort: normalizeReasoningForConfig(
+      reasoningInherited
+        ? hostConfig.reasoningEffort
+        : requestedReasoningEffort,
+    ),
+    serviceTier: fastModeEnabled ? "priority" : null,
+    expectedServiceTier: fastModeEnabled
+      ? "priority"
+      : normalizeServiceTierForConfig(hostConfig.serviceTier),
+    provenance: Object.freeze({
+      model: modelInherited ? "inherit" : "explicit",
+      reasoningEffort: reasoningInherited ? "inherit" : "explicit",
+      serviceTier: fastModeEnabled ? "explicit" : "inherit",
+    }),
+  });
+}
+
+function normalizeReasoningForConfig(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/gu, " ")
+    .replace(/\s+/gu, " ");
+  if (!normalized || normalized === "inherit") return "";
+  if (normalized === "extra high" || normalized === "extrahigh") {
+    return "xhigh";
+  }
+  const token = normalized.replace(/\s+/gu, "");
+  return /^[a-z][a-z0-9]{0,31}$/u.test(token) ? token : "";
+}
+
+function normalizeProfileProvenance(value) {
+  return Object.freeze({
+    model: value?.model === "inherit" ? "inherit" : "explicit",
+    reasoningEffort:
+      value?.reasoningEffort === "inherit" ? "inherit" : "explicit",
+    serviceTier:
+      value?.serviceTier === "inherit" ? "inherit" : "explicit",
+  });
+}
+
+function immutableDispatchProfile({
+  model,
+  reasoningEffort,
+  serviceTier = null,
+  expectedServiceTier = serviceTier,
+  provenance = null,
+} = {}) {
+  return Object.freeze({
+    model: normalizeModelForConfig(model) || "gpt-5.6-sol",
+    reasoningEffort:
+      normalizeReasoningForConfig(reasoningEffort) || "xhigh",
+    serviceTier: normalizeServiceTierForConfig(serviceTier),
+    expectedServiceTier: normalizeServiceTierForConfig(expectedServiceTier),
+    provenance: normalizeProfileProvenance(provenance),
+  });
 }
 
 function firstWorkspaceRoot(value) {
@@ -2869,6 +3067,64 @@ function exactAppBindingError(reason) {
   const error = new Error(`Codex app Remote exact task binding failed: ${reason}`);
   error.code = "APP_REMOTE_EXACT_TASK_MISMATCH";
   error.reason = reason;
+  return error;
+}
+
+function appRemoteBusyError(message) {
+  const error = new Error(message);
+  error.code = "APP_REMOTE_BUSY";
+  error.preDispatch = true;
+  return error;
+}
+
+function resolvedThreadProfile(response) {
+  return {
+    model: nonEmptyString(response?.model) || "unknown",
+    reasoningEffort:
+      nonEmptyString(response?.reasoningEffort) || "unknown",
+    serviceTier: nonEmptyString(response?.serviceTier) || null,
+  };
+}
+
+function assertResolvedThreadProfile({ expected, actual }) {
+  const expectedServiceTier = normalizeServiceTierForConfig(
+    Object.hasOwn(Object(expected), "expectedServiceTier")
+      ? expected.expectedServiceTier
+      : expected.serviceTier,
+  );
+  const actualServiceTier = normalizeServiceTierForConfig(actual.serviceTier);
+  if (
+    actual.model === expected.model
+    && actual.reasoningEffort === expected.reasoningEffort
+    && actualServiceTier === expectedServiceTier
+  ) {
+    return;
+  }
+  const error = new Error(
+    "Codex app Remote profile was not applied before dispatch: "
+      + `expected ${expected.model}/${expected.reasoningEffort}/${expectedServiceTier || "default"}; `
+      + `actual ${actual.model}/${actual.reasoningEffort}/${actual.serviceTier || "default"}`,
+  );
+  error.code = "APP_REMOTE_PROFILE_MISMATCH";
+  error.preDispatch = true;
+  error.expectedProfile = {
+    model: expected.model,
+    reasoningEffort: expected.reasoningEffort,
+    serviceTier: expectedServiceTier,
+  };
+  error.actualProfile = actual;
+  throw error;
+}
+
+function acceptedTurnProfileMismatchError({ expected, actual }) {
+  const error = new Error(
+    "Accepted app Remote turn profile mismatch: "
+      + `expected ${expected.model}/${expected.reasoningEffort}/never/danger-full-access; `
+      + `actual ${actual.model}/${actual.reasoningEffort}/${actual.approvalPolicy}/${actual.sandbox}`,
+  );
+  error.code = "APP_REMOTE_ACCEPTED_PROFILE_MISMATCH";
+  error.expectedProfile = expected;
+  error.actualProfile = actual;
   return error;
 }
 

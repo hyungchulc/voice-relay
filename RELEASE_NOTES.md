@@ -1,13 +1,12 @@
-This alpha separates session transport from microphone input and adds supported Codex profile controls to Settings.
+This alpha makes the Voice Relay Codex profile selected in Settings authoritative for the next actual turn.
 
-- The expanded overlay now keeps exactly three controls in order: Settings, microphone input, and Play or Stop.
-- Microphone mute stops capture and recognition without stopping playback, the active voice session, or the current Codex task, and unmute resumes the appropriate input path.
-- Settings now persist Model, Thinking level, and Fast mode selections discovered from the live Codex capability surface.
-- Unsupported profile combinations fail closed, while Fast mode maps to the supported accelerated service tier and the default path omits any tier override.
-- Selected profile values propagate through task preparation, session resume, new turns, and same-task follow-ups instead of remaining UI-only state.
-- Accepted same-turn corrections now form an exact response-revision boundary, so an obsolete pending final cannot be combined with corrected post-steer finals while multiple distinct finals from the corrected revision remain ordered and exactly once.
-- Collapsed notch and answer content now yield cleanly during Settings-driven overlay rebuilds instead of producing Auto Layout constraint conflicts.
-- Regression coverage protects control ordering, independent microphone state, preference persistence, capability gating, and actual request propagation.
-- Build 37 is the signed update target for installed Voice Relay preview-channel builds.
+- Explicit Model and Thinking selections are applied and verified on the bound Voice task before a new turn is dispatched.
+- Default or Inherit re-reads the current host Codex configuration for every request instead of caching a previously resolved value.
+- Turning Fast mode off explicitly clears the Voice priority override and returns service-tier behavior to the host configuration.
+- A normal new request never becomes a profile-less steer of an already active turn; it fails busy before dispatch while the dedicated correction path remains separate.
+- Accepted-turn validation is bound to an immutable per-request profile snapshot and reports both expected and actual values if a mismatch is observed.
+- Codex failures use a sanitized deterministic playback notice, so Realtime cannot invent plausible requested content after a failed route.
+- Regression coverage protects explicit medium reasoning on an existing xhigh task, inherited config changes, priority clearing, root-versus-correction routing, and failure-speech fidelity.
+- Build 38 is the signed update target for installed Voice Relay preview-channel builds.
 
 This public build is Apple Development signed and is not notarized.

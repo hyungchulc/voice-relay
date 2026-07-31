@@ -308,16 +308,18 @@ async function ask(params, requestId) {
   try {
     const config = await remoteEffectiveConfig();
     const preferredThreadID = String(params.preferredThreadID || "").trim();
-    const model =
-      String(params.model || "").trim() === "inherit"
-        ? config.model
-        : String(params.model || config.model);
-    const reasoningEffort =
-      String(params.reasoningEffort || "").trim() === "inherit"
-        ? config.reasoningEffort
-        : String(params.reasoningEffort || config.reasoningEffort);
-    const serviceTier = normalizeServiceTier(params.serviceTier);
-    if (model === "unknown" || reasoningEffort === "unknown") {
+    const profile = backendModule.resolveVoiceTurnProfileSelection(
+      params,
+      config,
+    );
+    const {
+      model,
+      reasoningEffort,
+      serviceTier,
+      expectedServiceTier,
+      provenance: profileProvenance,
+    } = profile;
+    if (!model || !reasoningEffort) {
       const error = new Error(
         "Codex host model configuration is unavailable",
       );
@@ -333,6 +335,8 @@ async function ask(params, requestId) {
       model,
       reasoningEffort,
       serviceTier,
+      expectedServiceTier,
+      profileProvenance,
     });
     const threadID = await ensureBoundThread(
       {
@@ -341,6 +345,8 @@ async function ask(params, requestId) {
         model,
         reasoningEffort,
         serviceTier,
+        expectedServiceTier,
+        profileProvenance,
       },
       requestId,
     );
@@ -525,23 +531,23 @@ async function interrupt() {
 
 async function prepareThread(params, requestId) {
   const config = await remoteEffectiveConfig();
-  const model =
-    String(params.model || "").trim() === "inherit"
-      ? config.model
-      : String(params.model || config.model);
-  const reasoningEffort =
-    String(params.reasoningEffort || "").trim() === "inherit"
-      ? config.reasoningEffort
-      : String(params.reasoningEffort || config.reasoningEffort);
+  const profile = backendModule.resolveVoiceTurnProfileSelection(
+    params,
+    config,
+  );
+  if (!profile.model || !profile.reasoningEffort) {
+    const error = new Error("Codex host model configuration is unavailable");
+    error.code = "APP_REMOTE_CONFIG_UNAVAILABLE";
+    throw error;
+  }
   const threadID = await ensureBoundThread(
     {
       ...params,
-      model,
-      reasoningEffort,
-      serviceTier: normalizeServiceTier(params.serviceTier),
+      ...profile,
     },
     requestId,
   );
+  await backend.lockThreadSettingsForNextTurn();
   return {
     status: "ready",
     threadID,
@@ -575,6 +581,8 @@ async function ensureBackend({
   model,
   reasoningEffort,
   serviceTier,
+  expectedServiceTier = serviceTier,
+  profileProvenance = null,
 }) {
   await controller.start();
   if (!backend) {
@@ -585,6 +593,8 @@ async function ensureBackend({
       model,
       reasoningEffort,
       serviceTier,
+      expectedServiceTier,
+      profileProvenance,
       statePath: backendStatePath,
       responseTimeoutMs: 10 * 60_000,
     });
@@ -604,6 +614,8 @@ async function ensureBackend({
   backend.model = model;
   backend.reasoningEffort = reasoningEffort;
   backend.serviceTier = normalizeServiceTier(serviceTier);
+  backend.expectedServiceTier = normalizeServiceTier(expectedServiceTier);
+  backend.profileProvenance = profileProvenance;
   if (backend.commandDispatcher) {
     backend.commandDispatcher.defaultModel = model;
     backend.commandDispatcher.defaultReasoningEffort = reasoningEffort;
@@ -636,6 +648,8 @@ async function resolveBoundThread(params, requestId) {
     model: params.model,
     reasoningEffort: params.reasoningEffort,
     serviceTier: params.serviceTier,
+    expectedServiceTier: params.expectedServiceTier,
+    profileProvenance: params.profileProvenance || params.provenance,
   });
   let threadID = createNewThreadIfUnset
     ? ""
@@ -785,9 +799,13 @@ function effectiveConfig(value) {
   const approvalPolicy = String(
     source.approval_policy || source.approvalPolicy || unavailable,
   );
+  const serviceTier = String(
+    source.service_tier ?? source.serviceTier ?? "default",
+  ).trim() || "default";
   return {
     model,
     reasoningEffort,
+    serviceTier,
     sandbox,
     approvalPolicy,
     summary: `${model} · ${reasoningEffort} · ${sandbox} · ${approvalPolicy}`,
