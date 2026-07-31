@@ -661,6 +661,18 @@ require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   $'bottomActionBar.addArrangedSubview(settingsButton)\n        bottomActionBar.addArrangedSubview(microphoneButton)\n        bottomActionBar.addArrangedSubview(transportButton)' \
   "expanded controls must remain ordered Settings, microphone, then Play/Stop"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'NSLayoutConstraint.Priority(rawValue: 999)' \
+  "collapsed content constraints must yield without breaking structural layout"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  $'activityStatusLabelBottomConstraint.priority =\n                contentDependentConstraintPriority' \
+  "a hidden activity label must not conflict with the compact header height"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  $'bottomActionBarBottomConstraint.priority =\n            contentDependentConstraintPriority' \
+  "a hidden answer action bar must not conflict with the collapsed answer height"
 reject_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'private let playButton =' \

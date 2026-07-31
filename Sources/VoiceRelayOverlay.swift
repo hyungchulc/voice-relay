@@ -989,6 +989,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
     private var compactHeight: CGFloat
     private let bottomActionHeight: CGFloat = 36
+    private let contentDependentConstraintPriority =
+        NSLayoutConstraint.Priority(rawValue: 999)
     private let minAnswerHeightFloor: CGFloat = 38
     private let baseMaxAnswerHeight =
         NotchAnswerGeometry.maximumBodyHeight
@@ -1858,6 +1860,13 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
         answerHeightConstraint = answerCardView.heightAnchor.constraint(equalToConstant: 0)
         answerHeightConstraint?.isActive = true
+        let bottomActionBarBottomConstraint =
+            bottomActionBar.bottomAnchor.constraint(
+                equalTo: answerCardView.bottomAnchor,
+                constant: -4
+            )
+        bottomActionBarBottomConstraint.priority =
+            contentDependentConstraintPriority
         inputWidthConstraint = inputCardView.widthAnchor.constraint(
             equalToConstant: displayGeometry.compactWidth(for: resolvedAnchor)
         )
@@ -1933,7 +1942,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             answerScrollView.bottomAnchor.constraint(equalTo: bottomActionBar.topAnchor),
             bottomActionBar.leadingAnchor.constraint(equalTo: answerCardView.leadingAnchor, constant: 14),
             bottomActionBar.trailingAnchor.constraint(equalTo: answerCardView.trailingAnchor, constant: -14),
-            bottomActionBar.bottomAnchor.constraint(equalTo: answerCardView.bottomAnchor, constant: -4),
+            bottomActionBarBottomConstraint,
             bottomActionBar.heightAnchor.constraint(equalToConstant: bottomActionHeight),
         ])
         if resolvedAnchor == .orb,
@@ -2095,6 +2104,13 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             let notchWidth = displayGeometry.hasHardwareNotch
                 ? displayGeometry.hardwareNotchWidth
                 : 210
+            let activityStatusLabelBottomConstraint =
+                activityStatusLabel.bottomAnchor.constraint(
+                    lessThanOrEqualTo: row.bottomAnchor,
+                    constant: -NotchActivityGeometry.labelBottomPadding
+                )
+            activityStatusLabelBottomConstraint.priority =
+                contentDependentConstraintPriority
             var constraints = [
                 statusIndicatorView.centerYAnchor.constraint(equalTo: row.centerYAnchor),
                 statusIndicatorView.widthAnchor.constraint(
@@ -2118,10 +2134,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                         safeTopInset: displayGeometry.safeTopInset
                     )
                 ),
-                activityStatusLabel.bottomAnchor.constraint(
-                    lessThanOrEqualTo: row.bottomAnchor,
-                    constant: -NotchActivityGeometry.labelBottomPadding
-                ),
+                activityStatusLabelBottomConstraint,
                 notchHoverActionBar.trailingAnchor.constraint(
                     equalTo: row.trailingAnchor,
                     constant: -8
