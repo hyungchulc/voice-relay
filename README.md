@@ -39,11 +39,11 @@ key to copy, embed, or store, and no separate task-owning agent stack.
 ```text
 You speak
   |
-  +-> Immediate social or device-local request
-  |     -> OpenAI Realtime
-  |     -> native transcript and audio reply
+  +-> Closed lifecycle or device-local request
+  |     -> app-owned local action
+  |     -> OpenAI Realtime audio playback
   |
-  +-> Current, personal, analytical, or tool-using request
+  +-> Any content-bearing request
         -> short contextual handoff
         -> persistent Codex/ChatGPT desktop task
         -> app-owned tools, approvals, and session
@@ -51,10 +51,12 @@ You speak
         -> the same Realtime voice and visible surface
 ```
 
-Realtime decides the route semantically. Greetings, thanks, identity questions,
-hearing checks, and device-local time can stay direct. Personal state, current
-facts, lookups, analysis, verification, and work that may take more than about
-five seconds go to Codex. When the boundary is uncertain, Codex owns the turn.
+Realtime supplies transcription and a semantic route suggestion, but the app
+owns the execution boundary. Greetings, thanks, identity questions, stable
+knowledge, translation, and every other content-bearing turn go to Codex.
+Only closed local actions such as stop, repeat, brief session acknowledgements,
+and device-local time stay local. When the boundary is uncertain, Codex owns
+the turn.
 
 ## Compared with ChatGPT Voice in Work and Codex
 
@@ -313,16 +315,15 @@ and never print credentials or unrelated private data.
   conversation history, and collapse automatically.
 
 Realtime is the main user interface, while the Codex/ChatGPT app remains the
-task and approval owner. Greetings, thanks, configured identity questions,
-hearing checks, and current device-local time or date can stay in Realtime.
-Personal state, current facts, lookups, analysis, verification, and anything
-that may take more than about five seconds or benefit from context, tools,
-files, apps, memory, or sources are handed to the same app Remote task. When
-the boundary is uncertain, Codex owns the turn. The short spoken progress line
-describes only the action being taken and never pre-answers the request. Direct
-replies, progress lines, commentary, and returned Codex answers are displayed
-and play through the Realtime audio path. Escape or Stop interrupts both the
-Realtime session and the active app Remote turn.
+task and approval owner. Realtime may classify a completed utterance, but the
+app normalizes greetings, thanks, configured identity questions, stable
+knowledge, translation, and all other content generation to the same app
+Remote task. Only closed lifecycle actions and device-local time or date stay
+local. The short spoken progress line describes only the action being taken and
+never pre-answers the request. Local acknowledgements, progress lines,
+commentary, and returned Codex answers are displayed and play through the
+Realtime audio path. Escape or Stop interrupts both the Realtime session and
+the active app Remote turn.
 
 After completed onboarding, Realtime starts with the app instead of waiting for
 Codex Remote. The first-install greeting is persisted so an ordinary restart

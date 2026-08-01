@@ -1166,15 +1166,15 @@ require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
   'cleanupCompletion?()' \
   "an already-idle wake session must release the Realtime handoff immediately"
-reject_text \
+require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'Any factual, current-state, personal-context, device-state, external-information, calculation, or verification request must use codex.' \
-  "Realtime must not blanket-route every stable factual or arithmetic request to Codex"
+  'function normalizeExecutionRouteKind(kind)' \
+  "Realtime classifier labels must pass through one application-owned execution normalization boundary"
 require_count \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'localSimpleRoutingBoundary()' \
   4 \
-  "one shared bounded local-answer contract must govern all ordinary routing surfaces"
+  "one shared semantic classifier contract must govern all ordinary routing surfaces"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'Use local_simple only for a short, self-contained, unambiguous, low-stakes request' \
@@ -1187,10 +1187,33 @@ require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'Never use local_simple for current or live information' \
   "current, contextual, uncertain, and high-stakes work must remain on Codex"
-require_text \
+reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'if (kind === "local_simple") {' \
-  "a bounded local answer must exit before the Codex handoff path"
+  "local_simple classifier output must never reach a Realtime-authored answer path"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'if (kind === "direct_chat") {' \
+  "direct_chat classifier output must never reach a Realtime-authored answer path"
+reject_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'if (kind === "local_identity") {' \
+  "local_identity classifier output must never reach a Realtime-authored answer path"
+require_count \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'case "direct_chat":' \
+  1 \
+  "direct_chat must have one explicit Codex normalization decision"
+require_count \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'case "local_simple":' \
+  1 \
+  "local_simple must have one explicit Codex normalization decision"
+require_count \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'case "local_identity":' \
+  1 \
+  "local_identity must have one explicit Codex normalization decision"
 require_count \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'semanticSessionClosureRoutingBoundary()' \
@@ -1749,12 +1772,24 @@ require_text \
   "a name-only wake invocation must acknowledge locally without a Codex preamble"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'assistantName: session.assistantName' \
-  "local identity replies must use the configured assistant name"
+  'configuredIdentity: {' \
+  "every Codex voice handoff must include one structured configured identity snapshot"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'assistantDisplayName: session.assistantName' \
+  "Codex voice handoffs must use the configured assistant name"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'userDisplayName: session.userDisplayName' \
-  "local identity replies must use the configured user display name"
+  "Codex voice handoffs must use the configured user display name"
+require_text \
+  "$ROOT/Sources/VoiceCodexRequestEnvelope.swift" \
+  'struct VoiceCodexConfiguredIdentity: Codable, Equatable' \
+  "configured identity must remain a typed JSON-encoded data object"
+require_text \
+  "$ROOT/Sources/VoiceCodexRequestEnvelope.swift" \
+  'identityEncoder.encode(configuredIdentity)' \
+  "configured identity must be encoded through JSONEncoder rather than prompt interpolation"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'userDisplayName: config.userDisplayName' \

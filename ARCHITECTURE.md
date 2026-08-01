@@ -105,16 +105,18 @@ readiness never blocks microphone startup or the greeting.
 Completed transcripts pass a deterministic speech-stability gate before they
 can change UI state or route a turn. Provisional VAD start and stop events do
 nothing. Accepted turns are serialized so overlapping transcripts cannot reuse
-one mutable slot. Realtime semantically answers only pure social speech that it
-can complete immediately, such as greetings, thanks, its configured identity,
-hearing checks, or the current device-local time. Personal state, current
-facts, lookups, analysis, and any request that may take more than about five
-seconds or benefit from context, tools, files, apps, memory, or source
-verification are handed to Codex. If the boundary is uncertain, Codex owns the
-turn. The short handoff progress response may describe only the action being
-taken and cannot pre-answer the request or claim uncertainty. Output audio
-deltas are decoded and scheduled on the native player. Stop and Escape
-interrupt the active app Remote turn and reject late UI results.
+one mutable slot. Realtime supplies a semantic classifier label, then an
+application-owned normalization boundary sends every content-bearing label,
+including `direct_chat`, `local_simple`, and `local_identity`, to Codex. Only
+closed lifecycle actions, playback echo suppression, repeat, and device-local
+time remain local. Every Codex handoff includes a typed, bounded snapshot of
+the configured assistant, product, and user display names so the persistent
+task does not infer identity from an earlier turn or its underlying model. If
+the boundary is uncertain, Codex owns the turn. The short handoff progress
+response may describe only the action being taken and cannot pre-answer the
+request or claim uncertainty. Output audio deltas are decoded and scheduled on
+the native player. Stop and Escape interrupt the active app Remote turn and
+reject late UI results.
 
 Completed onboarding starts Realtime as soon as the overlay is presented unless
 microphone access is explicitly denied or restricted. The first greeting marker

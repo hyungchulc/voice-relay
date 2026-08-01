@@ -3552,6 +3552,17 @@ private extension DirectRealtimeController {
         return allowed.has(kind) ? kind : "codex";
       }
 
+      function normalizeExecutionRouteKind(kind) {
+        switch (kind) {
+          case "direct_chat":
+          case "local_simple":
+          case "local_identity":
+            return "codex";
+          default:
+            return kind;
+        }
+      }
+
       function normalizeSocialOrigin(value) {
         const origin = String(value || "");
         const allowed = new Set([
@@ -4799,7 +4810,7 @@ private extension DirectRealtimeController {
             const progressSummary = safeProgressSummary(
               args.progress_summary
             );
-            let kind =
+            let classifierKind =
               requestedKind === "stop_session"
                   && stopTarget !== "current_voice_or_codex_work"
                 ? "codex"
@@ -4811,11 +4822,12 @@ private extension DirectRealtimeController {
               )
               || hasClearlyUnconfiguredScript(text)
             ) {
-              kind = "clarify";
+              classifierKind = "clarify";
             }
-            const socialOrigin = kind === "direct_chat"
+            const socialOrigin = classifierKind === "direct_chat"
               ? normalizeSocialOrigin(args.social_origin)
               : "not_applicable";
+            const kind = normalizeExecutionRouteKind(classifierKind);
             const activeTurn = session.activeUserTurn;
             if (activeTurn) {
               activeTurn.spokenLanguage = spokenLanguage;
@@ -4823,6 +4835,7 @@ private extension DirectRealtimeController {
             }
             diagnostic("route_decision", generation, {
               callID: callId,
+              classifierKind,
               kind,
               reason: activeTurn?.playbackContended
                 ? "playback_contended"
@@ -4834,9 +4847,9 @@ private extension DirectRealtimeController {
               turnID: String(activeTurn?.id || "")
             });
             const suppressAssistantLikeTurn =
-              kind === "ignore"
+              classifierKind === "ignore"
               || (
-                kind === "direct_chat"
+                classifierKind === "direct_chat"
                 && socialOrigin === "assistant_like_playback"
               );
             if (suppressAssistantLikeTurn) {
@@ -4857,6 +4870,7 @@ private extension DirectRealtimeController {
                 generation,
                 {
                   callID: callId,
+                  classifierKind,
                   kind,
                   socialOrigin,
                   text,
@@ -4912,26 +4926,6 @@ private extension DirectRealtimeController {
               );
               break;
             }
-            if (kind === "direct_chat") {
-              finishRoute(
-                callId,
-                { status: "ok", request: text },
-                "Give one brief natural conversational reply to the exact request. This route is only for a greeting, thanks, conversational receipt, approval, or acknowledgement that adds no work and does not clearly end the conversation. Do not add facts, advice, or a new topic.",
-                spokenLanguage,
-                spokenRegister
-              );
-              break;
-            }
-            if (kind === "local_simple") {
-              finishRoute(
-                callId,
-                { status: "ok", request: text },
-                "Answer the exact request directly from stable model knowledge in one short final answer. This response is only for deterministic basic arithmetic, stable general knowledge, or simple direct translation already classified as safe and self-contained. Do not mention checking, progress, Codex, routing, tools, or sources. Do not add unrelated detail.",
-                spokenLanguage,
-                spokenRegister
-              );
-              break;
-            }
             if (kind === "repeat_output") {
               session.pendingCalls.delete(callId);
               dataSend({
@@ -4947,22 +4941,6 @@ private extension DirectRealtimeController {
                 spokenRegister
               );
               completeAcceptedTurn();
-              break;
-            }
-            if (kind === "local_identity") {
-              finishRoute(
-                callId,
-                {
-                  status: "ok",
-                  request: text,
-                  productName: session.productName,
-                  assistantName: session.assistantName,
-                  userDisplayName: session.userDisplayName
-                },
-                "Answer the exact identity question from the tool result in one short natural sentence in the user's language. Never invent a different name.",
-                spokenLanguage,
-                spokenRegister
-              );
               break;
             }
             if (kind === "local_wake") {
@@ -5037,7 +5015,12 @@ private extension DirectRealtimeController {
               callId,
               currentTurnId: currentTurnID,
               currentUtterance: text,
-              recentFinalizedTurns: recentTurns
+              recentFinalizedTurns: recentTurns,
+              configuredIdentity: {
+                assistantDisplayName: session.assistantName,
+                productDisplayName: session.productName,
+                userDisplayName: session.userDisplayName
+              }
             });
             break;
           }

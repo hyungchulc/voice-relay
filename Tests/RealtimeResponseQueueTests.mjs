@@ -597,60 +597,26 @@ runtime.receiveRealtimeEvent({
 const generationTwoMessages = nativeMessages.slice(messagesBeforeDirect);
 assert.equal(
   generationTwoMessages.filter(message => message.type === "codexRequest").length,
-  0,
-  "Realtime semantic direct_chat must not start a Codex turn"
+  1,
+  "Realtime semantic direct_chat must normalize to one Codex turn"
 );
 const generationTwoCreates = generationTwoMessages
   .filter(message => message.type === "realtimeSend")
   .map(message => JSON.parse(message.eventJSON))
   .filter(event => event.type === "response.create");
 assert.equal(
-  generationTwoCreates.length,
-  2,
-  "Realtime semantic direct_chat must answer through the routed tool result only"
+  generationTwoCreates.filter(event =>
+    !event.response?.metadata?.voice_relay_kind
+  ).length,
+  0,
+  "Realtime semantic direct_chat must not create a direct answer response",
 );
-assert.match(
-  generationTwoCreates.at(-1)?.response?.instructions || "",
-  /BCP 47 tag: "ko-KR"/,
-  "a direct reply must use the classifier's spoken language",
-);
-assert.match(
-  generationTwoCreates.at(-1)?.response?.instructions || "",
-  /speaking register: "casual"/,
-  "a direct reply must use the classifier's spoken register",
-);
-assert.match(
-  generationTwoCreates.at(-1)?.response?.instructions || "",
-  /Use one consistent speaking register throughout the entire response/,
-  "a direct reply must not mix casual and polite forms",
-);
-runtime.receiveRealtimeEvent({
-  generation: 2,
-  event: {
-    type: "response.created",
-    response: { id: "direct-2", metadata: {} },
-  },
-});
-runtime.receiveRealtimeEvent({
-  generation: 2,
-  event: {
-    type: "response.output_audio_transcript.delta",
-    response_id: "direct-2",
-    delta: "응.",
-  },
-});
-runtime.receiveRealtimeEvent({
-  generation: 2,
-  event: {
-    type: "response.output_audio_transcript.done",
-    response_id: "direct-2",
-    transcript: "응.",
-  },
-});
 assert.equal(
-  nativeEvents("assistantFinal").at(-1)?.text,
-  "응.",
-  "a direct Realtime reply must remain visible while it is spoken",
+  generationTwoMessages.filter(message =>
+    message.type === "assistantFinal"
+  ).length,
+  0,
+  "Realtime must not author or surface a competing direct-chat final",
 );
 
 const messagesBeforeRouteFailure = nativeMessages.length;
@@ -2133,15 +2099,15 @@ assert.equal(
       event.type === "response.create"
       && event.response?.metadata?.voice_relay_kind !== "route_classifier"
     ).length,
-  1,
-  "an admitted post-final social reply must create exactly one spoken reply",
+  0,
+  "an admitted post-final social reply must not create a direct Realtime answer",
 );
 assert.equal(
   postFinalReplyMessages.filter(message =>
     message.type === "codexRequest"
   ).length,
-  0,
-  "a post-final conversational receipt must stay on the direct Realtime path",
+  1,
+  "a post-final conversational receipt must normalize to one Codex request",
 );
 
 const codexFailureStart = nativeMessages.length;
@@ -8372,51 +8338,42 @@ for (const [index, fixture] of localSimpleCases.entries()) {
     additionalLanguages: ["ko-KR"],
   });
   const callID = `local-simple-call-${index}`;
-  const messages = completeLocalRoutedReply(harness, {
+  const start = harness.messages.length;
+  beginOrdinaryRouteDecision(harness, {
     itemID: `local-simple-item-${index}`,
     text: fixture.text,
     callID,
-    reply: fixture.reply,
+    kind: "local_simple",
   });
+  const messages = harness.messages.slice(start);
   const outbound = messages
     .filter(message => message.type === "realtimeSend")
     .map(message => JSON.parse(message.eventJSON));
   assert.equal(
     messages.filter(message => message.type === "codexRequest").length,
-    0,
-    `a bounded local answer must not dispatch Codex: ${fixture.text}`,
+    1,
+    `local_simple must normalize to one Codex request: ${fixture.text}`,
   );
   assert.equal(
     outbound.filter(event =>
       event.type === "response.create"
       && event.response?.metadata?.voice_relay_kind === "codex_progress"
     ).length,
-    0,
-    `a bounded local answer must not create progress speech: ${fixture.text}`,
+    1,
+    `a Codex-normalized local_simple turn must create one progress response: ${fixture.text}`,
   );
   assert.equal(
     outbound.filter(event =>
       event.type === "response.create"
       && !event.response?.metadata?.voice_relay_kind
     ).length,
-    1,
-    `a bounded local answer must create exactly one direct response: ${fixture.text}`,
-  );
-  assert.match(
-    outbound.find(event =>
-      event.type === "response.create"
-      && !event.response?.metadata?.voice_relay_kind
-    )?.response?.instructions || "",
-    /BCP 47 tag: "en-US"/,
-    `the local answer must preserve the configured spoken language: ${fixture.text}`,
+    0,
+    `local_simple must never create a direct Realtime answer: ${fixture.text}`,
   );
   assert.equal(
-    messages.filter(message =>
-      message.type === "assistantFinal"
-      && message.text === fixture.reply
-    ).length,
-    1,
-    `a bounded local answer must emit one final reply: ${fixture.text}`,
+    messages.filter(message => message.type === "assistantFinal").length,
+    0,
+    `Realtime must not emit a local_simple final before Codex resolves: ${fixture.text}`,
   );
 }
 
@@ -8465,18 +8422,24 @@ const bareThanksHarness = makeContractHarness({
   generation: 340,
   language: "en-US",
 });
-const bareThanksMessages = completeLocalRoutedReply(bareThanksHarness, {
+const bareThanksStart = bareThanksHarness.messages.length;
+beginOrdinaryRouteDecision(bareThanksHarness, {
   itemID: "bare-thanks-item",
   text: "OK, thanks.",
   callID: "bare-thanks-call",
   kind: "direct_chat",
-  reply: "You're welcome.",
   socialOrigin: "user_reply",
 });
+const bareThanksMessages = bareThanksHarness.messages.slice(bareThanksStart);
 assert.equal(
   bareThanksMessages.filter(message => message.type === "stopIntent").length,
   0,
   "bare thanks without clear closure must remain direct chat",
+);
+assert.equal(
+  bareThanksMessages.filter(message => message.type === "codexRequest").length,
+  1,
+  "direct_chat acknowledgements must normalize to Codex without becoming stop intents",
 );
 
 const configuredIdentityHarness = makeContractHarness({
@@ -8515,21 +8478,18 @@ beginOrdinaryRouteDecision(configuredIdentityHarness, {
   spokenLanguage: "en-US",
   spokenRegister: "neutral",
 });
-const configuredIdentityOutput =
-  configuredIdentityHarness.outbound().findLast(event =>
-    event.type === "conversation.item.create"
-    && event.item?.type === "function_call_output"
-  );
+const configuredIdentityRequest =
+  configuredIdentityHarness.native("codexRequest").at(-1);
 assert.deepEqual(
-  JSON.parse(configuredIdentityOutput?.item?.output || "{}"),
+  JSON.parse(JSON.stringify(
+    configuredIdentityRequest?.configuredIdentity || {},
+  )),
   {
-    status: "ok",
-    request: "Who are we?",
-    productName: "Orbit",
-    assistantName: "Nova",
+    assistantDisplayName: "Nova",
+    productDisplayName: "Orbit",
     userDisplayName: "John",
   },
-  "local identity answers must use the configured assistant, user, and product values without invented names",
+  "local_identity must normalize to Codex with the configured assistant, user, and product identity snapshot",
 );
 const incompleteIdentityHarness = makeContractHarness({
   generation: 383,
@@ -8572,13 +8532,31 @@ const completedTrajectoryHarness = makeContractHarness({
   generation: 364,
   language: "en-US",
 });
-completeLocalRoutedReply(completedTrajectoryHarness, {
+const completedTrajectoryRoute = beginOrdinaryRouteDecision(
+  completedTrajectoryHarness,
+  {
   itemID: "completed-trajectory-request",
   text: "Give me the short answer.",
   callID: "completed-trajectory-request-call",
   kind: "local_simple",
-  reply: "The short answer is ready.",
+  },
+);
+settleContractSpeech(
+  completedTrajectoryHarness,
+  "codex_progress",
+  "Working on it.",
+);
+completedTrajectoryHarness.runtime.resolveCodex({
+  generation: completedTrajectoryHarness.generation,
+  callId: completedTrajectoryRoute.callID,
+  output: "The short answer is ready.",
 });
+settleContractSpeech(
+  completedTrajectoryHarness,
+  "codex_final",
+  "The short answer is ready.",
+  { withAudio: true },
+);
 const trajectoryUtterance = "All right.";
 const completedTrajectoryStart =
   completedTrajectoryHarness.messages.length;

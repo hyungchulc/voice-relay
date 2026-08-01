@@ -1,12 +1,10 @@
-This alpha fixes the Thinking level menu order in Voice Relay Settings.
+This alpha makes Codex the single content authority for Voice Relay conversations.
 
-- Known reasoning levels are presented in semantic ascending order rather than alphabetically.
-- The ordering covers none, minimal, low, medium, high, xhigh, max, and ultra whenever the host reports them.
-- Duplicate capability identifiers are removed without dropping supported values.
-- Unknown future identifiers remain available and are ordered deterministically after known levels.
-- Spoken work-in-progress cues now describe one resolved action and referent instead of voicing classifier categories, alternatives, or unresolved option lists.
-- Progress cues preserve conversational deixis, address the listener naturally, and omit unresolved or sensitive referents across languages and domains.
-- Regression coverage protects shuffled input, duplicates, and future capability identifiers.
-- Build 39 is the signed update target for installed Voice Relay preview-channel builds.
+- Realtime classifier labels for direct chat, stable local answers, and configured identity questions now normalize to the persistent Codex task.
+- Pure assistant-playback echo suppression, stop, repeat, and closed device-local actions remain local.
+- Every Codex voice handoff carries the current configured assistant, product, and user display names as bounded JSON data.
+- The current request identity supersedes stale persistent-task context, and missing values never fall back to a model, provider, or platform identity.
+- Regression coverage verifies direct chat, stable knowledge, translation, and identity routes cannot produce a competing Realtime-authored answer.
+- Build 40 is the signed update target for installed Voice Relay preview-channel builds.
 
 This public build is Apple Development signed and is not notarized.
