@@ -17,6 +17,7 @@ few seconds are handed to the same dedicated Codex task. There is no OpenAI API
 key to copy, embed, or store, and no separate task-owning agent stack.
 
 [Download the public alpha](https://github.com/hyungchulc/voice-relay/releases)
+· [Watch the three-minute walkthrough](https://github.com/hyungchulc/voice-relay/releases/download/v0.5.1-alpha.15/Voice-Relay-Introduction-2026-08-01.mp4)
 · [Build from source](#build-and-launch)
 
 ## Why Voice Relay is different
