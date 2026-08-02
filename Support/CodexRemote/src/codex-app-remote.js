@@ -237,6 +237,8 @@ export class CodexAppRemoteBackend {
     taskScopedFollowupEvidence = createSessionLogTaskScopedFollowupEvidence(),
     now = () => Date.now(),
     steerAcceptanceTimeoutMs = responseTimeoutMs,
+    threadResidencyRefreshIntervalMs = 0,
+    scheduleInterval = setInterval,
   }) {
     const restoredState = this.readStateFromPath(statePath);
     this.responseTimeoutMs = responseTimeoutMs;
@@ -258,6 +260,12 @@ export class CodexAppRemoteBackend {
       1,
       Number(steerAcceptanceTimeoutMs) || responseTimeoutMs,
     );
+    this.threadResidencyRefreshIntervalMs = Math.max(
+      0,
+      Number(threadResidencyRefreshIntervalMs) || 0,
+    );
+    this.scheduleInterval = scheduleInterval;
+    this.threadResidencyRefreshTimer = null;
     this.activeTurn = null;
     this.supportsLiveSteer = true;
     this.supportsTaskScopedFollowup = true;
@@ -335,6 +343,7 @@ export class CodexAppRemoteBackend {
     const threadResidency = await this.prewarmThreadResidency({
       timeoutMs: 10_000,
     });
+    this.startThreadResidencyMaintenance();
     return {
       status: "ready",
       backend: "app-remote",
@@ -435,12 +444,14 @@ export class CodexAppRemoteBackend {
       return this.threadResidencyPrewarmPromise;
     }
     const prewarmPromise = this.invokeCommand(
-      "probe-thread-residency",
+      "maybe-resume-conversation",
       {
         conversationId: this.threadId,
         model: this.model,
         reasoningEffort: this.reasoningEffort,
+        serviceTier: this.serviceTier,
         workspaceRoots: [this.cwd],
+        requireReconciliation: true,
       },
       { timeoutMs },
     );
@@ -453,6 +464,29 @@ export class CodexAppRemoteBackend {
         this.threadResidencyPrewarmPromise = null;
       }
     }
+  }
+
+  startThreadResidencyMaintenance() {
+    if (
+      this.threadResidencyRefreshTimer
+      || this.threadResidencyRefreshIntervalMs <= 0
+      || typeof this.scheduleInterval !== "function"
+    ) {
+      return;
+    }
+    this.threadResidencyRefreshTimer = this.scheduleInterval(() => {
+      if (!this.threadId || this.activeTurn) return;
+      void this.prewarmThreadResidency({ timeoutMs: 10_000 }).catch(
+        (error) => {
+          console.warn(
+            `${new Date(this.now()).toISOString()} app-remote background residency refresh failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        },
+      );
+    }, this.threadResidencyRefreshIntervalMs);
+    this.threadResidencyRefreshTimer?.unref?.();
   }
 
   async keepAliveRenderer() {
@@ -687,7 +721,9 @@ export class CodexAppRemoteBackend {
     lifecycle.phase = "resuming";
     let resumeResult;
     try {
-      resumeResult = await this.resumeThread();
+      resumeResult = await this.resumeThread({
+        requireReconciliation: true,
+      });
     } catch (error) {
       if (!isMissingConversationError(error)) throw error;
       if (lifecycle?.exactBinding) throw exactAppBindingError("wrong_thread");
@@ -779,7 +815,17 @@ export class CodexAppRemoteBackend {
     return this.threadId;
   }
 
-  async resumeThread() {
+  async resumeThread({ requireReconciliation = false } = {}) {
+    if (
+      requireReconciliation
+      && this.threadResidencyPrewarmPromise
+      && this.threadResidencyPrewarmGeneration
+        === normalizedRemoteStreamGeneration(
+          this.remoteControlClient?.streamGeneration,
+        )
+    ) {
+      return this.threadResidencyPrewarmPromise;
+    }
     return this.invokeCommand(
       "maybe-resume-conversation",
       {
@@ -793,7 +839,8 @@ export class CodexAppRemoteBackend {
         permissions: FULL_ACCESS_PERMISSIONS,
         approvalsReviewer: "user",
         shouldSendPermissionOverrides: true,
-        requireReconciliation: Boolean(this.activeTurn?.exactBinding),
+        requireReconciliation:
+          requireReconciliation || Boolean(this.activeTurn?.exactBinding),
       },
       { timeoutMs: 60_000 },
     );

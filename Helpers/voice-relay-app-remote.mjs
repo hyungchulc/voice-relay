@@ -597,6 +597,7 @@ async function ensureBackend({
       profileProvenance,
       statePath: backendStatePath,
       responseTimeoutMs: 10 * 60_000,
+      threadResidencyRefreshIntervalMs: 60_000,
     });
     // Starting the transport must not prewarm a possibly stale persisted task.
     // resolveBoundThread owns the read/resume/replace decision immediately
@@ -660,36 +661,18 @@ async function resolveBoundThread(params, requestId) {
       );
 
   if (threadID) {
+    activeBackend.threadId = threadID;
     try {
-      await controller.request(
-        "thread/read",
-        { threadId: threadID, includeTurns: false },
-        { timeoutMs: 60_000 },
-      );
+      await activeBackend.resumeThread({
+        requireReconciliation: true,
+      });
     } catch {
-      try {
-        await controller.request(
-          "thread/resume",
-          {
-            threadId: threadID,
-            cwd: workspacePath,
-            model: params.model,
-            serviceTier: normalizeServiceTier(params.serviceTier),
-            config: {
-              model: params.model,
-              model_reasoning_effort: params.reasoningEffort,
-            },
-          },
-          { timeoutMs: 60_000 },
-        );
-      } catch {
-        write({
-          event: "diagnostic",
-          requestId,
-          stage: "saved_thread_unavailable_creating_replacement",
-        });
-        threadID = await startVoiceRelayThread(params);
-      }
+      write({
+        event: "diagnostic",
+        requestId,
+        stage: "saved_thread_unavailable_creating_replacement",
+      });
+      threadID = await startVoiceRelayThread(params);
     }
   } else {
     threadID = await startVoiceRelayThread(params);

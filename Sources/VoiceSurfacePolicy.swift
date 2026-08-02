@@ -675,9 +675,33 @@ enum ConversationSpeaker: Equatable {
     case assistant
 }
 
+enum ConversationDeliveryState: String, Equatable {
+    case pending
+    case applied
+    case failed
+    case expired
+    case superseded
+
+    var isTerminal: Bool { self != .pending }
+}
+
 struct ConversationEntry: Equatable {
     let speaker: ConversationSpeaker
     var text: String
+    let deliveryID: String?
+    var deliveryState: ConversationDeliveryState?
+
+    init(
+        speaker: ConversationSpeaker,
+        text: String,
+        deliveryID: String? = nil,
+        deliveryState: ConversationDeliveryState? = nil
+    ) {
+        self.speaker = speaker
+        self.text = text
+        self.deliveryID = deliveryID
+        self.deliveryState = deliveryState
+    }
 }
 
 struct ConversationTranscriptState {
@@ -709,6 +733,7 @@ struct ConversationTranscriptState {
         speaker: ConversationSpeaker,
         text: String,
         deliveryID: String? = nil,
+        deliveryState: ConversationDeliveryState? = nil,
         limit: Int
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -721,7 +746,11 @@ struct ConversationTranscriptState {
         }
         let finalizedEntry = ConversationEntry(
             speaker: speaker,
-            text: trimmed
+            text: trimmed,
+            deliveryID: normalizedDeliveryID.isEmpty
+                ? nil
+                : normalizedDeliveryID,
+            deliveryState: deliveryState
         )
         if draft?.speaker == speaker {
             draft = nil
@@ -730,6 +759,30 @@ struct ConversationTranscriptState {
         }
         append(finalizedEntry, limit: limit)
         rememberFinalizedDeliveryID(normalizedDeliveryID)
+    }
+
+    @discardableResult
+    mutating func transitionDeliveryState(
+        deliveryID: String,
+        to nextState: ConversationDeliveryState
+    ) -> Bool {
+        let normalizedDeliveryID = deliveryID.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !normalizedDeliveryID.isEmpty,
+              let index = history.lastIndex(where: {
+                  $0.deliveryID == normalizedDeliveryID
+              }) else {
+            return false
+        }
+        let currentState = history[index].deliveryState
+        guard currentState != nextState,
+              currentState == nil || currentState == .pending,
+              currentState?.isTerminal != true else {
+            return false
+        }
+        history[index].deliveryState = nextState
+        return true
     }
 
     mutating func sealDraftAtSessionBoundary(limit: Int) {
@@ -1480,6 +1533,16 @@ enum WakeAudioHandoffReplay: Equatable {
     case unavailable
 }
 
+struct WakeAudioRearmChunk: Equatable {
+    let span: WakeAudioFrameSpan
+    let data: Data
+}
+
+enum WakeAudioRearmReplay: Equatable {
+    case ready(WakeAudioRearmChunk)
+    case truncated
+}
+
 struct WakeAudioHandoffKey: Equatable {
     let ticketID: String
     let generation: Int
@@ -1705,7 +1768,7 @@ struct WakeAudioHandoffReplayLifecycle {
 struct WakeAudioHandoffJournal {
     static let sampleRate: Int64 = 24_000
     static let bytesPerFrame = MemoryLayout<Int16>.size
-    static let rollingFrameCapacity = sampleRate * 3
+    static let rollingFrameCapacity = sampleRate * 6
     static let committedByteCapacity = 1_048_576
 
     private struct Record {
@@ -1829,6 +1892,30 @@ struct WakeAudioHandoffJournal {
             result.append(record.data.dropFirst(byteOffset))
         }
         return .ready(result)
+    }
+
+    func replay(fromFrame requestedFrame: Int64) -> WakeAudioRearmReplay {
+        let earliestFrame = records.first?.startFrame ?? nextFrame
+        guard requestedFrame >= earliestFrame,
+              requestedFrame <= nextFrame else {
+            return .truncated
+        }
+        var result = Data()
+        for record in records where record.endFrame > requestedFrame {
+            let startFrame = max(record.startFrame, requestedFrame)
+            let byteOffset =
+                Int(startFrame - record.startFrame) * Self.bytesPerFrame
+            result.append(record.data.dropFirst(byteOffset))
+        }
+        return .ready(
+            WakeAudioRearmChunk(
+                span: WakeAudioFrameSpan(
+                    startFrame: requestedFrame,
+                    endFrame: nextFrame
+                ),
+                data: result
+            )
+        )
     }
 
     mutating func finish(ticketID: String, generation: Int) {

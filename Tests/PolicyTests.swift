@@ -179,10 +179,43 @@ struct PolicyTests {
                 ),
                 ConversationEntry(
                     speaker: .user,
-                    text: "멈춰 줘."
+                    text: "멈춰 줘.",
+                    deliveryID: "turn-1"
                 ),
             ] && transcript.draft == nil,
             "a new user turn must seal older assistant progress before finalizing once"
+        )
+
+        var steeringReceipt = ConversationTranscriptState()
+        steeringReceipt.finalize(
+            speaker: .user,
+            text: "밖에 온도 알려달라고.",
+            deliveryID: "voice-steer-1",
+            deliveryState: .pending,
+            limit: 8
+        )
+        expect(
+            steeringReceipt.transitionDeliveryState(
+                deliveryID: "voice-steer-1",
+                to: .applied
+            )
+                && steeringReceipt.history == [
+                    ConversationEntry(
+                        speaker: .user,
+                        text: "밖에 온도 알려달라고.",
+                        deliveryID: "voice-steer-1",
+                        deliveryState: .applied
+                    )
+                ],
+            "a pending steering receipt must update in place without changing its exact transcript"
+        )
+        expect(
+            !steeringReceipt.transitionDeliveryState(
+                deliveryID: "voice-steer-1",
+                to: .failed
+            )
+                && steeringReceipt.history[0].deliveryState == .applied,
+            "a terminal steering receipt must reject late or duplicate terminal transitions"
         )
 
         transcript.updateDraft(
@@ -211,11 +244,13 @@ struct PolicyTests {
             transcript.history.suffix(2) == [
                 ConversationEntry(
                     speaker: .user,
-                    text: "멈춰 줘."
+                    text: "멈춰 줘.",
+                    deliveryID: "turn-1"
                 ),
                 ConversationEntry(
                     speaker: .assistant,
-                    text: "Done"
+                    text: "Done",
+                    deliveryID: "response-1"
                 ),
             ],
             "streaming assistant updates and a repeated final must produce one durable reply"
@@ -263,7 +298,8 @@ struct PolicyTests {
                 ),
                 ConversationEntry(
                     speaker: .assistant,
-                    text: "A newer reply"
+                    text: "A newer reply",
+                    deliveryID: "response-2"
                 ),
             ],
             "distinct turns with identical text must remain visible"
@@ -2087,6 +2123,59 @@ struct PolicyTests {
                 generation: 7
             ) == .unavailable,
             "a drained handoff must retire its immutable ticket"
+        )
+
+        var rearmJournal = WakeAudioHandoffJournal()
+        rearmJournal.beginWake()
+        _ = rearmJournal.append(
+            pcm: Data(repeating: 7, count: 200)
+        )
+        let rearmBoundary = rearmJournal.nextFrame
+        _ = rearmJournal.append(
+            pcm: Data(repeating: 8, count: 120)
+        )
+        _ = rearmJournal.append(
+            pcm: Data(repeating: 9, count: 80)
+        )
+        let rearmReplay: WakeAudioRearmChunk
+        if case let .ready(chunk) = rearmJournal.replay(
+            fromFrame: rearmBoundary
+        ) {
+            rearmReplay = chunk
+        } else {
+            rearmReplay = WakeAudioRearmChunk(
+                span: WakeAudioFrameSpan(startFrame: 0, endFrame: 0),
+                data: Data()
+            )
+        }
+        expect(
+            rearmReplay.span == WakeAudioFrameSpan(
+                startFrame: rearmBoundary,
+                endFrame: rearmBoundary + 100
+            )
+                && rearmReplay.data
+                    == Data(repeating: 8, count: 120)
+                        + Data(repeating: 9, count: 80),
+            "wake rearm must replay every gap frame in chronological order so the first phoneme is preserved"
+        )
+
+        var expiredRearmJournal = WakeAudioHandoffJournal()
+        expiredRearmJournal.beginWake()
+        let expiredRearmBoundary = expiredRearmJournal.nextFrame
+        _ = expiredRearmJournal.append(
+            pcm: Data(
+                repeating: 1,
+                count:
+                    Int(WakeAudioHandoffJournal.rollingFrameCapacity)
+                    * WakeAudioHandoffJournal.bytesPerFrame
+                    + 2
+            )
+        )
+        expect(
+            expiredRearmJournal.replay(
+                fromFrame: expiredRearmBoundary
+            ) == .truncated,
+            "a reconnect gap beyond the bounded wake journal must fail closed instead of hiding first-phoneme loss"
         )
 
         var truncatedWakeJournal = WakeAudioHandoffJournal()

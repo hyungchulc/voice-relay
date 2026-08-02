@@ -2671,6 +2671,8 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             guard let text = event["text"] as? String else { return }
             let turnID = ((event["turnId"] as? String) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            let deliveryState = (event["deliveryState"] as? String)
+                .flatMap(ConversationDeliveryState.init(rawValue:))
             guard !turnID.isEmpty else {
                 VoiceRelayDiagnostics.flow(
                     "realtime_user_turn_display_rejected",
@@ -2697,8 +2699,12 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             appendConversation(
                 .user,
                 text: text,
-                deliveryID: turnID
+                deliveryID: turnID,
+                deliveryState: deliveryState
             )
+            if deliveryState == .pending {
+                NSSound.beep()
+            }
             if resolvedAnchor == .notch {
                 isReplyPreviewVisible = true
                 showConversationHistory(
@@ -2711,6 +2717,27 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 fields: ["turnID": turnID],
                 transcriptFields: ["userText": text]
             )
+        case "codexControlState":
+            guard let deliveryID = event["turnId"] as? String,
+                  let rawState = event["state"] as? String,
+                  let nextState = ConversationDeliveryState(
+                      rawValue: rawState
+                  ),
+                  conversationTranscript.transitionDeliveryState(
+                      deliveryID: deliveryID,
+                      to: nextState
+                  ) else {
+                return
+            }
+            VoiceRelayDiagnostics.flow(
+                "realtime_codex_control_state_updated",
+                generation: generation,
+                fields: [
+                    "turnID": deliveryID,
+                    "state": nextState.rawValue,
+                ]
+            )
+            showConversationHistory(animated: false)
         case "assistantProgress":
             guard let text = event["text"] as? String else { return }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3769,12 +3796,14 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private func appendConversation(
         _ speaker: ConversationSpeaker,
         text: String,
-        deliveryID: String? = nil
+        deliveryID: String? = nil,
+        deliveryState: ConversationDeliveryState? = nil
     ) {
         conversationTranscript.finalize(
             speaker: speaker,
             text: text,
             deliveryID: deliveryID,
+            deliveryState: deliveryState,
             limit: config.recentTurnLimit
         )
     }
@@ -3994,9 +4023,14 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             let label = entry.speaker == .user
                 ? config.userDisplayName
                 : config.assistantName
+            let stateLabel = conversationDeliveryStateLabel(
+                entry.deliveryState
+            )
             result.append(
                 NSAttributedString(
-                    string: "\(label)\n",
+                    string: stateLabel.isEmpty
+                        ? "\(label)\n"
+                        : "\(label) · \(stateLabel)\n",
                     attributes: [
                         .font: NSFont.systemFont(ofSize: 11.5, weight: .semibold),
                         .foregroundColor: entry.speaker == .user
@@ -4058,6 +4092,28 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         answerTextView.textStorage?.setAttributedString(result)
         scheduleScrollHistoryToBottom()
         return result.string
+    }
+
+    private func conversationDeliveryStateLabel(
+        _ state: ConversationDeliveryState?
+    ) -> String {
+        let copy = AppCopy(
+            preference: SettingsStore.shared.load().appDisplayLanguage
+        )
+        switch state {
+        case .pending:
+            return copy.text("Pending", "대기 중")
+        case .applied:
+            return copy.text("Applied", "반영됨")
+        case .failed:
+            return copy.text("Failed", "실패")
+        case .expired:
+            return copy.text("Expired", "만료됨")
+        case .superseded:
+            return copy.text("Superseded", "대체됨")
+        case nil:
+            return ""
+        }
     }
 
     private func scrollHistoryToBottom() {

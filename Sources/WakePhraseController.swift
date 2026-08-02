@@ -17,6 +17,9 @@ protocol WakeAudioBufferSource: AnyObject {
     func prepareWakeAudioCapture() -> Bool
 
     @discardableResult
+    func beginWakeAudioRearm() -> Bool
+
+    @discardableResult
     func beginWakeAudioDelivery(
         _ handler: @escaping (WakeAudioChunk) -> Void,
         onFailure: @escaping () -> Void
@@ -1138,6 +1141,18 @@ final class WakePhraseController {
         delay: TimeInterval = 0.8
     ) {
         guard wantsMonitoring else { return }
+        let rearmContinuityStarted =
+            externalAudioSource?.beginWakeAudioRearm() ?? false
+        VoiceRelayDiagnostics.flow(
+            "wake_audio_rearm_started",
+            generation: recognitionGeneration,
+            fields: [
+                "reason": reason,
+                "status": rearmContinuityStarted
+                    ? "buffering"
+                    : "unavailable",
+            ]
+        )
         let expectedGeneration = recognitionGeneration + 1
         stopRecognition(
             reason: reason,

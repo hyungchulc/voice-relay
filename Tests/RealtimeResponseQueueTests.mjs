@@ -5022,6 +5022,53 @@ assert.ok(
     && firstCorrelatedSteer?.voiceTurnID,
   "a genuine amendment must emit one correlated steer",
 );
+const immediateSteerReceipt = steerContractHarness.native("userTranscript")
+  .find(message => message.text === "Also include tomorrow.");
+assert.equal(
+  immediateSteerReceipt?.deliveryState,
+  "pending",
+  "ASR finalization must immediately preserve the exact correction as pending",
+);
+assert.equal(
+  immediateSteerReceipt?.turnId,
+  firstCorrelatedSteer.voiceTurnID,
+  "receipt and eventual effect must share one stable Voice turn identity",
+);
+assert.equal(
+  steerContractHarness.native("codexControlState").filter(message =>
+    message.turnId === firstCorrelatedSteer.voiceTurnID
+  ).length,
+  0,
+  "pending receipt must not be presented as applied before task acceptance",
+);
+
+const repeatedCorrectionStart = steerContractHarness.messages.length;
+steerContractHarness.receive({
+  type: "conversation.item.input_audio_transcription.completed",
+  item_id: "contract-control-user-exact-repeat",
+  transcript: "Also include tomorrow.",
+});
+const repeatedCorrectionMessages = steerContractHarness.messages.slice(
+  repeatedCorrectionStart,
+);
+assert.equal(
+  repeatedCorrectionMessages.filter(message =>
+    message.type === "userTranscript"
+    && message.text === "Also include tomorrow."
+    && message.deliveryState === "superseded"
+  ).length,
+  1,
+  "a silence-driven exact repeat must remain visible but be superseded instead of mutating twice",
+);
+assert.equal(
+  repeatedCorrectionMessages.filter(message =>
+    message.type === "realtimeSend"
+    && JSON.parse(message.eventJSON)?.response?.metadata
+      ?.voice_relay_kind === "active_codex_control"
+  ).length,
+  0,
+  "an exact repeated correction inside the bounded receipt window must not create a second classifier or steer",
+);
 assert.equal(
   steerContractHarness.outbound().filter(event =>
     event.type === "response.create"
@@ -5069,6 +5116,14 @@ steerContractHarness.runtime.resolveCodexSteer({
   mutationDeadlineEpochMs: steerContractHarness.now() + 60_000,
   accepted: true,
 });
+assert.equal(
+  steerContractHarness.native("codexControlState").filter(message =>
+    message.turnId === firstCorrelatedSteer.voiceTurnID
+    && message.state === "applied"
+  ).length,
+  1,
+  "the same pending receipt must become applied only after exact task acceptance",
+);
 assert.equal(
   steerContractHarness.outbound().filter(event =>
     event.type === "response.create"
@@ -5137,6 +5192,14 @@ lateSteerAcceptanceHarness.runtime.resolveCodexSteer({
   reason: "timeout",
 });
 assert.equal(
+  lateSteerAcceptanceHarness.native("codexControlState").filter(message =>
+    message.turnId === rejectedSteer.voiceTurnID
+    && message.state === "expired"
+  ).length,
+  1,
+  "a steer that misses its acceptance deadline must transition the same receipt to expired",
+);
+assert.equal(
   lateSteerAcceptanceHarness.outbound().filter(event =>
     event.type === "response.create"
     && event.response?.metadata?.voice_relay_kind
@@ -5168,6 +5231,35 @@ assert.equal(
   ).length,
   1,
   "a late acceptance after terminal failure must be retired by control identity",
+);
+
+const failedSteerHarness = makeContractHarness({
+  generation: 115,
+  language: "en-US",
+});
+beginContractCodex(failedSteerHarness, "Prepare the original answer.");
+routeContractControl(failedSteerHarness, "Use the corrected source.", {
+  action: "steer_active_codex",
+  confidence: "high",
+  spoken_language: "en-US",
+  spoken_register: "casual",
+  stop_target: "not_applicable",
+});
+const failedSteer = failedSteerHarness.native("codexSteer").at(-1);
+failedSteerHarness.runtime.resolveCodexSteer({
+  generation: failedSteerHarness.generation,
+  controlRequestID: failedSteer.controlRequestID,
+  voiceTurnID: failedSteer.voiceTurnID,
+  accepted: false,
+  reason: "backend_rejected",
+});
+assert.equal(
+  failedSteerHarness.native("codexControlState").filter(message =>
+    message.turnId === failedSteer.voiceTurnID
+    && message.state === "failed"
+  ).length,
+  1,
+  "a non-deadline steering rejection must transition the same exact receipt to failed",
 );
 
 const commentaryContractHarness = makeContractHarness({
@@ -5675,6 +5767,15 @@ function runCompletedTargetControlRace({
     },
   });
   const messages = harness.messages.slice(start);
+  const receipt = messages.find(message =>
+    message.type === "userTranscript"
+    && message.text === text
+    && message.deliveryState === "pending"
+  );
+  assert.ok(
+    receipt?.turnId,
+    `${action} must preserve one immediate pending receipt even if the target completes`,
+  );
   assert.equal(
     messages.filter(message =>
       message.type === "codexRequest"
@@ -5702,6 +5803,15 @@ function runCompletedTargetControlRace({
     ).length,
     1,
     `${action} must produce exactly one target-completed terminal disposition`,
+  );
+  assert.equal(
+    messages.filter(message =>
+      message.type === "codexControlState"
+      && message.turnId === receipt.turnId
+      && message.state === "superseded"
+    ).length,
+    1,
+    `${action} must supersede the same receipt when its captured target turn completes`,
   );
   assert.equal(
     messages
@@ -9639,5 +9749,161 @@ await assert.rejects(
   /profile is unavailable/u,
   "unsupported model-thinking-Fast combinations must fail closed",
 );
+
+const notLoadedThreadId = "019fbc20-484f-7aa0-8c16-db0bff6fe74c";
+const notLoadedCalls = [];
+let notLoadedReadCount = 0;
+const notLoadedDispatcher = new RemoteControlCommandDispatcher({
+  client: {
+    streamGeneration: 1,
+    environmentId: "voice-relay-not-loaded-test",
+    async request(method, params) {
+      notLoadedCalls.push({ method, params });
+      if (method === "thread/read") {
+        notLoadedReadCount += 1;
+        return notLoadedReadCount === 1
+          ? {
+              thread: {
+                id: notLoadedThreadId,
+                status: { type: "notLoaded" },
+                turns: [],
+              },
+            }
+          : {
+              thread: {
+                id: notLoadedThreadId,
+                status: { type: "loaded" },
+                threadSource: "user",
+                turns: [],
+              },
+            };
+      }
+      if (method === "thread/resume") return {};
+      throw new Error(`unexpected not-loaded dispatcher method ${method}`);
+    },
+  },
+  cwd: "/tmp/voice-relay-not-loaded-test",
+  model: "gpt-5.6-sol",
+  reasoningEffort: "medium",
+});
+const notLoadedResumeResult = await notLoadedDispatcher.invoke(
+  "maybe-resume-conversation",
+  {
+    conversationId: notLoadedThreadId,
+    model: "gpt-5.6-sol",
+    reasoningEffort: "medium",
+    workspaceRoots: ["/tmp/voice-relay-not-loaded-test"],
+    requireReconciliation: true,
+  },
+  { timeoutMs: 1_000 },
+);
+assert.equal(notLoadedResumeResult.threadSource, "user");
+assert.deepEqual(
+  notLoadedCalls.map(call => call.method),
+  ["thread/read", "thread/resume", "thread/read"],
+  "a success-shaped notLoaded task must resume the same task and be re-read before use",
+);
+assert.equal(
+  notLoadedCalls.find(call => call.method === "thread/resume")?.params?.threadId,
+  notLoadedThreadId,
+  "notLoaded recovery must preserve the established Voice task identity",
+);
+
+const residencyInvocations = [];
+let residencyMaintenanceTick = null;
+let residencyTimerUnrefCount = 0;
+const residencyBackend = new CodexAppRemoteBackend({
+  remoteControlClient: {
+    streamGeneration: 1,
+    async request() {
+      throw new Error("residency test must use the injected command function");
+    },
+  },
+  threadId: notLoadedThreadId,
+  cwd: "/tmp/voice-relay-residency-test",
+  model: "gpt-5.6-sol",
+  reasoningEffort: "medium",
+  serviceTier: null,
+  threadResidencyRefreshIntervalMs: 60_000,
+  scheduleInterval(callback, intervalMs) {
+    assert.equal(
+      intervalMs,
+      60_000,
+      "Voice task residency maintenance must use its configured low-frequency interval",
+    );
+    residencyMaintenanceTick = callback;
+    return {
+      unref() {
+        residencyTimerUnrefCount += 1;
+      },
+    };
+  },
+  async invokeCommand(method, params) {
+    residencyInvocations.push({ method, params });
+    return { activeTurnId: null, threadSource: "user" };
+  },
+});
+residencyBackend.startThreadResidencyMaintenance();
+assert.equal(residencyTimerUnrefCount, 1);
+assert.equal(typeof residencyMaintenanceTick, "function");
+residencyMaintenanceTick();
+await new Promise(resolve => setTimeout(resolve, 0));
+assert.equal(residencyInvocations.length, 1);
+assert.equal(residencyInvocations[0].method, "maybe-resume-conversation");
+assert.equal(
+  residencyInvocations[0].params.requireReconciliation,
+  true,
+  "background residency maintenance must re-read and load the task instead of trusting cached residency",
+);
+assert.equal(
+  residencyInvocations[0].params.conversationId,
+  notLoadedThreadId,
+  "background residency maintenance must target the established Voice task",
+);
+
+residencyInvocations.length = 0;
+await residencyBackend.resumeThread({ requireReconciliation: true });
+assert.equal(residencyInvocations.length, 1);
+assert.equal(residencyInvocations[0].method, "maybe-resume-conversation");
+assert.equal(
+  residencyInvocations[0].params.requireReconciliation,
+  true,
+  "the command path must reconcile residency immediately before dispatch",
+);
+
+let resolveSharedResidency;
+const sharedResidencyInvocations = [];
+const sharedResidencyBackend = new CodexAppRemoteBackend({
+  remoteControlClient: {
+    streamGeneration: 7,
+    async request() {
+      throw new Error("shared residency test uses the injected command function");
+    },
+  },
+  threadId: notLoadedThreadId,
+  cwd: "/tmp/voice-relay-shared-residency-test",
+  model: "gpt-5.6-sol",
+  reasoningEffort: "medium",
+  serviceTier: null,
+  async invokeCommand(method, params) {
+    sharedResidencyInvocations.push({ method, params });
+    return new Promise(resolve => {
+      resolveSharedResidency = resolve;
+    });
+  },
+});
+const backgroundResidency = sharedResidencyBackend.prewarmThreadResidency({
+  timeoutMs: 1_000,
+});
+const commandResidency = sharedResidencyBackend.resumeThread({
+  requireReconciliation: true,
+});
+assert.equal(
+  sharedResidencyInvocations.length,
+  1,
+  "a command arriving during background task loading must join the same reconciliation instead of resuming twice",
+);
+resolveSharedResidency({ activeTurnId: null, threadSource: "user" });
+await Promise.all([backgroundResidency, commandResidency]);
 
 console.log("Realtime response queue tests passed");

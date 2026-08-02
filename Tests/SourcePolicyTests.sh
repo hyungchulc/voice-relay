@@ -434,6 +434,22 @@ require_text \
   "Voice startup must prewarm the selected or newly created dedicated session"
 require_text \
   "$ROOT/Helpers/voice-relay-app-remote.mjs" \
+  'threadResidencyRefreshIntervalMs: 60_000' \
+  "Voice Relay must maintain its established task residency in the background"
+require_text \
+  "$ROOT/Helpers/voice-relay-app-remote.mjs" \
+  'await activeBackend.resumeThread({' \
+  "saved Voice task resolution must load and reconcile the same task before replacement"
+require_text \
+  "$ROOT/Support/CodexRemote/src/codex-app-remote.js" \
+  'requireReconciliation: true' \
+  "background and command-time residency checks must not trust a stale loaded cache"
+require_text \
+  "$ROOT/Support/CodexRemote/src/codex-app-remote.js" \
+  '&& this.threadResidencyPrewarmPromise' \
+  "a command arriving during background loading must join the same task reconciliation"
+require_text \
+  "$ROOT/Helpers/voice-relay-app-remote.mjs" \
   'saved_thread_unavailable_creating_replacement' \
   "stale saved tasks must be replaced instead of failing startup"
 require_text \
@@ -2368,6 +2384,22 @@ require_text \
   'case "userTranscriptPartial":' \
   "partial user transcripts must render while speech is still being processed"
 require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'deliveryState: controlReceipt.deliveryState' \
+  "a finalized spoken control must surface its exact transcript and pending state before routing"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'case "codexControlState":' \
+  "the same displayed spoken control must accept a later effect-state transition"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'NSSound.beep()' \
+  "a pending off-screen spoken control must receive an immediate local audible receipt"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'mutating func transitionDeliveryState(' \
+  "spoken control receipt and effect must share one immutable display identity"
+require_text \
   "$ROOT/Helpers/voice-relay-app-remote.mjs" \
   'forgetLocalEnrollment' \
   "connection recovery must expose local pairing reset separately from session reset"
@@ -3613,6 +3645,22 @@ require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'self.wakeDeliveredChunks > capturedBaseline' \
   "wake route recovery must verify actual PCM progress"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'externalAudioSource?.beginWakeAudioRearm()' \
+  "wake analyzer restart must open capture continuity before detaching recognition"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'wakeAudioHandoffJournal.replay(' \
+  "wake analyzer rearm must replay the bounded microphone gap into the new consumer"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '|| self.wakeAudioRearmBoundaryFrame != nil' \
+  "persistent capture must keep journaling PCM while wake recognition rearms"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '"wake_audio_rearm_replayed"' \
+  "wake rearm continuity must leave an observable first-phoneme replay diagnostic"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'captureTimingHealth.record(' \

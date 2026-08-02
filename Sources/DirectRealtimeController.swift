@@ -1073,6 +1073,7 @@ extension DirectRealtimeController: WKScriptMessageHandler {
         "state",
         "userTranscriptPartial",
         "userTranscript",
+        "codexControlState",
         "assistantProgress",
         "assistantPartial",
         "assistantFinal",
@@ -1172,6 +1173,9 @@ private extension DirectRealtimeController {
 
       function closeSession() {
         const current = session;
+        if (current) {
+          supersedeActiveCodexControls("superseded_by_session_close");
+        }
         session = null;
         if (current) {
           try { clearTimeout(current.draftFlushTimer); } catch (_) {}
@@ -3859,15 +3863,33 @@ private extension DirectRealtimeController {
             )
           : "";
         if (session.codexInFlight) {
+          const displayTurnID = String(
+            wakeActivationID || groupID || itemID ||
+            `turn-${session.generation}-${++session.turnSequence}`
+          );
+          const controlReceipt = queueActiveCodexControlTurn(
+            routedValue,
+            displayTurnID
+          );
           if (!wakeActivationID) {
             send({
               type: "userTranscript",
               generation: session.generation,
-              turnId: String(groupID || itemID || ""),
+              turnId: displayTurnID,
+              deliveryState: controlReceipt.deliveryState,
               text: routedValue
             });
+          } else {
+            send({
+              type: "codexControlState",
+              generation: session.generation,
+              turnId: displayTurnID,
+              state: controlReceipt.deliveryState
+            });
           }
-          queueActiveCodexControlTurn(routedValue);
+          if (controlReceipt.queued) {
+            startNextActiveCodexControlTurn();
+          }
           if (hadBufferedPlayback) {
             finishInterruptedPlaybackForBargeIn();
           } else {
@@ -4081,11 +4103,55 @@ private extension DirectRealtimeController {
           status: outcome,
           turnID: control.voiceTurnID
         });
+        const deliveryState = controlDeliveryState(outcome);
+        send({
+          type: "codexControlState",
+          generation: session.generation,
+          controlRequestID: control.controlRequestID,
+          turnId: control.voiceTurnID,
+          state: deliveryState,
+          reason: String(outcome || "")
+        });
         if (session.activeCodexControl?.controlRequestID
             === control.controlRequestID) {
           session.activeCodexControl = null;
         }
         return true;
+      }
+
+      function controlDeliveryState(outcome) {
+        const value = String(outcome || "");
+        if (value === "accepted" || value === "handled_locally") {
+          return "applied";
+        }
+        if (value === "timeout" || value.includes("deadline")) {
+          return "expired";
+        }
+        if (value === "target_turn_completed"
+            || value.startsWith("invalidated_")
+            || value.startsWith("superseded_")) {
+          return "superseded";
+        }
+        return "failed";
+      }
+
+      function supersedeActiveCodexControls(reason) {
+        if (!session) return;
+        const controls = [
+          ...(session.activeCodexControlQueue || []),
+          session.activeCodexControl,
+          session.pendingCodexSteer
+        ].filter(Boolean);
+        for (const control of controls) {
+          terminalizeActiveControl(
+            control,
+            String(control.action || "steer_active_codex"),
+            reason
+          );
+        }
+        session.activeCodexControlQueue.length = 0;
+        session.activeCodexControl = null;
+        session.pendingCodexSteer = null;
       }
 
       function startNextActiveCodexControlTurn() {
@@ -4134,27 +4200,61 @@ private extension DirectRealtimeController {
         });
       }
 
-      function queueActiveCodexControlTurn(text) {
-        if (!session || session.lifecycle !== "active") return false;
+      function queueActiveCodexControlTurn(text, displayTurnID = "") {
+        if (!session || session.lifecycle !== "active") {
+          return { queued: false, deliveryState: "failed" };
+        }
         const value = String(text || "").trim();
-        if (!value) return false;
+        if (!value) return { queued: false, deliveryState: "failed" };
+        const now = Date.now();
+        session.recentCodexControlReceipts =
+          session.recentCodexControlReceipts.filter(
+            receipt => now - receipt.receivedAt <= 1800
+          );
+        const duplicate = session.recentCodexControlReceipts.find(
+          receipt => receipt.text === value
+        );
+        const voiceTurnID = String(displayTurnID || "").trim()
+          || `turn-${session.generation}-${++session.turnSequence}`;
+        if (duplicate) {
+          diagnostic("active_codex_control_duplicate_suppressed", session.generation, {
+            duplicateOf: duplicate.controlRequestID,
+            turnID: voiceTurnID
+          });
+          return {
+            queued: false,
+            deliveryState: "superseded",
+            voiceTurnID
+          };
+        }
         const controlRequestID =
           `voice-relay-steer-g${session.generation}-c${String(
             ++session.controlRequestSequence
           ).padStart(6, "0")}`;
-        const voiceTurnID =
-          `turn-${session.generation}-${++session.turnSequence}`;
-        session.activeCodexControlQueue.push({
+        const control = {
           controlRequestID,
           voiceTurnID,
-          text: value
-        });
+          text: value,
+          receivedAt: now
+        };
+        session.activeCodexControlQueue.push(control);
+        session.recentCodexControlReceipts.push(control);
+        if (session.recentCodexControlReceipts.length > 16) {
+          session.recentCodexControlReceipts.splice(
+            0,
+            session.recentCodexControlReceipts.length - 16
+          );
+        }
         diagnostic("active_codex_control_queued", session.generation, {
           controlRequestID,
           turnID: voiceTurnID
         });
-        startNextActiveCodexControlTurn();
-        return true;
+        return {
+          queued: true,
+          deliveryState: "pending",
+          voiceTurnID,
+          controlRequestID
+        };
       }
 
       function beginSemanticStop(
@@ -4167,8 +4267,8 @@ private extension DirectRealtimeController {
         const value = String(text || "").trim();
         const isClosure = acknowledgementKind === "farewell";
         session.lifecycle = "stop_requested";
+        supersedeActiveCodexControls("superseded_by_stop");
         session.acceptedTurnQueue.length = 0;
-        session.activeCodexControlQueue.length = 0;
         session.codexSpeechQueue.length = 0;
         session.codexSpeechInFlight = false;
         session.activeCodexSpeech = null;
@@ -4179,15 +4279,6 @@ private extension DirectRealtimeController {
         session.userVoicePreemptionSettled = false;
         session.pendingAssistantAudioResponseCreates = 0;
         session.activeUserTurn = null;
-        session.activeCodexControl = null;
-        if (session.pendingCodexSteer) {
-          terminalizeActiveControl(
-            session.pendingCodexSteer,
-            "steer_active_codex",
-            "invalidated_by_stop"
-          );
-          session.pendingCodexSteer = null;
-        }
         session.routeInFlight = false;
         session.controlRouteInFlight = false;
         send({
@@ -5481,6 +5572,7 @@ private extension DirectRealtimeController {
           controlRequestSequence: 0,
           pendingCodexSteer: null,
           retiredControlRequestIDs: new Set(),
+          recentCodexControlReceipts: [],
           lastRepeatableAssistantOutput: null,
           recoverableInterruptedFinal: null,
           commentaryProgressMarker: null,

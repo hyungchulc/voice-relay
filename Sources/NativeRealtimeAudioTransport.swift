@@ -113,6 +113,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private var playerNode: AVAudioPlayerNode?
     private var wakeAudioConsumer: ((WakeAudioChunk) -> Void)?
     private var wakeAudioFailureHandler: (() -> Void)?
+    private var wakeAudioRearmBoundaryFrame: Int64?
     private var wakeAudioHealthWorkItem: DispatchWorkItem?
     private var wakeAudioHealthToken: UInt64 = 0
     private var wakeDeliveredChunks = 0
@@ -457,6 +458,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             pendingBargeInPCM.removeAll(keepingCapacity: false)
             captureTimingHealth.reset()
             if !enabled {
+                wakeAudioRearmBoundaryFrame = nil
+                if !wakeAudioHandoffJournal.hasCommittedHandoff {
+                    wakeAudioHandoffJournal.cancel()
+                }
                 cancelWakeAudioHealthCheck()
                 wakeAudioConsumer = nil
                 wakeAudioFailureHandler = nil
@@ -608,6 +613,23 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     }
 
     @discardableResult
+    func beginWakeAudioRearm() -> Bool {
+        stateQueue.sync {
+            guard activeGeneration == nil,
+                  microphoneInputEnabled,
+                  wakeAudioConsumer != nil,
+                  !wakeAudioHandoffJournal.hasCommittedHandoff else {
+                return false
+            }
+            if wakeAudioRearmBoundaryFrame == nil {
+                wakeAudioRearmBoundaryFrame =
+                    wakeAudioHandoffJournal.nextFrame
+            }
+            return true
+        }
+    }
+
+    @discardableResult
     func beginWakeAudioDelivery(
         _ handler: @escaping (WakeAudioChunk) -> Void,
         onFailure: @escaping () -> Void
@@ -625,8 +647,11 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                   captureTapInstalled else {
                 return false
             }
-            wakeAudioHandoffJournal.beginWake()
-            advanceCaptureRoutingEpoch()
+            let rearmBoundaryFrame = wakeAudioRearmBoundaryFrame
+            if rearmBoundaryFrame == nil {
+                wakeAudioHandoffJournal.beginWake()
+                advanceCaptureRoutingEpoch()
+            }
             wakeAudioConsumer = handler
             wakeAudioFailureHandler = onFailure
             if !audioEngine.isRunning {
@@ -651,6 +676,53 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 capturedBaseline: wakeDeliveredChunks,
                 reason: "initial_binding"
             )
+            if let rearmBoundaryFrame {
+                guard case let .ready(replay) =
+                    wakeAudioHandoffJournal.replay(
+                        fromFrame: rearmBoundaryFrame
+                    ) else {
+                    wakeAudioConsumer = nil
+                    wakeAudioFailureHandler = nil
+                    wakeAudioRearmBoundaryFrame = nil
+                    wakeAudioHandoffJournal.cancel()
+                    VoiceRelayDiagnostics.flow(
+                        "wake_audio_rearm_replay_failed",
+                        fields: ["reason": "buffer_truncated"]
+                    )
+                    return false
+                }
+                if !replay.data.isEmpty {
+                    guard let wakeBuffer = Self.wakeAudioBuffer(
+                        fromPCM16: replay.data
+                    ) else {
+                        wakeAudioConsumer = nil
+                        wakeAudioFailureHandler = nil
+                        wakeAudioRearmBoundaryFrame = nil
+                        wakeAudioHandoffJournal.cancel()
+                        VoiceRelayDiagnostics.flow(
+                            "wake_audio_rearm_replay_failed",
+                            fields: ["reason": "conversion_failed"]
+                        )
+                        return false
+                    }
+                    wakeDeliveredChunks += 1
+                    handler(
+                        WakeAudioChunk(
+                            buffer: wakeBuffer,
+                            span: replay.span
+                        )
+                    )
+                }
+                wakeAudioRearmBoundaryFrame = nil
+                VoiceRelayDiagnostics.flow(
+                    "wake_audio_rearm_replayed",
+                    fields: [
+                        "start_frame": String(replay.span.startFrame),
+                        "end_frame": String(replay.span.endFrame),
+                        "byte_count": String(replay.data.count),
+                    ]
+                )
+            }
             return true
         }
     }
@@ -662,7 +734,8 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             audioConfigurationRecoveryPolicy.invalidate()
             audioRecoveryStableWorkItem?.cancel()
             audioRecoveryStableWorkItem = nil
-            if !wakeAudioHandoffJournal.hasCommittedHandoff {
+            if wakeAudioRearmBoundaryFrame == nil,
+               !wakeAudioHandoffJournal.hasCommittedHandoff {
                 advanceCaptureRoutingEpoch()
                 wakeAudioHandoffJournal.cancel()
             }
@@ -698,6 +771,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
 
     func cancelWakeAudioHandoff() {
         stateQueue.sync {
+            wakeAudioRearmBoundaryFrame = nil
             wakeAudioHandoffLifecycle.cancel()
             wakeAudioHandoffJournal.cancel()
             wakeAudioReplayPump.reset()
@@ -1302,6 +1376,12 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
         mediaEpoch &+= 1
         advanceCaptureRoutingEpoch()
+        if wakeAudioRearmBoundaryFrame != nil {
+            wakeAudioRearmBoundaryFrame = nil
+            if !wakeAudioHandoffJournal.hasCommittedHandoff {
+                wakeAudioHandoffJournal.cancel()
+            }
+        }
         cancelWakeAudioHealthCheck()
         provisionalPauseToken &+= 1
         playbackProvisionallyPaused = false
@@ -2053,6 +2133,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                         == .committedJournal
                     || (
                         self.wakeAudioConsumer != nil
+                        || self.wakeAudioRearmBoundaryFrame != nil
                         || self.wakeAudioHandoffJournal
                             .hasCommittedHandoff
                     )
@@ -2781,6 +2862,12 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         return buffer
     }
 
+    private static func wakeAudioBuffer(
+        fromPCM16 data: Data
+    ) -> AVAudioPCMBuffer? {
+        playbackBuffer(from: data)
+    }
+
     private func provisionallyPausePlaybackForBargeIn() {
         guard scheduledPlaybackBuffers > 0,
               !playbackProvisionallyPaused,
@@ -3116,6 +3203,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         echoAdmissionPolicy.reset()
         pendingPCM.removeAll(keepingCapacity: false)
         pendingBargeInPCM.removeAll(keepingCapacity: false)
+        wakeAudioRearmBoundaryFrame = nil
         wakeAudioHandoffLifecycle.cancel()
         wakeAudioHandoffJournal.cancel()
         wakeAudioReplayPump.reset()
