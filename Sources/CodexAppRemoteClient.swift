@@ -68,11 +68,12 @@ struct CodexConnectionSnapshot {
 struct CodexEffectiveConfig: Equatable {
     let model: String
     let reasoningEffort: String
+    let serviceTier: String
     let sandbox: String
     let approvalPolicy: String
 
     var summary: String {
-        "\(model) · \(reasoningEffort) · \(sandbox) · \(approvalPolicy)"
+        "\(model) · \(reasoningEffort) · \(serviceTier) · \(sandbox) · \(approvalPolicy)"
     }
 }
 
@@ -1098,6 +1099,7 @@ final class CodexAppRemoteClient {
             effectiveConfig: CodexEffectiveConfig(
                 model: config["model"] as? String ?? "unknown",
                 reasoningEffort: config["reasoningEffort"] as? String ?? "unknown",
+                serviceTier: config["serviceTier"] as? String ?? "unknown",
                 sandbox: config["sandbox"] as? String ?? "unknown",
                 approvalPolicy: config["approvalPolicy"] as? String ?? "unknown"
             ),

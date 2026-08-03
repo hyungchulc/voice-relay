@@ -38,6 +38,7 @@ private struct WakeCaptureCandidate: Equatable {
     let isFinal: Bool
     let laneIndex: Int
     let localeIdentifier: String
+    let confidence: Float?
     let recognizedThroughFrame: Int64?
 }
 
@@ -48,6 +49,7 @@ final class WakePhraseController {
     )
 
     private let localeIdentifiers: [String]
+    private let explicitLocaleIdentifier: String?
     private let recognizers: [SFSpeechRecognizer]
     private let phrases: [String]
     private let preferModernSpeechAnalyzer: Bool
@@ -89,6 +91,7 @@ final class WakePhraseController {
     init(
         localeIdentifiers: [String],
         phrases: [String],
+        explicitLocaleIdentifier: String? = nil,
         preferModernSpeechAnalyzer: Bool = true,
         externalAudioSource: WakeAudioBufferSource? = nil,
         captureAdmission: @escaping (String) -> Bool = { _ in true }
@@ -97,6 +100,7 @@ final class WakePhraseController {
             localeIdentifiers
         )
         self.localeIdentifiers = resolved
+        self.explicitLocaleIdentifier = explicitLocaleIdentifier
         recognizers = resolved.compactMap {
             SFSpeechRecognizer(locale: Locale(identifier: $0))
         }
@@ -397,6 +401,7 @@ final class WakePhraseController {
                         transcript,
                         laneIndex: laneIndex,
                         localeIdentifier: localeIdentifier,
+                        confidence: nil,
                         isFinal: isFinal,
                         recognizedThroughFrame: recognizedThroughFrame,
                         generation: generation
@@ -655,7 +660,7 @@ final class WakePhraseController {
                     captureFormat.sampleRate
                 ),
                 "source": legacyUsesExternalAudioSource
-                    ? "persistent_realtime_capture"
+                    ? "persistent_raw_wake_capture"
                     : "legacy_speech_engine",
             ]
         )
@@ -683,24 +688,31 @@ final class WakePhraseController {
                 DispatchQueue.main.async {
                     guard generation == self.recognitionGeneration else { return }
                     if let transcription = result?.bestTranscription {
-                        let transcripts =
-                            result?.transcriptions.map(\.formattedString)
-                                ?? [transcription.formattedString]
+                        let transcriptions = result?.transcriptions
+                            ?? [transcription]
                         let transcript =
                             WakeTranscriptCandidatePolicy
                                 .preferredWakeTranscript(
-                                    transcripts: transcripts,
+                                    transcripts: transcriptions.map(
+                                        \.formattedString
+                                    ),
                                     phrases: self.phrases
                                 )
+                        let selectedTranscription = transcriptions.first {
+                            $0.formattedString == transcript
+                        } ?? transcription
                         if self.handleWakeTranscript(
                             transcript,
                             laneIndex: laneIndex,
                             localeIdentifier:
                                 recognizer.locale.identifier,
+                            confidence: self.legacyConfidence(
+                                selectedTranscription
+                            ),
                             isFinal: result?.isFinal == true,
                             recognizedThroughFrame:
                                 self.legacyRecognizedThroughFrame(
-                                    transcription
+                                    selectedTranscription
                                 ),
                             generation: generation
                         ) {
@@ -729,6 +741,7 @@ final class WakePhraseController {
         _ transcript: String,
         laneIndex: Int,
         localeIdentifier: String,
+        confidence: Float?,
         isFinal: Bool,
         recognizedThroughFrame: Int64?,
         generation: Int
@@ -748,16 +761,34 @@ final class WakePhraseController {
             ],
             transcriptFields: ["text": transcript]
         )
-        if let match = WakePhrasePolicy.match(
+        let match = WakePhrasePolicy.match(
             transcript,
             phrases: phrases
-        ) {
+        )
+        VoiceRelayDiagnostics.flow(
+            "wake_locale_lane_evaluated",
+            generation: generation,
+            fields: [
+                "backend":
+                    modernSession == nil ? "legacy_speech" : "speech_analyzer",
+                "confidence": confidence.map { String($0) }
+                    ?? "unavailable",
+                "final": String(isFinal),
+                "lane": String(laneIndex),
+                "locale": localeIdentifier,
+                "selection_reason": match == nil
+                    ? "wake_phrase_not_matched"
+                    : "wake_phrase_matched",
+            ]
+        )
+        if let match {
             wakeCandidates[laneIndex] = WakeCaptureCandidate(
                 match: match,
                 transcript: transcript,
                 isFinal: isFinal,
                 laneIndex: laneIndex,
                 localeIdentifier: localeIdentifier,
+                confidence: confidence,
                 recognizedThroughFrame: recognizedThroughFrame
             )
         } else {
@@ -827,6 +858,37 @@ final class WakePhraseController {
                     recognizedThroughFrame: $0
                 )
             }
+            let localeSelection = SpokenLocaleSelectionPolicy.resolve(
+                explicitOverrideIdentifier: self.explicitLocaleIdentifier,
+                laneEvidence: self.wakeCandidates.values.map {
+                    RecognitionLocaleEvidence(
+                        laneIndex: $0.laneIndex,
+                        localeIdentifier: $0.localeIdentifier,
+                        confidence: $0.confidence,
+                        isFinal: $0.isFinal
+                    )
+                },
+                activationWakeLocaleIdentifier: candidate.localeIdentifier,
+                configuredPrimaryLocaleIdentifier:
+                    self.localeIdentifiers.first ?? "",
+                configuredSupportedLocaleIdentifiers:
+                    self.localeIdentifiers
+            )
+            VoiceRelayDiagnostics.flow(
+                "wake_locale_selected",
+                generation: generation,
+                fields: [
+                    "confidence": localeSelection.confidence.map { String($0) }
+                        ?? "unavailable",
+                    "final": localeSelection.isFinal.map { String($0) }
+                        ?? "unavailable",
+                    "lane": localeSelection.laneIndex.map { String($0) }
+                        ?? "unavailable",
+                    "locale": localeSelection.localeIdentifier
+                        ?? "unavailable",
+                    "selection_reason": localeSelection.reason.rawValue,
+                ]
+            )
             let activation = WakeActivationContext(
                 activationID: UUID().uuidString,
                 commandText: WakeRealtimePrefillPolicy.prefill(
@@ -835,8 +897,14 @@ final class WakePhraseController {
                 recognizedUtteranceText:
                     WakeDisplayTranscriptPolicy.visibleText(
                         recognizedText: candidate.transcript
-                    ),
+                ),
                 wakeLocaleIdentifier: candidate.localeIdentifier,
+                spokenLocaleIdentifier:
+                    localeSelection.localeIdentifier ?? "",
+                spokenLocaleSelectionReason: localeSelection.reason,
+                spokenLocaleLaneIndex: localeSelection.laneIndex,
+                spokenLocaleConfidence: localeSelection.confidence,
+                spokenLocaleIsFinal: localeSelection.isFinal,
                 handoffTicketID: handoffTicket?.id
             )
             self.stopRecognition(
@@ -885,6 +953,16 @@ final class WakePhraseController {
                 (end * Double(WakeAudioHandoffJournal.sampleRate))
                     .rounded(.up)
             )
+    }
+
+    private func legacyConfidence(
+        _ transcription: SFTranscription
+    ) -> Float? {
+        let calibrated = transcription.segments
+            .map(\.confidence)
+            .filter { $0 > 0 && $0.isFinite }
+        guard !calibrated.isEmpty else { return nil }
+        return calibrated.reduce(0, +) / Float(calibrated.count)
     }
 
     private func stopRecognition(
@@ -1573,7 +1651,7 @@ private final class SpeechAnalyzerWakeSession {
                         generation: self.diagnosticGeneration,
                         fields: [
                             "source": usesExternalAudioSource
-                                ? "persistent_realtime_capture"
+                                ? "persistent_raw_wake_capture"
                                 : "speech_analyzer_engine",
                         ]
                     )

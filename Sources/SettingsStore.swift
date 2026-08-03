@@ -124,6 +124,19 @@ enum VoiceRelayDiagnostics {
     }
 }
 
+enum CodexServiceTierSelection: String, CaseIterable, Equatable {
+    case inherit
+    case standard
+    case priority
+
+    static func parse(_ value: String?) -> Self {
+        guard let value else { return .inherit }
+        return Self(rawValue: value.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).lowercased()) ?? .standard
+    }
+}
+
 struct AppSettings: Equatable {
     var productName: String
     var assistantName: String
@@ -154,7 +167,7 @@ struct AppSettings: Equatable {
     var codexThreadTitle: String
     var codexModel: String
     var codexReasoningEffort: String
-    var codexFastMode: Bool
+    var codexServiceTierSelection: CodexServiceTierSelection
     var codexSandbox: String
     var codexApprovalPolicy: String
 
@@ -213,7 +226,7 @@ struct AppSettings: Equatable {
             codexThreadTitle: "",
             codexModel: "inherit",
             codexReasoningEffort: "inherit",
-            codexFastMode: false,
+            codexServiceTierSelection: .inherit,
             codexSandbox: "inherit",
             codexApprovalPolicy: "inherit",
             includeAuthorityPack: false,
@@ -256,7 +269,7 @@ final class SettingsStore {
         "shimmer",
         "verse",
     ]
-    static let currentSchemaVersion = 20
+    static let currentSchemaVersion = 21
     private static let legacyDefaultRealtimeInstructionFingerprints:
         Set<UInt64> = [
             0x01a7718371a87c1c,
@@ -377,6 +390,8 @@ final class SettingsStore {
         static let codexThreadTitle = "voiceRelay.codex.threadTitle"
         static let codexModel = "voiceRelay.codex.model"
         static let codexReasoningEffort = "voiceRelay.codex.reasoningEffort"
+        static let codexServiceTierSelection =
+            "voiceRelay.codex.serviceTierSelection"
         static let codexFastMode = "voiceRelay.codex.fastMode"
         static let codexSandbox = "voiceRelay.codex.sandbox"
         static let codexApprovalPolicy = "voiceRelay.codex.approvalPolicy"
@@ -426,8 +441,29 @@ final class SettingsStore {
             .appendingPathComponent("thread-binding.lock", isDirectory: false)
     }
 
+    private func migrateCodexServiceTierSelectionIfNeeded(
+        storedSchemaVersion: Int
+    ) {
+        guard storedSchemaVersion < Self.currentSchemaVersion,
+              defaults.object(forKey: Key.codexServiceTierSelection) == nil,
+              defaults.object(forKey: Key.codexFastMode) != nil else {
+            return
+        }
+        let selection: CodexServiceTierSelection =
+            defaults.bool(forKey: Key.codexFastMode)
+                ? .priority
+                : .standard
+        defaults.set(
+            selection.rawValue,
+            forKey: Key.codexServiceTierSelection
+        )
+    }
+
     func load() -> AppSettings {
         let storedSchemaVersion = defaults.integer(forKey: Key.schemaVersion)
+        migrateCodexServiceTierSelectionIfNeeded(
+            storedSchemaVersion: storedSchemaVersion
+        )
         if storedSchemaVersion < Self.currentSchemaVersion,
            let storedRealtimeInstructions =
             defaults.string(forKey: Key.realtimeInstructions),
@@ -534,9 +570,9 @@ final class SettingsStore {
             codexReasoningEffort: Self.normalizedCodexReasoningEffort(
                 defaults.string(forKey: Key.codexReasoningEffort) ?? fallback.codexReasoningEffort
             ),
-            codexFastMode: boolValue(
-                forKey: Key.codexFastMode,
-                fallback: fallback.codexFastMode
+            codexServiceTierSelection: CodexServiceTierSelection.parse(
+                defaults.string(forKey: Key.codexServiceTierSelection)
+                    ?? fallback.codexServiceTierSelection.rawValue
             ),
             codexSandbox: Self.normalizedCodexSandbox(
                 defaults.string(forKey: Key.codexSandbox) ?? fallback.codexSandbox
@@ -768,7 +804,14 @@ final class SettingsStore {
             Self.normalizedCodexReasoningEffort(settings.codexReasoningEffort),
             forKey: Key.codexReasoningEffort
         )
-        defaults.set(settings.codexFastMode, forKey: Key.codexFastMode)
+        defaults.set(
+            settings.codexServiceTierSelection.rawValue,
+            forKey: Key.codexServiceTierSelection
+        )
+        defaults.set(
+            settings.codexServiceTierSelection == .priority,
+            forKey: Key.codexFastMode
+        )
         defaults.set(Self.normalizedCodexSandbox(settings.codexSandbox), forKey: Key.codexSandbox)
         defaults.set(
             Self.normalizedCodexApprovalPolicy(settings.codexApprovalPolicy),

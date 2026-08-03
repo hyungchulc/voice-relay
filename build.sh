@@ -7,6 +7,10 @@ APP_DIR="${OUT_DIR}/Voice Relay.app"
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/voice-relay.XXXXXX")"
 ARCHS="${VOICE_RELAY_ARCHS:-arm64 x86_64}"
 SIGNING_IDENTITY="${VOICE_RELAY_SIGNING_IDENTITY:--}"
+SOURCE_PATH_FLAGS=(
+  -debug-prefix-map "$ROOT=VoiceRelay"
+  -file-prefix-map "$ROOT=VoiceRelay"
+)
 if [[ "$#" -ne 0 ]]; then
   echo "usage: $0" >&2
   exit 2
@@ -39,6 +43,7 @@ mkdir -p \
 SOURCES=(
   "$ROOT/Sources/AppLocalization.swift"
   "$ROOT/Sources/AmbientBackdropView.swift"
+  "$ROOT/Sources/ConnectorCore.swift"
   "$ROOT/Sources/VoiceRelayOverlay.swift"
   "$ROOT/Sources/VoiceCodexRequestEnvelope.swift"
   "$ROOT/Sources/AuthorityPackComposer.swift"
@@ -66,6 +71,7 @@ for arch in $ARCHS; do
   xcrun swiftc \
     -parse-as-library \
     -target "$arch-apple-macos14.0" \
+    "${SOURCE_PATH_FLAGS[@]}" \
     "${SOURCES[@]}" \
     -o "$arch_binary" \
     -framework Cocoa \
@@ -98,6 +104,7 @@ xcrun swiftc \
   "$ROOT/Sources/CodexAppRemoteClient.swift" \
   "$ROOT/Sources/LaunchAtLoginManager.swift" \
   "$ROOT/Sources/OverlayPlacement.swift" \
+  "$ROOT/Sources/ConnectorCore.swift" \
   "$ROOT/Sources/PresenceMonitor.swift" \
   "$ROOT/Sources/SettingsStore.swift" \
   "$ROOT/Sources/VoiceCodexRequestEnvelope.swift" \
@@ -111,6 +118,36 @@ xcrun swiftc \
   -framework Security
 "$BUILD_DIR/VoiceRelayPolicyTests"
 
+xcrun swiftc \
+  -parse-as-library \
+  -target "$HOST_ARCH-apple-macos14.0" \
+  "$ROOT/Sources/ConnectorCore.swift" \
+  "$ROOT/Tests/ConnectorCoreTests.swift" \
+  -o "$BUILD_DIR/VoiceRelayConnectorCoreTests"
+"$BUILD_DIR/VoiceRelayConnectorCoreTests"
+
+xcrun swiftc \
+  -parse-as-library \
+  -target "$HOST_ARCH-apple-macos14.0" \
+  "$ROOT/Sources/AppLocalization.swift" \
+  "$ROOT/Sources/AuthorityPackComposer.swift" \
+  "$ROOT/Sources/CodexAppRemoteClient.swift" \
+  "$ROOT/Sources/LaunchAtLoginManager.swift" \
+  "$ROOT/Sources/OverlayPlacement.swift" \
+  "$ROOT/Sources/ConnectorCore.swift" \
+  "$ROOT/Sources/PresenceMonitor.swift" \
+  "$ROOT/Sources/SettingsStore.swift" \
+  "$ROOT/Sources/VoiceCodexRequestEnvelope.swift" \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  "$ROOT/Sources/RealtimeAudioAdmissionPolicy.swift" \
+  "$ROOT/Sources/RealtimeEchoAdmissionPolicy.swift" \
+  "$ROOT/Tests/PresenceMonitorTests.swift" \
+  -o "$BUILD_DIR/VoiceRelayPresenceMonitorTests" \
+  -framework Cocoa \
+  -framework ServiceManagement \
+  -framework Security
+"$BUILD_DIR/VoiceRelayPresenceMonitorTests"
+
 cp "$BUILD_DIR/VoiceRelay" "$APP_DIR/Contents/MacOS/VoiceRelay"
 /usr/bin/ditto \
   "$SPARKLE_FRAMEWORK" \
@@ -119,6 +156,8 @@ cp "$ROOT/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$ROOT/Resources/PrivacyInfo.xcprivacy" "$APP_DIR/Contents/Resources/PrivacyInfo.xcprivacy"
 cp "$ROOT/Resources/authority-pack.json" \
   "$APP_DIR/Contents/Resources/authority-pack.json"
+cp "$ROOT/Resources/connector.schema.json" \
+  "$APP_DIR/Contents/Resources/connector.schema.json"
 cp "$ROOT/Resources/VoiceRelay.icns" "$APP_DIR/Contents/Resources/VoiceRelay.icns"
 cp "$ROOT/Resources/VoiceRelayIcon-1024.png" \
   "$APP_DIR/Contents/Resources/VoiceRelayIcon-1024.png"
@@ -134,6 +173,11 @@ cp "$ROOT/Helpers/voice-relay-thread-policy.mjs" \
 mkdir -p "$APP_DIR/Contents/Resources/Support"
 cp -R "$ROOT/Support/CodexRemote" \
   "$APP_DIR/Contents/Resources/Support/CodexRemote"
+"$ROOT/audit-public-source.sh" --content-only \
+  "$APP_DIR/Contents/Resources" >/dev/null
+/usr/bin/strings "$BUILD_DIR/VoiceRelay" > "$BUILD_DIR/VoiceRelay.strings"
+"$ROOT/audit-public-source.sh" --content-only \
+  "$BUILD_DIR/VoiceRelay.strings" >/dev/null
 chmod +x "$APP_DIR/Contents/MacOS/VoiceRelay"
 
 plutil -lint "$APP_DIR/Contents/Info.plist" >/dev/null
@@ -141,6 +185,9 @@ plutil -lint "$APP_DIR/Contents/Resources/PrivacyInfo.xcprivacy" >/dev/null
 node -e \
   'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' \
   "$APP_DIR/Contents/Resources/authority-pack.json"
+node -e \
+  'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' \
+  "$APP_DIR/Contents/Resources/connector.schema.json"
 SPARKLE_BUNDLE="$APP_DIR/Contents/Frameworks/Sparkle.framework"
 SIGN_ARGS=(--force --sign "$SIGNING_IDENTITY")
 if [[ -z "$SIGNING_IDENTITY" || "$SIGNING_IDENTITY" == "-" ]]; then

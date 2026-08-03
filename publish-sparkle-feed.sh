@@ -33,8 +33,8 @@ RELEASE_STATE="$(
   "$GH_BIN" api "repos/${REPOSITORY}/releases/tags/${TAG}" \
     --jq '[.draft, .prerelease, ([.assets[].name] | index("'"$EXPECTED_ARCHIVE"'") != null)] | @tsv'
 )"
-if [[ "$RELEASE_STATE" != $'false\tfalse\ttrue' ]]; then
-  echo "Publish the matching ordinary GitHub release and update archive first." >&2
+if [[ "$RELEASE_STATE" != $'false\ttrue\ttrue' ]]; then
+  echo "Publish the matching GitHub prerelease and update archive first." >&2
   exit 3
 fi
 

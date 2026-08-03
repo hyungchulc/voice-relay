@@ -11,6 +11,7 @@ private struct AppConfig {
     let appearanceMode: AppAppearanceMode
     let autoSpeak: Bool
     let speechLocale: String
+    let speechLocaleExplicitlyForced: Bool
     let speechVoiceIdentifier: String?
     let speechRate: Float
     let overlayAnchor: OverlayAnchor
@@ -46,6 +47,15 @@ private struct AppConfig {
     static func load() -> AppConfig {
         let env = ProcessInfo.processInfo.environment
         let settings = SettingsStore.shared.load()
+        let configuredSpeechLocale = nonEmpty(
+            env["VOICE_RELAY_SPEECH_LOCALE"]
+        ) ?? settings.speechLocale
+        let speechLocaleExplicitlyForced =
+            !configuredSpeechLocale.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty
+            && configuredSpeechLocale.caseInsensitiveCompare("system")
+                != .orderedSame
 
         return AppConfig(
             productName: settings.productName,
@@ -58,9 +68,9 @@ private struct AppConfig {
                 fallback: settings.autoSpeak
             ),
             speechLocale: SettingsStore.resolvedSpeechLocaleIdentifier(
-                nonEmpty(env["VOICE_RELAY_SPEECH_LOCALE"])
-                    ?? settings.speechLocale
+                configuredSpeechLocale
             ),
+            speechLocaleExplicitlyForced: speechLocaleExplicitlyForced,
             speechVoiceIdentifier: nonEmpty(env["VOICE_RELAY_SPEECH_VOICE"]),
             speechRate: Float(env["VOICE_RELAY_SPEECH_RATE"] ?? "") ?? 0.48,
             overlayAnchor: OverlayAnchor.parse(
@@ -871,6 +881,9 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private lazy var wakePhrase = WakePhraseController(
         localeIdentifiers: [config.speechLocale] + config.additionalSpeechLocales,
         phrases: config.wakePhrases,
+        explicitLocaleIdentifier: config.speechLocaleExplicitlyForced
+            ? config.speechLocale
+            : nil,
         preferModernSpeechAnalyzer: config.preferModernSpeechAnalyzer,
         externalAudioSource: realtimeController.wakeAudioSource,
         captureAdmission: { [weak self] reason in
@@ -885,6 +898,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         reasoningEffort: config.realtimeReasoningEffort,
         instructions: config.realtimeInstructions,
         language: config.speechLocale,
+        languageExplicitlyForced: config.speechLocaleExplicitlyForced,
         additionalLanguages: config.additionalSpeechLocales,
         productName: config.productName,
         assistantName: config.assistantName,
@@ -892,6 +906,15 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         wakePhrases: config.wakePhrases
     )
     private let mediaPlaybackDetector = SystemMediaPlaybackDetector()
+    private lazy var connectorBriefingCoordinator = ConnectorBriefingCoordinator(
+        registry: .shared,
+        runner: ConnectorRunner(),
+        ledger: .shared
+    )
+    private let connectorWorkQueue = DispatchQueue(
+        label: "com.hyungchulc.voice-relay.connector",
+        qos: .utility
+    )
     private lazy var presenceMonitor = PresenceMonitor(
         policy: PresencePolicy(
             idleThreshold: TimeInterval(config.returnGreetingMinutes * 60),
@@ -964,8 +987,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             )
         }
     }
-    private var cancelledCodexGenerations: Set<Int> = []
-    private var activeCodexGeneration: Int?
+    private var codexRequestLeaseState = CodexRequestLeaseState()
+    private var activeCodexGeneration: Int? {
+        codexRequestLeaseState.active?.generation
+    }
     private var voiceIdleWorkItem: DispatchWorkItem?
     private var wakeResumeWorkItem: DispatchWorkItem?
     private var voiceStopFallbackWorkItem: DispatchWorkItem?
@@ -976,6 +1001,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private var assistantFinalGeneration: Int?
     private var finalPlaybackDrainedGeneration: Int?
     private var userActivityGeneration: Int?
+    private var pendingConnectorBriefings: [Int: ConnectorBriefingPresentation] = [:]
+    private var pendingPresenceCandidates: [Int: UUID] = [:]
+    private var automaticSpeechPlaybackCorrelation =
+        AutomaticSpeechPlaybackCorrelation()
     private var answerLayoutWorkItem: DispatchWorkItem?
     private var pendingAnswerRender: (() -> Void)?
     private var answerLayoutGeneration = 0
@@ -1243,7 +1272,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             preferredThreadTitle: liveSettings.codexThreadTitle,
             model: liveSettings.codexModel,
             reasoningEffort: liveSettings.codexReasoningEffort,
-            serviceTier: liveSettings.codexFastMode ? "priority" : nil,
+            serviceTier: liveSettings.codexServiceTierSelection.rawValue,
             sandbox: config.codexSandbox,
             approvalPolicy: config.codexApprovalPolicy,
             additionalContext: nil,
@@ -1350,6 +1379,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     private func performCodexRequest(
         _ text: String,
         generation: Int,
+        requestID: String,
         displayResult: Bool,
         finishSurface: Bool,
         completion: @escaping (Result<String, Error>) -> Void
@@ -1392,7 +1422,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         }
 
         streamedAnswer = ""
-        activeCodexGeneration = generation
+        let requestLease = codexRequestLeaseState.begin(
+            generation: generation,
+            requestID: requestID
+        )
         scheduleVoiceIdleTimeout()
         VoiceRelayDiagnostics.flow(
             "codex_request_started",
@@ -1409,12 +1442,13 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             onCommentary: { [weak self] commentary in
                 DispatchQueue.main.async {
                     guard let self,
-                          self.voiceState.generation == generation else {
+                          self.voiceState.generation == generation,
+                          self.codexRequestLeaseState.matches(requestLease) else {
                         return
                     }
                     self.presentCodexCommentary(
                         commentary,
-                        generation: generation
+                        lease: requestLease
                     )
                     VoiceRelayDiagnostics.flow(
                         "codex_commentary_received_host",
@@ -1477,16 +1511,17 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                             error.localizedDescription
                         )
                     }
-                    if self.activeCodexGeneration == generation {
-                        self.activeCodexGeneration = nil
+                    let completedActiveRequest =
+                        self.codexRequestLeaseState.complete(requestLease)
+                    if completedActiveRequest {
+                        self.scheduleVoiceIdleTimeout()
+                        self.completeCodexRequest(
+                            result,
+                            generation: generation,
+                            displayResult: displayResult,
+                            finishSurface: finishSurface
+                        )
                     }
-                    self.scheduleVoiceIdleTimeout()
-                    self.completeCodexRequest(
-                        result,
-                        generation: generation,
-                        displayResult: displayResult,
-                        finishSurface: finishSurface
-                    )
                     completion(result)
                 }
             }
@@ -1495,11 +1530,11 @@ private final class OverlayController: NSObject, NSWindowDelegate {
 
     private func presentCodexCommentary(
         _ commentary: CodexCommentary,
-        generation: Int
+        lease: CodexRequestLease
     ) {
+        let generation = lease.generation
         guard voiceState.generation == generation,
-              activeCodexGeneration == generation,
-              !cancelledCodexGenerations.contains(generation) else {
+              codexRequestLeaseState.matches(lease) else {
             return
         }
         let text = commentary.text
@@ -1529,8 +1564,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         displayResult: Bool,
         finishSurface: Bool
     ) {
-        guard voiceState.generation == generation,
-              !cancelledCodexGenerations.contains(generation) else {
+        guard voiceState.generation == generation else {
             return
         }
         switch result {
@@ -2512,6 +2546,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             self.performCodexRequest(
                 request.codexInput,
                 generation: generation,
+                requestID: request.requestID,
                 displayResult: false,
                 finishSurface: false,
                 completion: completion
@@ -2539,21 +2574,117 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     }
 
     private func wirePresenceGreeting() {
-        presenceMonitor.onReturnCandidate = { [weak self] in
+        presenceMonitor.onReturnCandidate = { [weak self] candidate in
             guard let self,
                   !self.voiceState.phase.isSessionActive,
                   !self.isWaitingForReply else {
+                VoiceRelayDiagnostics.flow(
+                    "presence_speech_deferred",
+                    fields: ["reason": PresenceGateReason.busy.rawValue]
+                )
                 return false
             }
-            guard self.wakeCaptureDecision(
-                reason: "presence_return"
-            ) == .start else {
+            let snapshot = self.mediaPlaybackDetector.snapshot()
+            let gate = PresenceMediaGate.evaluate(snapshot)
+            guard gate == .allowed else {
+                let reason: PresenceGateReason
+                if case let .deferred(value) = gate {
+                    reason = value
+                } else {
+                    reason = .activeMedia
+                }
+                VoiceRelayDiagnostics.flow(
+                    "presence_speech_deferred",
+                    fields: [
+                        "detector_available": snapshot.isAvailable ? "true" : "false",
+                        "process_count": String(snapshot.processLabels.count),
+                        "reason": reason.rawValue,
+                    ]
+                )
                 return false
             }
-            return self.startRealtimeVoice(
-                acknowledgeWake: true,
-                activationReason: "presence_return"
+            let now = Date()
+            let trigger: ConnectorTrigger = Calendar.current.component(
+                .hour,
+                from: now
+            ) < 12 ? .morning : .returnEvent
+            let formatter = DateFormatter()
+            formatter.calendar = .current
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyy-MM-dd"
+            let event = ConnectorHostEventEnvelope.dailyBrief(
+                trigger: trigger,
+                now: now,
+                localDay: formatter.string(from: now),
+                absenceSeconds: candidate.absenceSeconds,
+                presenceEvidence: candidate.evidence
             )
+            self.connectorWorkQueue.async { [weak self] in
+                guard let self else { return }
+                let preparation = self.connectorBriefingCoordinator.prepare(
+                    event: event
+                )
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let latestSnapshot = self.mediaPlaybackDetector.snapshot()
+                    let latestGate = PresenceMediaGate.evaluate(latestSnapshot)
+                    guard latestGate == .allowed else {
+                        let reason: PresenceGateReason
+                        if case let .deferred(value) = latestGate {
+                            reason = value
+                        } else {
+                            reason = .activeMedia
+                        }
+                        if case let .presentation(presentation) = preparation {
+                            self.connectorBriefingCoordinator.deferForRetry(
+                                presentation
+                            )
+                        }
+                        self.presenceMonitor.releaseDelivery(
+                            candidateID: candidate.id,
+                            reason: reason
+                        )
+                        VoiceRelayDiagnostics.flow(
+                            "presence_speech_deferred",
+                            fields: [
+                                "detector_available": latestSnapshot.isAvailable ? "true" : "false",
+                                "process_count": String(latestSnapshot.processLabels.count),
+                                "reason": reason.rawValue,
+                            ]
+                        )
+                        return
+                    }
+                    let started: Bool
+                    switch preparation {
+                    case let .presentation(presentation):
+                        started = self.startRealtimeVoice(
+                            acknowledgeWake: false,
+                            activationReason: "connector_event",
+                            eventBriefing: presentation,
+                            presenceCandidateID: candidate.id
+                        )
+                        if !started {
+                            self.connectorBriefingCoordinator.fail(
+                                presentation,
+                                reason: PresenceGateReason.startRejected.rawValue
+                            )
+                        }
+                    case .abstained, .duplicate:
+                        started = self.startRealtimeVoice(
+                            acknowledgeWake: true,
+                            activationReason: "presence_return",
+                            presenceCandidateID: candidate.id
+                        )
+                    }
+                    if !started {
+                        self.presenceMonitor.releaseDelivery(
+                            candidateID: candidate.id,
+                            reason: .startRejected
+                        )
+                    }
+                }
+            }
+            return true
         }
     }
 
@@ -2785,8 +2916,25 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
             let responseID = (event["responseId"] as? String) ?? ""
+            let nativeFinalRegistered = assistantOutputLifecycle
+                .registerNativeFinal(
+                    generation: generation,
+                    responseID: responseID
+                )
             SettingsStore.shared.completedFirstVoiceGreeting = true
             assistantFinalGeneration = generation
+            if nativeFinalRegistered,
+               let rawKind = event["kind"] as? String,
+               let kind = AutomaticSpeechKind(rawValue: rawKind),
+               automaticSpeechPlaybackCorrelation.bindFinal(
+                   generation: generation,
+                   responseID: responseID,
+                   kind: kind
+               ),
+               kind == .connectorEventBriefing,
+               let presentation = pendingConnectorBriefings[generation] {
+                connectorBriefingCoordinator.markPresented(presentation)
+            }
             lastAnswer = trimmed
             appendConversation(
                 .assistant,
@@ -2795,10 +2943,7 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             )
             isReplyPreviewVisible = true
             showConversationHistory(animated: true)
-            if assistantOutputLifecycle.registerNativeFinal(
-                generation: generation,
-                responseID: responseID
-            ) {
+            if nativeFinalRegistered {
                 replyRetainUntil = .distantPast
             } else {
                 replyRetainUntil =
@@ -2810,12 +2955,30 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             scheduleVoiceIdleTimeout()
         case "assistantPlaybackDrained":
             guard let responseID = event["responseId"] as? String,
-                  assistantOutputLifecycle.finishNativePlayback(
-                    generation: generation,
-                    responseID: responseID
-                  ) else {
+                  assistantOutputLifecycle.pendingNativeResponseIDs
+                    .contains(responseID) else {
                 return
             }
+            let becameIdle = assistantOutputLifecycle.finishNativePlayback(
+                generation: generation,
+                responseID: responseID
+            )
+            if automaticSpeechPlaybackCorrelation.consumeDrain(
+                generation: generation,
+                responseID: responseID
+            ) {
+                if let presentation = pendingConnectorBriefings.removeValue(
+                    forKey: generation
+                ) {
+                    connectorBriefingCoordinator.complete(presentation)
+                }
+                if let candidateID = pendingPresenceCandidates.removeValue(
+                    forKey: generation
+                ) {
+                    presenceMonitor.acknowledgeDelivery(candidateID: candidateID)
+                }
+            }
+            guard becameIdle else { return }
             finalPlaybackDrainedGeneration = generation
             scheduleVoiceIdleTimeout()
             replyRetainUntil =
@@ -2846,6 +3009,16 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             }
         case "stopIntent":
             beginRealtimeSpokenStop(generation: generation)
+        case "cancelCurrentAnswer":
+            guard let callID = event["callId"] as? String,
+                  !callID.isEmpty else {
+                return
+            }
+            cancelActiveCodexRequest(
+                generation: generation,
+                requestID: callID,
+                reason: "spoken_current_answer_cancel"
+            )
         case "stopAcknowledgementFinal":
             guard let text = event["text"] as? String,
                   let responseID = event["responseId"] as? String,
@@ -2889,6 +3062,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             finishRealtimeSpokenStop(generation: generation)
         case "terminal":
             guard !isShowingTransientError else { return }
+            failPendingAutomaticSpeech(
+                generation: generation,
+                reason: PresenceGateReason.playbackFailed
+            )
             completeVoiceStop(
                 generation: generation,
                 audioHandoffReady: true
@@ -2909,6 +3086,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 autoHideAfter: 3.0
             )
         case "error":
+            failPendingAutomaticSpeech(
+                generation: generation,
+                reason: PresenceGateReason.playbackFailed
+            )
             let copy = AppCopy(
                 preference: SettingsStore.shared.load().appDisplayLanguage
             )
@@ -2917,6 +3098,13 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                     "Realtime connection error",
                     "Realtime 연결 오류"
                 )
+            let failurePlan = AudioCaptureStartupFailurePlan
+                .fromEventFields(
+                    event,
+                    wakePhraseEnabled: config.wakePhraseEnabled
+                )
+            let preserveWakeCapture =
+                failurePlan.preserveCaptureForWake
             NSLog("Voice Relay Realtime failed: %@", message)
             let wasEstablished = voiceState.phase != .starting
             let interruptedAnswer = realtimeDraft
@@ -2948,7 +3136,15 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                 realtimeController.stop(
                     generation: generation,
                     reason: "realtime_error",
-                    preserveCaptureForWake: false
+                    preserveCaptureForWake: preserveWakeCapture,
+                    preserveHandoffJournal:
+                        failurePlan.preserveHandoffJournal
+                )
+            }
+            if failurePlan.rearmWakeAnalyzer {
+                resumeWakePhraseSoon(
+                    reason: "realtime_startup_failure",
+                    delay: 0
                 )
             }
         default:
@@ -2961,7 +3157,9 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         prefill: String? = nil,
         acknowledgeWake: Bool = false,
         activationReason: String? = nil,
-        wakeActivation: WakeActivationContext? = nil
+        wakeActivation: WakeActivationContext? = nil,
+        eventBriefing: ConnectorBriefingPresentation? = nil,
+        presenceCandidateID: UUID? = nil
     ) -> Bool {
         guard microphoneInputEnabled,
               !voiceState.phase.isSessionActive,
@@ -3011,6 +3209,21 @@ private final class OverlayController: NSObject, NSWindowDelegate {
             setAnswerVisible(false, animated: config.animateSurface)
         }
         let generation = voiceState.begin()
+        if let eventBriefing {
+            pendingConnectorBriefings[generation] = eventBriefing
+            automaticSpeechPlaybackCorrelation.reserve(
+                generation: generation,
+                expectedKind: .connectorEventBriefing
+            )
+        } else if presenceCandidateID != nil {
+            automaticSpeechPlaybackCorrelation.reserve(
+                generation: generation,
+                expectedKind: .presenceReturnGreeting
+            )
+        }
+        if let presenceCandidateID {
+            pendingPresenceCandidates[generation] = presenceCandidateID
+        }
         userTurnDisplayRegistry.begin(generation: generation)
         VoiceRelayDiagnostics.flow(
             "realtime_surface_starting",
@@ -3059,11 +3272,35 @@ private final class OverlayController: NSObject, NSWindowDelegate {
                         : nil,
                     shouldGreet: shouldGreet,
                     reason: resolvedActivationReason,
-                    wakeActivation: wakeActivation
+                    wakeActivation: wakeActivation,
+                    eventBriefing: eventBriefing
                 )
             }
         )
         return true
+    }
+
+    private func failPendingAutomaticSpeech(
+        generation: Int,
+        reason: PresenceGateReason
+    ) {
+        if let presentation = pendingConnectorBriefings.removeValue(
+            forKey: generation
+        ) {
+            connectorBriefingCoordinator.fail(
+                presentation,
+                reason: reason.rawValue
+            )
+        }
+        automaticSpeechPlaybackCorrelation.cancel(generation: generation)
+        if let candidateID = pendingPresenceCandidates.removeValue(
+            forKey: generation
+        ) {
+            presenceMonitor.releaseDelivery(
+                candidateID: candidateID,
+                reason: reason
+            )
+        }
     }
 
     private func wakeCaptureDecision(
@@ -3192,6 +3429,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         userActivityGeneration = generation
         guard beginsNewTurn else { return }
         assistantOutputLifecycle.cancelAll(generation: generation)
+        failPendingAutomaticSpeech(
+            generation: generation,
+            reason: .playbackFailed
+        )
         assistantFinalGeneration = nil
         finalPlaybackDrainedGeneration = nil
     }
@@ -3214,6 +3455,10 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         voiceIdleWorkItem?.cancel()
         voiceIdleWorkItem = nil
         assistantOutputLifecycle.cancelAll(generation: generation)
+        failPendingAutomaticSpeech(
+            generation: generation,
+            reason: .playbackFailed
+        )
         if interruptsCodex, activeCodexGeneration == generation {
             cancelActiveCodexRequest(
                 generation: generation,
@@ -3352,6 +3597,16 @@ private final class OverlayController: NSObject, NSWindowDelegate {
         generation: Int,
         audioHandoffReady: Bool
     ) {
+        guard AudioCaptureStopCompletionPolicy.decision(
+            audioHandoffReady: audioHandoffReady
+        ) == .finishAndResumeWake else {
+            VoiceRelayDiagnostics.flow(
+                "transport_stop_handoff_pending",
+                generation: generation,
+                fields: ["reason": "audio_routing_not_drained"]
+            )
+            return
+        }
         let terminalAcknowledgementPending =
             stopAcknowledgementLifecycle.isAwaitingAuthoritativeDrain(
                 generation: generation
@@ -3412,24 +3667,29 @@ private final class OverlayController: NSObject, NSWindowDelegate {
     }
 
     private func prepareCodexGeneration(_ generation: Int) {
-        cancelledCodexGenerations.remove(generation)
-        cancelledCodexGenerations = Set(
-            cancelledCodexGenerations.filter { $0 >= generation - 32 }
-        )
+        guard activeCodexGeneration != generation else { return }
+        codexRequestLeaseState = CodexRequestLeaseState()
     }
 
     private func cancelActiveCodexRequest(
         generation: Int,
+        requestID: String? = nil,
         reason: String = "host_cancel"
     ) {
-        guard activeCodexGeneration == generation else { return }
+        guard let activeLease = codexRequestLeaseState.active,
+              activeLease.generation == generation,
+              requestID == nil || activeLease.requestID == requestID,
+              codexRequestLeaseState.cancel(
+                generation: generation,
+                requestID: activeLease.requestID
+              ) != nil else {
+            return
+        }
         VoiceRelayDiagnostics.flow(
             "codex_interrupt_requested",
             generation: generation,
             fields: ["reason": reason]
         )
-        activeCodexGeneration = nil
-        cancelledCodexGenerations.insert(generation)
         isWaitingForReply = false
         codexClient.interruptActiveTurn { [weak self] result in
             switch result {

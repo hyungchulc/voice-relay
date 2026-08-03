@@ -52,7 +52,7 @@ printf '%s\n' \
   '  exit 4' \
   'fi' \
   'if [[ "$1" == "api" && "$*" == *"/releases/tags/"* ]]; then' \
-  "  printf 'false\\tfalse\\ttrue\\n'" \
+  "  printf 'false\\ttrue\\ttrue\\n'" \
   '  exit 0' \
   'fi' \
   'if [[ "$1" == "api" && "$*" == *"/contents/appcast.xml?ref=main"* ]]; then' \
@@ -98,8 +98,8 @@ ALPHA_OUTPUT="$(
     "$UPDATE_CHECKSUM_FILE" \
     "$APPCAST_FILE"
 )"
-if [[ "$ALPHA_OUTPUT" == *"--prerelease"* ]]; then
-  echo "FAIL: preview-channel releases must be ordinary GitHub releases" >&2
+if [[ "$ALPHA_OUTPUT" != *"--prerelease"* ]]; then
+  echo "FAIL: preview-channel releases must be GitHub prereleases" >&2
   exit 1
 fi
 if [[ "$ALPHA_OUTPUT" == *"--latest"* ]]; then

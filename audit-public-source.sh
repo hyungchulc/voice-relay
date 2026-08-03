@@ -3,6 +3,32 @@ set -euo pipefail
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST="$SCRIPT_ROOT/public-source-files.txt"
+PRIVATE_CONTENT_PATTERN='-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{30,}|sk-(proj-)?[A-Za-z0-9_-]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{24,}|/Users/[^/[:space:]]+|/home/[^/[:space:]]+|[A-Za-z]:\\Users\\[^\\[:space:]]+|[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}|~/(\.omx|\.agents|\.codex/(agents|memories|plugins|skills))(/|[[:space:]]|$)|\$HOME/(\.omx|\.agents|\.codex/(agents|memories|plugins|skills))(/|[[:space:]]|$)|\$\{HOME\}/(\.omx|\.agents|\.codex/(agents|memories|plugins|skills))(/|[[:space:]]|$)|/(\.omx|\.agents|\.codex/(agents|memories|plugins|skills))/'
+
+contains_private_content() {
+  /usr/bin/grep -RIlE \
+    --exclude-dir=.git \
+    --exclude=LICENSE \
+    --exclude=audit-public-source.sh \
+    -- \
+    "$PRIVATE_CONTENT_PATTERN" \
+    "$1" >/dev/null
+}
+
+if [[ "$#" -eq 2 && "$1" == "--content-only" ]]; then
+  CONTENT_TARGET="$2"
+  if [[ ! -e "$CONTENT_TARGET" ]]; then
+    echo "usage: $0 --content-only <file-or-directory>" >&2
+    exit 2
+  fi
+  if contains_private_content "$CONTENT_TARGET"; then
+    echo "Public package content contains credential-like or private local content." >&2
+    exit 3
+  fi
+  echo "Voice Relay public package content audit passed"
+  exit 0
+fi
+
 TARGET="${1:-$SCRIPT_ROOT}"
 
 if [[ "$#" -gt 1 || ! -d "$TARGET" || ! -f "$MANIFEST" ]]; then
@@ -92,16 +118,7 @@ if git -C "$TARGET" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   exit 3
 fi
 
-if /usr/bin/grep -RIlE \
-    --exclude-dir=.git \
-    --exclude=LICENSE \
-    --exclude=audit-public-source.sh \
-    --exclude=SourcePolicyTests.sh \
-    --exclude=PublicSourceAuditTests.sh \
-    --exclude=PolicyTests.swift \
-    -- \
-    '-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{30,}|sk-(proj-)?[A-Za-z0-9_-]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{24,}|/Users/[^/[:space:]]+|[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}' \
-    "$TARGET" >/dev/null; then
+if contains_private_content "$TARGET"; then
   echo "Public source contains credential-like or private local content." >&2
   exit 3
 fi

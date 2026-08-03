@@ -25,14 +25,14 @@ key to copy, embed, or store, and no separate task-owning agent stack.
 | Capability | What Voice Relay does |
 | --- | --- |
 | Full Codex desktop runtime | The Codex/ChatGPT desktop app remains the owner of tools, approvals, Browser Use, Computer Use, skills, connectors, and session state, subject to your app configuration and permissions. |
-| Direct Codex profile control | Choose Inherit or a supported model, Thinking level, and Fast mode inside Voice Relay. Inherit re-resolves the current desktop `config.toml` profile for every request; explicit choices are validated against live `model/list` capabilities and applied to the dedicated Voice task. |
+| Direct Codex profile control | Choose Inherit or a supported model and Thinking level, plus an explicit Inherit, Standard, or Fast service tier inside Voice Relay. Inherit re-resolves the current desktop `config.toml` profile for every request; explicit choices are validated against live `model/list` capabilities and applied to the dedicated Voice task. |
 | OAuth, not API-key setup | Voice Relay uses the signed-in desktop session and keeps its short-lived Realtime credential in memory. It never asks for or bundles an OpenAI API key. |
 | Direct Realtime Voice | Microphone capture, WebSocket transport, transcript display, and audio playback stay on a native low-latency Realtime path. |
 | Persistent task continuity | Use an existing Session ID or let Voice Relay create and persist a dedicated task that keeps context across voice turns and restarts. |
 | Live progress, not silent waiting | The handoff line, streamed Codex commentary, and final answer remain visible and play through the selected Realtime voice. |
 | Mid-turn voice steering | Add a correction or instruction while Codex is working and Voice Relay steers the active turn instead of starting a disconnected request. |
 | One stop control | Stop or Escape interrupts both Realtime output and the active Codex turn, then rejects late results. |
-| Personal operating context | Optional Authority Packs add persistent guidance. Optional Additional Context Providers add bounded current data only to Codex-bound turns. Both are blank and disabled in public builds. |
+| Personal operating context | Optional Authority Packs add persistent guidance. Connector v1 adds explicit read-only event briefs without a Codex turn. Legacy Additional Context Providers add bounded current data only to Codex-bound turns. All are blank and disabled in public builds. |
 | Native macOS surface | A notch-aware compact interface, a movable Orb fallback, local wake phrases, native permissions, launch at login, and system appearance support keep Voice as the primary surface. |
 
 ## How it works
@@ -73,7 +73,7 @@ does not claim to match GPT-Live-1's conversational model behavior.
 | Best fit | The integrated first-party default for eligible ChatGPT users | An open, customizable, Mac-first control surface around one dedicated Codex task |
 | Voice experience | Built-in ChatGPT Voice. The Live option provides continuous GPT-Live full-duplex listening and speaking on supported accounts | Direct Realtime speech plus a semantic handoff to Codex for substantive work |
 | Task coordination | Can start, prioritize, interrupt, redirect, and coordinate multiple agents across active conversations and projects | Keeps voice work pinned to one explicit existing or app-created persistent Session ID |
-| Model and thinking control | ChatGPT Voice offers Instant, Medium, and High reasoning choices. GPT-Live can delegate deeper work to a background frontier model that OpenAI updates over time | Lets the user inherit the current Codex profile or choose a supported model, Thinking level, and Fast mode inside Voice Relay, then validates and applies that profile to the same dedicated task |
+| Model and thinking control | ChatGPT Voice offers Instant, Medium, and High reasoning choices. GPT-Live can delegate deeper work to a background frontier model that OpenAI updates over time | Lets the user inherit the current Codex profile or choose a supported model, Thinking level, and Inherit, Standard, or Fast service tier inside Voice Relay, then validates and applies that profile to the same dedicated task |
 | Surface | Built into the ChatGPT desktop app on macOS and Windows, with paired iOS remote access | macOS notch or movable Orb, local wake phrases, launch at login, and an always-ready surface outside the main app window |
 | Personal context | Uses available project context and supported connected tools | Adds opt-in Authority Packs and bounded Additional Context Providers |
 | Extensibility | First-party product behavior and workspace controls | GPLv3 source that can be inspected, modified, and self-hosted |
@@ -98,7 +98,7 @@ Official references
 
 Voice Relay reads the available models, supported Thinking levels, and service
 tiers from the paired desktop runtime. Settings can inherit the current Codex
-profile or select an exact supported model, Thinking level, and Fast-mode
+profile or select an exact supported model, Thinking level, and service-tier
 combination for Voice Relay's dedicated task.
 
 Inherit is resolved again from the effective desktop `config.toml` profile for
@@ -107,9 +107,11 @@ validated before saving and applied to the existing app-managed task before the
 next Codex turn. Voice Relay fails before dispatch rather than silently running
 an unsupported or mismatched profile.
 
-Fast mode requests the runtime's `priority` service tier only when the selected
-model reports that capability. Turning Fast mode off explicitly clears Voice
-Relay's priority override, including when an earlier Voice turn used Fast mode.
+The service-tier control has three distinct states. Inherit re-resolves and
+applies the live Codex host tier for every request. Standard explicitly clears
+Voice Relay's priority override, including when the host default or an earlier
+Voice turn used Fast. Fast requests the runtime's `priority` tier only when the
+selected model reports that capability.
 Profile-only changes take effect on subsequent Codex-bound requests without
 rebuilding the active Realtime voice session.
 
@@ -258,9 +260,31 @@ Session ID was pasted by the user, clear it explicitly before saving a changed
 pack. The public manifest is
 [`Resources/authority-pack.json`](Resources/authority-pack.json).
 
+## Optional Connector v1
+
+Connector v1 is the public event-only boundary for read-only Daily Brief data.
+Open `Settings > Advanced`, add a `connector.json`, inspect its declared data
+classes and permissions, then explicitly enable it after the unsandboxed-code
+warning. Adding, validating, and binding never execute connector code, and every
+new binding starts disabled.
+
+Voice Relay binds approval to exact manifest and executable SHA-256 digests,
+runs an exact verified per-run copy only for a matching host event, and rejects
+changed bytes until the user approves a fresh binding. It never auto-discovers
+connectors. Morning and return briefs share a persistent local-day idempotency
+key. A brief is complete only after native audio playback for its exact response
+ID drains; startup acceptance does not start the presence cooldown. Active
+media or an unavailable media detector defers automatic speech.
+
+Connector event speech goes directly through Realtime with tool routing disabled
+and does not create or rotate a Codex task. Missing, denied, timed-out, stale,
+invalid, and explicitly empty results remain different states. See
+[`CONNECTORS.md`](CONNECTORS.md) for the manifest, host-event, structured-result,
+trust, ledger, and privacy contracts.
+
 ## Optional Additional Context Providers
 
-Additional Context Providers are a separate public extension point for current,
+Additional Context Providers are a legacy-compatible, request-bound extension point for current,
 request-specific grounding such as local app state, device context, or a
 user-owned data source. They are disabled and blank on a fresh install. The app
 does not ship a personal provider or select a provider folder.
@@ -393,10 +417,10 @@ installation instructions, distribution notes, and the exact corresponding
 source URL. Because this path is not notarized, macOS may require
 **System Settings → Privacy & Security → Open Anyway**.
 
-Publish every alpha, beta, and release-candidate tag as an ordinary GitHub
-release. The helper passes neither `--prerelease` nor a `--latest` option, so
-GitHub chooses the `Latest` marker automatically. Until the user explicitly
-approves `v1.0.0`, the release helper still rejects stable tags:
+Publish every alpha, beta, and release-candidate tag as a GitHub prerelease.
+The helper passes `--prerelease` for those tags and never passes `--latest`,
+so preview releases cannot become Latest. Until the user explicitly approves
+`v1.0.0`, the release helper still rejects stable tags:
 
 ```bash
 VOICE_RELAY_RELEASE_NOTES_FILE="./release-notes.md" \
@@ -409,12 +433,12 @@ VOICE_RELAY_RELEASE_NOTES_FILE="./release-notes.md" \
   releases/Voice-Relay-0.4.0-alpha.12-appcast.xml
 ```
 
-The release helper uploads the preview-channel assets as an ordinary GitHub
-release and then publishes the signed feed to the stable `appcast.xml` URL. If
-feed publication alone needs retrying, run `publish-sparkle-feed.sh` with the
-tag and versioned appcast. The internal
-`VoiceRelayDistributionChannel=prerelease` value and Sparkle preview feed are
-separate from GitHub release metadata.
+The release helper uploads preview-channel assets as a GitHub prerelease and
+then publishes the signed feed to the stable `appcast.xml` URL. If feed
+publication alone needs retrying, run `publish-sparkle-feed.sh` with the tag
+and versioned appcast. The internal
+`VoiceRelayDistributionChannel=prerelease` value and Sparkle preview feed
+align with that GitHub prerelease metadata.
 
 Only after explicit user approval for the first stable release may the same
 helper be invoked with `VOICE_RELAY_STABLE_RELEASE_APPROVED=true` and

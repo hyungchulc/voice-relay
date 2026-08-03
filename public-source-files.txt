@@ -3,6 +3,7 @@
 ARCHITECTURE.md
 ASSETS.md
 COMMERCIAL-LICENSE.md
+CONNECTORS.md
 CONTRIBUTING.md
 DISTRIBUTION.md
 Examples/AdditionalContextProviders/10-device-time.mjs
@@ -27,12 +28,14 @@ Resources/VoiceRelay.entitlements
 Resources/VoiceRelay.icns
 Resources/VoiceRelayIcon-1024.png
 Resources/authority-pack.json
+Resources/connector.schema.json
 SECURITY.md
 Sources/AmbientBackdropView.swift
 Sources/AppLocalization.swift
 Sources/AuthorityPackComposer.swift
 Sources/CodexAppRemoteClient.swift
 Sources/CodexAppServerClient.swift
+Sources/ConnectorCore.swift
 Sources/DirectRealtimeController.swift
 Sources/LaunchAtLoginManager.swift
 Sources/NativeRealtimeAudioTransport.swift
@@ -64,8 +67,10 @@ Support/CodexRemote/src/session-log.js
 Support/CodexRemote/src/thread-rotation-handoff.js
 Tests/CodexClientSmoke.swift
 Tests/CodexReplyRevisionFenceTests.mjs
+Tests/ConnectorCoreTests.swift
 Tests/ContextProviderTests.mjs
 Tests/PolicyTests.swift
+Tests/PresenceMonitorTests.swift
 Tests/PublicSourceAuditTests.sh
 Tests/RealtimeCredentialTests.mjs
 Tests/RealtimeResponseQueueTests.mjs

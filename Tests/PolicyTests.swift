@@ -338,10 +338,14 @@ struct PolicyTests {
         let realtimeBufferToken = routingEpoch.advance(atHostTime: 100)
         let wakeBufferToken = routingEpoch.advance(atHostTime: 200)
         expect(
-            !routingEpoch.accepts(
+            routingEpoch.accepts(
                 realtimeBufferToken,
                 bufferHostTime: 150
             )
+                && !routingEpoch.accepts(
+                    realtimeBufferToken,
+                    bufferHostTime: 200
+                )
                 && !routingEpoch.accepts(
                     wakeBufferToken,
                     bufferHostTime: 199
@@ -350,14 +354,22 @@ struct PolicyTests {
                     wakeBufferToken,
                     bufferHostTime: 200
                 ),
-            "stop-to-wake handoff must reject delayed Realtime buffers"
+            "stop-to-wake overlap must preserve Realtime capture until the raw wake host-time cutover"
         )
         let nextRealtimeBufferToken = routingEpoch.advance(atHostTime: 300)
         expect(
-            !routingEpoch.accepts(
+            routingEpoch.accepts(
                 wakeBufferToken,
-                bufferHostTime: 301
+                bufferHostTime: 200
             )
+                && routingEpoch.accepts(
+                    wakeBufferToken,
+                    bufferHostTime: 299
+                )
+                && !routingEpoch.accepts(
+                    wakeBufferToken,
+                    bufferHostTime: 300
+                )
                 && !routingEpoch.accepts(
                     nextRealtimeBufferToken,
                     bufferHostTime: 299
@@ -366,7 +378,1371 @@ struct PolicyTests {
                     nextRealtimeBufferToken,
                     bufferHostTime: 300
                 ),
-            "wake-to-Realtime handoff must reject dormant capture buffers"
+            "wake-to-Realtime overlap must route the previous plane strictly before the host-time cutover"
+        )
+        let wakeOverlapFrames = [
+            (id: 1, hostTime: UInt64(250)),
+            (id: 2, hostTime: UInt64(299)),
+            (id: 3, hostTime: UInt64(300)),
+        ]
+        let realtimeOverlapFrames = [
+            (id: 2, hostTime: UInt64(299)),
+            (id: 3, hostTime: UInt64(300)),
+            (id: 4, hostTime: UInt64(340)),
+        ]
+        let deliveredOverlapFrames =
+            wakeOverlapFrames.compactMap { frame in
+                routingEpoch.accepts(
+                    wakeBufferToken,
+                    bufferHostTime: frame.hostTime
+                ) ? frame.id : nil
+            }
+            + realtimeOverlapFrames.compactMap { frame in
+                routingEpoch.accepts(
+                    nextRealtimeBufferToken,
+                    bufferHostTime: frame.hostTime
+                ) ? frame.id : nil
+            }
+        expect(
+            deliveredOverlapFrames == [1, 2, 3, 4],
+            "host-time capture cutover must deliver every overlapping PCM frame exactly once"
+        )
+        var timelineRouter = AudioCaptureTimelineRouter()
+        let timelineWakeToken = timelineRouter.advance(atHostTime: 100)
+        _ = timelineRouter.retirePrevious(
+            AudioCaptureRoutingToken(epoch: 0, beginsAtHostTime: 0)
+        )
+        let timelineRealtimeToken = timelineRouter.advance(atHostTime: 300)
+        let realtimeArrivedFirst = timelineRouter.route(
+            AudioCapturePCMBuffer(
+                token: timelineRealtimeToken,
+                startHostTime: 300,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(300..<340).map(Float.init)
+            )
+        )
+        let wakeArrivedSecond = timelineRouter.route(
+            AudioCapturePCMBuffer(
+                token: timelineWakeToken,
+                startHostTime: 280,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(280..<320).map(Float.init)
+            )
+        )
+        let straddlingDelivery = timelineRouter.retirePrevious(
+            timelineWakeToken
+        ).flatMap(\.samples).map(Int.init)
+        expect(
+            realtimeArrivedFirst.isEmpty
+                && wakeArrivedSecond.isEmpty
+                && straddlingDelivery == Array(280..<340),
+            "straddling capture buffers must split and drain in absolute timeline order without duplicate PCM"
+        )
+        var invalidatedRouter = AudioCaptureTimelineRouter()
+        _ = invalidatedRouter.activate(atHostTime: 100)
+        _ = invalidatedRouter.invalidate(atHostTime: 200)
+        let postInvalidationActivation = invalidatedRouter.activate(
+            atHostTime: 300
+        )
+        let postInvalidationDelivery = invalidatedRouter.route(
+            AudioCapturePCMBuffer(
+                token: postInvalidationActivation.token,
+                startHostTime: 300,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(300..<340).map(Float.init)
+            )
+        )
+        expect(
+            postInvalidationActivation.retiredTokens.count == 1
+                && postInvalidationDelivery.flatMap(\.samples).map(Int.init)
+                    == Array(300..<340),
+            "terminal routing invalidation must leave a retire-on-activation sentinel so the next capture session delivers immediately"
+        )
+        var sealedReleaseRouter = AudioCaptureTimelineRouter()
+        let sealedReleaseToken = sealedReleaseRouter.advance(
+            atHostTime: 100
+        )
+        _ = sealedReleaseRouter.retirePrevious(
+            AudioCaptureRoutingToken(epoch: 0, beginsAtHostTime: 0)
+        )
+        let sealedReleaseBoundary = sealedReleaseRouter
+            .sealCurrentForRelease(atHostTime: 150)
+        let sealedReleasePending = sealedReleaseRouter.route(
+            AudioCapturePCMBuffer(
+                token: sealedReleaseToken,
+                startHostTime: 120,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(120..<180).map(Float.init)
+            )
+        )
+        let sealedReleaseDrain = sealedReleaseRouter.requestRetirement(
+            sealedReleaseToken
+        )
+        let sealedReleaseResume = sealedReleaseRouter.activate(
+            atHostTime: 200
+        )
+        let sealedReleaseResumeDelivery = sealedReleaseRouter.route(
+            AudioCapturePCMBuffer(
+                token: sealedReleaseResume.token,
+                startHostTime: 200,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(200..<240).map(Float.init)
+            )
+        )
+        expect(
+            sealedReleasePending.isEmpty
+                && sealedReleaseBoundary.beginsAtHostTime == 150
+                && sealedReleaseDrain.readyBuffers
+                    .flatMap(\.samples).map(Int.init)
+                    == Array(120..<150)
+                && sealedReleaseResume.retiredTokens
+                    == [sealedReleaseBoundary]
+                && sealedReleaseResumeDelivery
+                    .flatMap(\.samples).map(Int.init)
+                    == Array(200..<240),
+            "a released current plane must drain through a sealed silence boundary and leave no synthetic predecessor before rebuilt capture activates"
+        )
+        var provisionalRouter = AudioCaptureTimelineRouter()
+        let provisionalOldToken = provisionalRouter.activate(
+            atHostTime: 100
+        ).token
+        _ = provisionalRouter.requestRetirement(
+            AudioCaptureRoutingToken(epoch: 0, beginsAtHostTime: 0)
+        )
+        let provisionalDecisionWithoutTimestamp =
+            AudioCaptureBindingActivationPolicy.decision(
+                existingToken: nil,
+                firstBufferHostTime: nil
+            )
+        let provisionalDecisionWithTimestamp =
+            AudioCaptureBindingActivationPolicy.decision(
+                existingToken: nil,
+                firstBufferHostTime: 300
+            )
+        let provisionalActivation: AudioCaptureRoutingTransition
+        switch provisionalDecisionWithTimestamp {
+        case let .activate(atHostTime):
+            provisionalActivation = provisionalRouter.activate(
+                atHostTime: atHostTime
+            )
+        default:
+            fatalError("first valid successor buffer must activate routing")
+        }
+        let provisionalCurrentArrival = provisionalRouter.route(
+            AudioCapturePCMBuffer(
+                token: provisionalActivation.token,
+                startHostTime: 300,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(300..<340).map(Float.init)
+            )
+        )
+        let provisionalOldArrival = provisionalRouter.route(
+            AudioCapturePCMBuffer(
+                token: provisionalOldToken,
+                startHostTime: 280,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(280..<320).map(Float.init)
+            )
+        )
+        let provisionalRetirement = provisionalRouter.requestRetirement(
+            provisionalOldToken
+        )
+        expect(
+            provisionalDecisionWithoutTimestamp == .awaitValidTimestamp
+                && provisionalCurrentArrival.isEmpty
+                && provisionalOldArrival.isEmpty
+                && provisionalRetirement.readyBuffers
+                    .flatMap(\.samples).map(Int.init)
+                    == Array(280..<340),
+            "a successor must stay provisional until its first valid host-timed buffer establishes the exact-once cutover"
+        )
+        var releaseBarrierCompletionCount = 0
+        let releaseBarrier = AudioCaptureReleaseCompletionBarrier {
+            releaseBarrierCompletionCount += 1
+        }
+        releaseBarrier.signal(.engineRetired)
+        expect(
+            releaseBarrierCompletionCount == 0,
+            "engine retention alone must not complete a capture handoff"
+        )
+        releaseBarrier.signal(.routingDrained)
+        releaseBarrier.signal(.routingDrained)
+        expect(
+            releaseBarrierCompletionCount == 1,
+            "capture handoff completion must wait for both engine retirement and routed callback drainage exactly once"
+        )
+        expect(
+            AudioCaptureStopCompletionPolicy.decision(
+                audioHandoffReady: false
+            ) == .waitForTransportHandoff
+                && AudioCaptureStopCompletionPolicy.decision(
+                    audioHandoffReady: true
+                ) == .finishAndResumeWake,
+            "the visual stop fallback must never restart wake analysis before the transport proves audio handoff readiness"
+        )
+        var muteRoutingEpoch = AudioCaptureRoutingEpoch()
+        let sharedEngineToken = muteRoutingEpoch.advance(atHostTime: 100)
+        let playbackReferenceBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        playbackReferenceBinding.token = sharedEngineToken
+        let microphoneRestartBinding = AudioCaptureEngineBindingPolicy
+            .microphoneTapRestartBinding(
+                activeBinding: playbackReferenceBinding
+            )
+        expect(
+            microphoneRestartBinding === playbackReferenceBinding
+                && muteRoutingEpoch.isCurrent(
+                    microphoneRestartBinding?.token
+                        ?? AudioCaptureRoutingToken(
+                            epoch: UInt64.max,
+                            beginsAtHostTime: 0
+                        )
+                )
+                && muteRoutingEpoch.accepts(
+                    playbackReferenceBinding.token
+                        ?? AudioCaptureRoutingToken(
+                            epoch: UInt64.max,
+                            beginsAtHostTime: 0
+                        ),
+                    bufferHostTime: 101
+                ),
+            "mute playback unmute must reuse the current engine binding so playback-reference admission resumes"
+        )
+        expect(
+            AudioCaptureEngineBindingPolicy
+                .canReusePersistentRealtimeBinding(
+                    routingTokenRecognized: true,
+                    routingTokenIsCurrent: true
+                )
+                && !AudioCaptureEngineBindingPolicy
+                    .canReusePersistentRealtimeBinding(
+                        routingTokenRecognized: true,
+                        routingTokenIsCurrent: false
+                    )
+                && !AudioCaptureEngineBindingPolicy
+                    .canReusePersistentRealtimeBinding(
+                        routingTokenRecognized: false,
+                        routingTokenIsCurrent: false
+                    ),
+            "a successor generation must rebind a still-running VPIO graph after raw wake capture becomes the current routing plane"
+        )
+        let retiringCallbackBinding = AudioCaptureRouteBinding(
+            plane: .idleWakeRaw
+        )
+        expect(
+            retiringCallbackBinding.beginCaptureCallback()
+                && !retiringCallbackBinding.requestRetirement()
+                && retiringCallbackBinding.finishCaptureCallback()
+                && !retiringCallbackBinding.beginCaptureCallback(),
+            "capture-plane retirement must wait for every callback already in flight and reject callbacks admitted after sealing"
+        )
+        var provisionalRetirementCompletionCount = 0
+        let provisionalRetirementBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        expect(
+            provisionalRetirementBinding.beginCaptureCallback(),
+            "a provisional capture binding must admit its first callback before token publication"
+        )
+        provisionalRetirementBinding.registerRetirementCompletion {
+            provisionalRetirementCompletionCount += 1
+        }
+        expect(
+            !provisionalRetirementBinding.requestRetirement()
+                && provisionalRetirementCompletionCount == 0
+                && provisionalRetirementBinding.finishCaptureCallback(),
+            "release of an unactivated binding must wait for its admitted callback to drain"
+        )
+        for completion in provisionalRetirementBinding
+            .takeRetirementCompletions() {
+            completion()
+        }
+        expect(
+            provisionalRetirementCompletionCount == 1,
+            "a drained provisional binding must complete release exactly once even without a routing token"
+        )
+        let lateActivatedRetirementBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        expect(
+            lateActivatedRetirementBinding.beginCaptureCallback(),
+            "a provisional binding may have an admitted callback when release begins"
+        )
+        var lateActivatedRetirementCompletionCount = 0
+        lateActivatedRetirementBinding.registerRetirementCompletion {
+            lateActivatedRetirementCompletionCount += 1
+        }
+        expect(
+            !lateActivatedRetirementBinding.requestRetirement(),
+            "release must wait while the provisional callback is still in flight"
+        )
+        let rejectedLateActivationHandlers =
+            lateActivatedRetirementBinding.publish(
+                token: AudioCaptureRoutingToken(
+                    epoch: 81,
+                    beginsAtHostTime: 200
+                )
+            )
+        expect(
+            rejectedLateActivationHandlers.isEmpty
+                && lateActivatedRetirementBinding.token == nil,
+            "a retired provisional binding must reject late token publication even while an admitted callback drains"
+        )
+        let lateActivatedCallbackDrained =
+            lateActivatedRetirementBinding.finishCaptureCallback()
+        for completion in lateActivatedRetirementBinding
+            .takeRetirementCompletions() {
+            completion()
+        }
+        expect(
+            lateActivatedCallbackDrained
+                && lateActivatedRetirementBinding.token == nil
+                && lateActivatedRetirementCompletionCount == 1,
+            "a retired provisional binding must drain its admitted callback and complete without ever acquiring routing ownership"
+        )
+        var retiredProvisionalCallbackRouter =
+            AudioCaptureTimelineRouter()
+        let authoritativeRawToken =
+            retiredProvisionalCallbackRouter.advance(atHostTime: 300)
+        _ = retiredProvisionalCallbackRouter.retirePrevious(
+            AudioCaptureRoutingToken(epoch: 0, beginsAtHostTime: 0)
+        )
+        let retiredProvisionalCallbackBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        expect(
+            retiredProvisionalCallbackBinding.beginCaptureCallback()
+                && !retiredProvisionalCallbackBinding.requestRetirement(),
+            "a provisional VPIO callback may already be admitted when cancellation retires its unpublished binding"
+        )
+        let retiredProvisionalTiming =
+            retiredProvisionalCallbackBinding.recordProvisionalTiming(
+                timestampAvailable: true
+            )
+        var retiredTokenProviderRan = false
+        let retiredProvisionalPublication =
+            retiredProvisionalCallbackBinding.publishIfAccepting {
+                retiredTokenProviderRan = true
+                return retiredProvisionalCallbackRouter.activate(
+                    atHostTime: 280
+                ).token
+            }
+        expect(
+            retiredProvisionalTiming == .ignoredStale
+                && retiredProvisionalPublication == nil
+                && !retiredTokenProviderRan
+                && retiredProvisionalCallbackBinding.token == nil
+                && retiredProvisionalCallbackRouter.routingEpoch.token
+                    == authoritativeRawToken,
+            "a retired unpublished VPIO callback with a valid timestamp must not publish after raw wake becomes authoritative"
+        )
+        _ = retiredProvisionalCallbackBinding.finishCaptureCallback()
+        let latePlaybackReferenceBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        expect(
+            latePlaybackReferenceBinding.beginCaptureCallback()
+                && !latePlaybackReferenceBinding.requestRetirement(),
+            "a playback-reference callback may already be admitted when release seals its binding"
+        )
+        latePlaybackReferenceBinding.cancelPendingActivationHandlers()
+        var latePlaybackActivationCallbackCount = 0
+        var latePlaybackActivationToken: AudioCaptureRoutingToken?
+        latePlaybackReferenceBinding.registerActivationHandler { token in
+            latePlaybackActivationCallbackCount += 1
+            latePlaybackActivationToken = token
+        }
+        expect(
+            latePlaybackActivationCallbackCount == 1
+                && latePlaybackActivationToken == nil
+                && latePlaybackReferenceBinding.finishCaptureCallback(),
+            "an activation handler registered after retirement begins must be cancelled immediately so callback drainage cannot hang"
+        )
+        let provisionalTimingBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        expect(
+            provisionalTimingBinding.recordProvisionalTiming(
+                timestampAvailable: false
+            ) == .awaitingValidTimestamp
+                && provisionalTimingBinding.recordProvisionalTiming(
+                    timestampAvailable: false
+                ) == .awaitingValidTimestamp
+                && provisionalTimingBinding.recordProvisionalTiming(
+                    timestampAvailable: false
+                ) == .failed,
+            "an active provisional binding must fail after a bounded run of missing first-buffer timestamps"
+        )
+        expect(
+            provisionalTimingBinding.recordProvisionalTiming(
+                timestampAvailable: true
+            ) == .ready,
+            "a valid first timestamp must reset provisional timing health and permit host-time activation"
+        )
+        let retiredProvisionalTimingBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        _ = retiredProvisionalTimingBinding.requestRetirement()
+        expect(
+            retiredProvisionalTimingBinding.recordProvisionalTiming(
+                timestampAvailable: false
+            ) == .ignoredStale,
+            "timestamp-less callbacks from a retired provisional binding must not poison the current plane"
+        )
+        let activationGatedRetirementBinding = AudioCaptureRouteBinding(
+            plane: .idleWakeRaw
+        )
+        var activationGatedRetirementToken: AudioCaptureRoutingToken?
+        AudioCaptureSuccessorActivationPolicy.register(
+            successor: activationGatedRetirementBinding
+        ) { token in
+            activationGatedRetirementToken = token
+        }
+        expect(
+            activationGatedRetirementToken == nil,
+            "a retiring capture binding must remain authoritative until its successor publishes a real first-buffer boundary"
+        )
+        let activationGatedSuccessorToken = AudioCaptureRoutingToken(
+            epoch: 91,
+            beginsAtHostTime: 9_100
+        )
+        for handler in activationGatedRetirementBinding.publish(
+            token: activationGatedSuccessorToken
+        ) {
+            handler(activationGatedSuccessorToken)
+        }
+        expect(
+            activationGatedRetirementToken
+                == activationGatedSuccessorToken,
+            "successful successor activation must trigger the deferred retirement exactly at its published timeline boundary"
+        )
+        let cancelledSuccessorBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        var cancelledSuccessorRetirementTriggered = false
+        AudioCaptureSuccessorActivationPolicy.register(
+            successor: cancelledSuccessorBinding
+        ) { _ in
+            cancelledSuccessorRetirementTriggered = true
+        }
+        _ = cancelledSuccessorBinding.requestRetirement()
+        cancelledSuccessorBinding.cancelPendingActivationHandlers()
+        expect(
+            !cancelledSuccessorRetirementTriggered,
+            "a successor that is cancelled before first-buffer activation must not retire the still-authoritative capture plane"
+        )
+        let stopHandoffTimingBinding = AudioCaptureRouteBinding(
+            plane: .idleWakeRaw
+        )
+        let stopHandoffRealtimeEngine = NSObject()
+        let stopHandoffRealtimeBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        let stopHandoffWakeEngine = NSObject()
+        let stopHandoffTimingOwnership =
+            AudioCaptureStopHandoffOwnership(
+                generation: 70,
+                realtimeEngine: stopHandoffRealtimeEngine,
+                realtimeBinding: stopHandoffRealtimeBinding,
+                wakeEngine: stopHandoffWakeEngine,
+                wakeBinding: stopHandoffTimingBinding
+            )
+        let stopHandoffFailureFallback =
+            AudioCaptureStopHandoffFailureFallback()
+        var stopHandoffFallbackCount = 0
+        stopHandoffFailureFallback.arm(
+            ownership: stopHandoffTimingOwnership,
+            binding: stopHandoffTimingBinding
+        ) {
+            stopHandoffFallbackCount += 1
+        }
+        let stopHandoffTimingDispositions = (0..<3).map { _ in
+            stopHandoffTimingBinding.recordProvisionalTiming(
+                timestampAvailable: false
+            )
+        }
+        expect(
+            stopHandoffTimingDispositions == [
+                .awaitingValidTimestamp,
+                .awaitingValidTimestamp,
+                .failed,
+            ]
+                && stopHandoffFailureFallback.triggerIfArmed(
+                    for: stopHandoffTimingBinding,
+                    activeGeneration: nil,
+                    realtimeEngine: stopHandoffRealtimeEngine,
+                    realtimeBinding: stopHandoffRealtimeBinding,
+                    wakeEngine: stopHandoffWakeEngine,
+                    wakeBinding: stopHandoffTimingBinding
+                )
+                && stopHandoffFallbackCount == 1
+                && !stopHandoffFailureFallback.triggerIfArmed(
+                    for: stopHandoffTimingBinding,
+                    activeGeneration: nil,
+                    realtimeEngine: stopHandoffRealtimeEngine,
+                    realtimeBinding: stopHandoffRealtimeBinding,
+                    wakeEngine: stopHandoffWakeEngine,
+                    wakeBinding: stopHandoffTimingBinding
+                )
+                && stopHandoffFallbackCount == 1,
+            "three invalid first raw timestamps during VPIO-to-wake stop must consume one fallback that releases the old plane and completes closure exactly once"
+        )
+        let successfulStopHandoffBinding = AudioCaptureRouteBinding(
+            plane: .idleWakeRaw
+        )
+        let successfulStopHandoffOwnership =
+            AudioCaptureStopHandoffOwnership(
+                generation: 70,
+                realtimeEngine: stopHandoffRealtimeEngine,
+                realtimeBinding: stopHandoffRealtimeBinding,
+                wakeEngine: stopHandoffWakeEngine,
+                wakeBinding: successfulStopHandoffBinding
+            )
+        stopHandoffFailureFallback.arm(
+            ownership: successfulStopHandoffOwnership,
+            binding: successfulStopHandoffBinding
+        ) {
+            stopHandoffFallbackCount += 1
+        }
+        expect(
+            stopHandoffFailureFallback.disarm(
+                ownership: successfulStopHandoffOwnership,
+                binding: successfulStopHandoffBinding
+            )
+                && !stopHandoffFailureFallback.triggerIfArmed(
+                    for: successfulStopHandoffBinding,
+                    activeGeneration: nil,
+                    realtimeEngine: stopHandoffRealtimeEngine,
+                    realtimeBinding: stopHandoffRealtimeBinding,
+                    wakeEngine: stopHandoffWakeEngine,
+                    wakeBinding: successfulStopHandoffBinding
+                )
+                && stopHandoffFallbackCount == 1,
+            "a valid raw first-buffer activation must disarm the stop fallback before VPIO retirement"
+        )
+        let staleStopRealtimeEngine = NSObject()
+        let staleStopRealtimeBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        let staleStopWakeEngine = NSObject()
+        let staleStopWakeBinding = AudioCaptureRouteBinding(
+            plane: .idleWakeRaw
+        )
+        let staleStopOwnership = AudioCaptureStopHandoffOwnership(
+            generation: 71,
+            realtimeEngine: staleStopRealtimeEngine,
+            realtimeBinding: staleStopRealtimeBinding,
+            wakeEngine: staleStopWakeEngine,
+            wakeBinding: staleStopWakeBinding
+        )
+        var staleStopFallbackStarted = 0
+        var staleStopRealtimeReleaseCount = 0
+        var delayedStaleStopRelease: (() -> Void)?
+        stopHandoffFailureFallback.arm(
+            ownership: staleStopOwnership,
+            binding: staleStopWakeBinding
+        ) {
+            staleStopFallbackStarted += 1
+            delayedStaleStopRelease = {
+                if staleStopOwnership.claimRealtimeRelease(
+                    activeGeneration: nil,
+                    realtimeEngine: staleStopRealtimeEngine,
+                    realtimeBinding: staleStopRealtimeBinding
+                ) {
+                    staleStopRealtimeReleaseCount += 1
+                }
+            }
+        }
+        expect(
+            stopHandoffFailureFallback.triggerIfArmed(
+                for: staleStopWakeBinding,
+                activeGeneration: nil,
+                realtimeEngine: staleStopRealtimeEngine,
+                realtimeBinding: staleStopRealtimeBinding,
+                wakeEngine: staleStopWakeEngine,
+                wakeBinding: staleStopWakeBinding
+            ) && staleStopFallbackStarted == 1,
+            "the generation-N wake fallback fixture must enter its delayed release phase while it still owns both capture planes"
+        )
+        staleStopOwnership.revoke()
+        delayedStaleStopRelease?()
+        expect(
+            staleStopRealtimeReleaseCount == 0
+                && !staleStopOwnership.claimRealtimeRelease(
+                    activeGeneration: nil,
+                    realtimeEngine: staleStopRealtimeEngine,
+                    realtimeBinding: staleStopRealtimeBinding
+                ),
+            "a revoked generation-N wake fallback must never release the same VPIO engine and binding after generation N+1 has reused them"
+        )
+        let activeSuccessorOwnership =
+            AudioCaptureStopHandoffOwnership(
+                generation: 72,
+                realtimeEngine: staleStopRealtimeEngine,
+                realtimeBinding: staleStopRealtimeBinding,
+                wakeEngine: staleStopWakeEngine,
+                wakeBinding: staleStopWakeBinding
+            )
+        stopHandoffFailureFallback.arm(
+            ownership: activeSuccessorOwnership,
+            binding: staleStopWakeBinding
+        ) {
+            staleStopFallbackStarted += 1
+        }
+        expect(
+            !stopHandoffFailureFallback.triggerIfArmed(
+                for: staleStopWakeBinding,
+                activeGeneration: 73,
+                realtimeEngine: staleStopRealtimeEngine,
+                realtimeBinding: staleStopRealtimeBinding,
+                wakeEngine: staleStopWakeEngine,
+                wakeBinding: staleStopWakeBinding
+            )
+                && staleStopFallbackStarted == 1
+                && !stopHandoffFailureFallback.triggerIfArmed(
+                    for: staleStopWakeBinding,
+                    activeGeneration: nil,
+                    realtimeEngine: staleStopRealtimeEngine,
+                    realtimeBinding: staleStopRealtimeBinding,
+                    wakeEngine: staleStopWakeEngine,
+                    wakeBinding: staleStopWakeBinding
+                ),
+            "a stale stop fallback must be consumed before it can mutate an active or later-idle successor generation"
+        )
+        var staleWakeRearmCompletionCount = 0
+        let staleWakeRearmOwnership =
+            AudioCaptureStopHandoffOwnership(
+                generation: 74,
+                realtimeEngine: staleStopRealtimeEngine,
+                realtimeBinding: staleStopRealtimeBinding,
+                completion: {
+                    staleWakeRearmCompletionCount += 1
+                }
+            )
+        expect(
+            staleWakeRearmOwnership.claimRealtimeRelease(
+                activeGeneration: 74,
+                realtimeEngine: staleStopRealtimeEngine,
+                realtimeBinding: staleStopRealtimeBinding
+            ),
+            "a failed raw startup fallback must first claim the exact generation-N VPIO graph"
+        )
+        staleWakeRearmOwnership.revoke()
+        staleWakeRearmOwnership.finish()
+        expect(
+            !staleWakeRearmOwnership.claimWakeRearm(
+                activeGeneration: nil,
+                realtimeEngine: nil,
+                realtimeBinding: nil,
+                wakeEngine: nil,
+                wakeBinding: nil
+            )
+                && staleWakeRearmCompletionCount == 1,
+            "a successor start must revoke delayed raw rearm ownership and complete the old stop exactly once"
+        )
+        let validWakeRearmOwnership =
+            AudioCaptureStopHandoffOwnership(
+                generation: 75,
+                realtimeEngine: staleStopRealtimeEngine,
+                realtimeBinding: staleStopRealtimeBinding
+            )
+        expect(
+            validWakeRearmOwnership.claimRealtimeRelease(
+                activeGeneration: 75,
+                realtimeEngine: staleStopRealtimeEngine,
+                realtimeBinding: staleStopRealtimeBinding
+            )
+                && validWakeRearmOwnership.claimWakeRearm(
+                    activeGeneration: nil,
+                    realtimeEngine: nil,
+                    realtimeBinding: nil,
+                    wakeEngine: nil,
+                    wakeBinding: nil
+                )
+                && !validWakeRearmOwnership.claimWakeRearm(
+                    activeGeneration: nil,
+                    realtimeEngine: nil,
+                    realtimeBinding: nil,
+                    wakeEngine: nil,
+                    wakeBinding: nil
+                ),
+            "an unchanged stopped generation may claim one delayed raw rearm after its exact VPIO graph is gone"
+        )
+        var idleMuteResumeRouter = AudioCaptureTimelineRouter()
+        let idleBeforeMuteToken = idleMuteResumeRouter.advance(
+            atHostTime: 100
+        )
+        _ = idleMuteResumeRouter.retirePrevious(
+            AudioCaptureRoutingToken(epoch: 0, beginsAtHostTime: 0)
+        )
+        let idleBeforeMuteBinding = AudioCaptureRouteBinding(
+            plane: .idleWakeRaw
+        )
+        idleBeforeMuteBinding.token = idleBeforeMuteToken
+        let idleResumeActivation = idleMuteResumeRouter.activate(
+            atHostTime: 200
+        )
+        let idleResumeDelivery = idleMuteResumeRouter.route(
+            AudioCapturePCMBuffer(
+                token: idleResumeActivation.token,
+                startHostTime: 200,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: [200, 201, 202].map(Float.init)
+            )
+        )
+        let idleMuteRetirementReady =
+            idleBeforeMuteBinding.requestRetirement()
+        let idleMuteRetirement = idleMuteResumeRouter.requestRetirement(
+            idleBeforeMuteToken
+        )
+        expect(
+            idleResumeActivation.retiredTokens.isEmpty
+                && idleResumeDelivery.isEmpty
+                && idleMuteRetirementReady
+                && idleMuteRetirement.retiredTokens
+                    == [idleBeforeMuteToken]
+                && idleMuteResumeRouter.routingEpoch.previousToken == nil
+                && idleMuteRetirement.readyBuffers
+                    .flatMap(\.samples).map(Int.init)
+                    == [200, 201, 202],
+            "idle raw unmute must activate replacement capture before sealing and retiring the preserved muted binding"
+        )
+        var failedRecoveryRouter = AudioCaptureTimelineRouter()
+        let failedRecoveryOldToken = failedRecoveryRouter.advance(
+            atHostTime: 300
+        )
+        _ = failedRecoveryRouter.retirePrevious(
+            AudioCaptureRoutingToken(epoch: 0, beginsAtHostTime: 0)
+        )
+        let deferredRecoveryRetirement = failedRecoveryRouter
+            .requestRetirement(failedRecoveryOldToken)
+        let rebuiltRecoveryActivation = failedRecoveryRouter.activate(
+            atHostTime: 400
+        )
+        let rebuiltRecoveryDelivery = failedRecoveryRouter.route(
+            AudioCapturePCMBuffer(
+                token: rebuiltRecoveryActivation.token,
+                startHostTime: 400,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: [400, 401].map(Float.init)
+            )
+        )
+        expect(
+            deferredRecoveryRetirement.retiredTokens.isEmpty
+                && rebuiltRecoveryActivation.retiredTokens
+                    == [failedRecoveryOldToken]
+                && rebuiltRecoveryDelivery.flatMap(\.samples).map(Int.init)
+                    == [400, 401],
+            "a retirement requested while the failed VPIO binding is current must complete after replacement activation"
+        )
+        var activatedRecoveryRouter = AudioCaptureTimelineRouter()
+        let activatedRecoveryOldToken = activatedRecoveryRouter.advance(
+            atHostTime: 410
+        )
+        _ = activatedRecoveryRouter.retirePrevious(
+            AudioCaptureRoutingToken(epoch: 0, beginsAtHostTime: 0)
+        )
+        let activatedRecoveryReplacement = activatedRecoveryRouter.activate(
+            atHostTime: 420
+        )
+        let activatedRecoveryRetirement = activatedRecoveryRouter
+            .requestRetirement(activatedRecoveryOldToken)
+        let activatedRecoveryDelivery = activatedRecoveryRouter.route(
+            AudioCapturePCMBuffer(
+                token: activatedRecoveryReplacement.token,
+                startHostTime: 420,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: [420, 421].map(Float.init)
+            )
+        )
+        expect(
+            activatedRecoveryRetirement.disposition == .retired
+                && activatedRecoveryRetirement.retiredTokens
+                    == [activatedRecoveryOldToken]
+                && activatedRecoveryDelivery
+                    .flatMap(\.samples).map(Int.init) == [420, 421],
+            "a replacement activated before old-plane retirement must retire the sealed old token and immediately release current capture"
+        )
+        var rapidTransitionRouter = AudioCaptureTimelineRouter()
+        let rapidFirstToken = rapidTransitionRouter.advance(
+            atHostTime: 100
+        )
+        _ = rapidTransitionRouter.retirePrevious(
+            AudioCaptureRoutingToken(epoch: 0, beginsAtHostTime: 0)
+        )
+        let rapidSecondToken = rapidTransitionRouter.activate(
+            atHostTime: 200
+        ).token
+        let rapidThirdToken = rapidTransitionRouter.activate(
+            atHostTime: 300
+        ).token
+        let rapidThirdArrival = rapidTransitionRouter.route(
+            AudioCapturePCMBuffer(
+                token: rapidThirdToken,
+                startHostTime: 300,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(300..<340).map(Float.init)
+            )
+        )
+        let rapidSecondArrival = rapidTransitionRouter.route(
+            AudioCapturePCMBuffer(
+                token: rapidSecondToken,
+                startHostTime: 200,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(200..<320).map(Float.init)
+            )
+        )
+        let rapidFirstArrival = rapidTransitionRouter.route(
+            AudioCapturePCMBuffer(
+                token: rapidFirstToken,
+                startHostTime: 180,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(180..<220).map(Float.init)
+            )
+        )
+        let rapidFirstRetirement = rapidTransitionRouter
+            .requestRetirement(rapidFirstToken)
+        let rapidSecondRetirement = rapidTransitionRouter
+            .requestRetirement(rapidSecondToken)
+        let delayedFirstRetirement = rapidTransitionRouter
+            .requestRetirement(rapidFirstToken)
+        expect(
+            rapidThirdArrival.isEmpty
+                && rapidSecondArrival.isEmpty
+                && rapidFirstArrival.isEmpty
+                && rapidFirstRetirement.disposition == .retired
+                && rapidFirstRetirement.readyBuffers.isEmpty
+                && rapidSecondRetirement.disposition == .retired
+                && rapidSecondRetirement.readyBuffers
+                    .flatMap(\.samples).map(Int.init)
+                    == Array(180..<340)
+                && delayedFirstRetirement.disposition == .unknown,
+            "rapid T1 to T2 to T3 capture transitions must preserve both cutover windows until ordered retirement and report delayed unknown retirement"
+        )
+        var outOfOrderRetirementRouter = AudioCaptureTimelineRouter()
+        let outOfOrderFirstToken = outOfOrderRetirementRouter.advance(
+            atHostTime: 100
+        )
+        _ = outOfOrderRetirementRouter.retirePrevious(
+            AudioCaptureRoutingToken(epoch: 0, beginsAtHostTime: 0)
+        )
+        let outOfOrderSecondToken = outOfOrderRetirementRouter.activate(
+            atHostTime: 200
+        ).token
+        let outOfOrderThirdToken = outOfOrderRetirementRouter.activate(
+            atHostTime: 300
+        ).token
+        let outOfOrderThirdArrival = outOfOrderRetirementRouter.route(
+            AudioCapturePCMBuffer(
+                token: outOfOrderThirdToken,
+                startHostTime: 290,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(3_000..<3_060).map(Float.init)
+            )
+        )
+        let outOfOrderSecondArrival = outOfOrderRetirementRouter.route(
+            AudioCapturePCMBuffer(
+                token: outOfOrderSecondToken,
+                startHostTime: 180,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(2_000..<2_140).map(Float.init)
+            )
+        )
+        let outOfOrderSecondRetirement = outOfOrderRetirementRouter
+            .requestRetirement(outOfOrderSecondToken)
+        let outOfOrderFirstArrival = outOfOrderRetirementRouter.route(
+            AudioCapturePCMBuffer(
+                token: outOfOrderFirstToken,
+                startHostTime: 180,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(1_000..<1_080).map(Float.init)
+            )
+        )
+        let outOfOrderFirstRetirement = outOfOrderRetirementRouter
+            .requestRetirement(outOfOrderFirstToken)
+        expect(
+            outOfOrderThirdArrival.isEmpty
+                && outOfOrderSecondArrival.isEmpty
+                && outOfOrderFirstArrival.isEmpty
+                && outOfOrderSecondRetirement.disposition == .deferred
+                && outOfOrderSecondRetirement.retiredTokens.isEmpty
+                && outOfOrderSecondRetirement.readyBuffers.isEmpty
+                && outOfOrderFirstRetirement.disposition == .retired
+                && outOfOrderFirstRetirement.retiredTokens
+                    == [outOfOrderFirstToken, outOfOrderSecondToken]
+                && outOfOrderFirstRetirement.readyBuffers
+                    .flatMap(\.samples).map(Int.init)
+                    == Array(1_000..<1_020)
+                        + Array(2_020..<2_120)
+                        + Array(3_010..<3_060),
+            "out-of-order retirement must preserve every cutover marker and drain only the oldest contiguous requested prefix"
+        )
+        var acceptedInflightRouter = AudioCaptureTimelineRouter()
+        let acceptedInflightOldToken = acceptedInflightRouter.advance(
+            atHostTime: 500
+        )
+        _ = acceptedInflightRouter.retirePrevious(
+            AudioCaptureRoutingToken(epoch: 0, beginsAtHostTime: 0)
+        )
+        let acceptedInflightBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        acceptedInflightBinding.token = acceptedInflightOldToken
+        expect(
+            acceptedInflightBinding.beginCaptureCallback(),
+            "an input callback must be admitted before restart activates replacement capture"
+        )
+        let acceptedInflightActivation = acceptedInflightRouter.activate(
+            atHostTime: 700
+        )
+        let acceptedInflightSealed =
+            acceptedInflightBinding.requestRetirement()
+        let acceptedInflightCurrentDelivery = acceptedInflightRouter.route(
+            AudioCapturePCMBuffer(
+                token: acceptedInflightActivation.token,
+                startHostTime: 700,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(700..<740).map(Float.init)
+            )
+        )
+        let acceptedInflightPreviousDelivery = acceptedInflightRouter.route(
+            AudioCapturePCMBuffer(
+                token: acceptedInflightOldToken,
+                startHostTime: 680,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(680..<720).map(Float.init)
+            )
+        )
+        let acceptedInflightRetirementReady =
+            acceptedInflightBinding.finishCaptureCallback()
+        let acceptedInflightRetirement = acceptedInflightRouter
+            .requestRetirement(acceptedInflightOldToken)
+        expect(
+            !acceptedInflightSealed
+                && acceptedInflightCurrentDelivery.isEmpty
+                && acceptedInflightPreviousDelivery.isEmpty
+                && acceptedInflightRetirementReady
+                && acceptedInflightRetirement.readyBuffers
+                    .flatMap(\.samples).map(Int.init)
+                    == Array(680..<740),
+            "restart must activate replacement, seal the admitted old callback, and drain its PCM only after asynchronous completion"
+        )
+        var inputTapFences = AudioCaptureInputTapFenceSet()
+        let acceptedBeforeRestart = inputTapFences.snapshot(
+            for: .realtimeFullDuplex
+        )
+        expect(
+            AudioCaptureInputCallbackPolicy.accepts(
+                capturedMediaEpoch: 7,
+                currentMediaEpoch: 8,
+                capturedTapRevision: acceptedBeforeRestart,
+                currentTapRevision: inputTapFences.snapshot(
+                    for: .realtimeFullDuplex
+                ),
+                microphoneInputEnabled: true,
+                routingTokenRecognized: true
+            ),
+            "a callback admitted before a VPIO restart must drain through its recognized previous token even after media epoch changes"
+        )
+        let staleBeforeMute = inputTapFences.snapshot(
+            for: .realtimeFullDuplex
+        )
+        inputTapFences.invalidateAll()
+        let currentAfterUnmute = inputTapFences.snapshot(
+            for: .realtimeFullDuplex
+        )
+        var stalePreActivationRouter = AudioCaptureTimelineRouter()
+        let stalePreActivationBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        let stalePreActivationAccepted =
+            AudioCaptureInputCallbackPolicy.acceptsBeforeRouting(
+                capturedTapRevision: staleBeforeMute,
+                currentTapRevision: currentAfterUnmute,
+                microphoneInputEnabled: true
+            )
+        if stalePreActivationAccepted {
+            let staleTransition = stalePreActivationRouter.activate(
+                atHostTime: 900
+            )
+            _ = stalePreActivationBinding.publish(
+                token: staleTransition.token
+            )
+        }
+        expect(
+            !stalePreActivationAccepted
+                && stalePreActivationBinding.token == nil
+                && stalePreActivationRouter.routingEpoch.token
+                    == AudioCaptureRoutingToken(
+                        epoch: 0,
+                        beginsAtHostTime: 0
+                    ),
+            "a delayed pre-mute callback must fail its tap incarnation before it can publish a cutover token or mutate routing health"
+        )
+        let staleMuteCallbackAccepted =
+            AudioCaptureInputCallbackPolicy.accepts(
+                capturedMediaEpoch: 8,
+                currentMediaEpoch: 8,
+                capturedTapRevision: staleBeforeMute,
+                currentTapRevision: currentAfterUnmute,
+                microphoneInputEnabled: true,
+                routingTokenRecognized: true
+            )
+        var muteTimingTracker = AudioCaptureTimingTracker(
+            maximumUnavailableBuffers: 2
+        )
+        muteTimingTracker.activate(sharedEngineToken)
+        if staleMuteCallbackAccepted {
+            _ = muteTimingTracker.record(
+                token: sharedEngineToken,
+                timestampAvailable: false,
+                recognized: true,
+                isCurrent: true
+            )
+        }
+        let currentAfterUnmuteTiming = muteTimingTracker.record(
+            token: sharedEngineToken,
+            timestampAvailable: false,
+            recognized: true,
+            isCurrent: true
+        )
+        muteTimingTracker.activate(sharedEngineToken)
+        let resetAfterUnmuteTiming = muteTimingTracker.record(
+            token: sharedEngineToken,
+            timestampAvailable: false,
+            recognized: true,
+            isCurrent: true
+        )
+        expect(
+            !staleMuteCallbackAccepted
+                && AudioCaptureInputCallbackPolicy.accepts(
+                    capturedMediaEpoch: 8,
+                    currentMediaEpoch: 8,
+                    capturedTapRevision: currentAfterUnmute,
+                    currentTapRevision: inputTapFences.snapshot(
+                        for: .realtimeFullDuplex
+                    ),
+                    microphoneInputEnabled: true,
+                    routingTokenRecognized: true
+                )
+                && currentAfterUnmuteTiming == .accepted
+                && resetAfterUnmuteTiming == .accepted,
+            "a delayed pre-mute input callback must fail the tap-incarnation fence before stale PCM or invalid timing reaches the current plane"
+        )
+        let preserveStopFenceDecision =
+            AudioCaptureSessionStopInputFencePolicy.decision(
+                preserveCaptureContinuity: true
+            )
+        let terminalStopFenceDecision =
+            AudioCaptureSessionStopInputFencePolicy.decision(
+                preserveCaptureContinuity: false
+            )
+        var sessionStopTapFence = AudioCaptureInputTapFence()
+        let preStopTapRevision = sessionStopTapFence.snapshot
+        if terminalStopFenceDecision == .invalidateAll {
+            sessionStopTapFence.invalidate()
+        }
+        let terminalStopTapRevision = sessionStopTapFence.snapshot
+        expect(
+            preserveStopFenceDecision == .preserveAdmittedCallbacks
+                && terminalStopFenceDecision == .invalidateAll
+                && AudioCaptureInputCallbackPolicy.accepts(
+                    capturedMediaEpoch: 10,
+                    currentMediaEpoch: 10,
+                    capturedTapRevision: preStopTapRevision,
+                    currentTapRevision: preStopTapRevision,
+                    microphoneInputEnabled: true,
+                    routingTokenRecognized: true
+                )
+                && !AudioCaptureInputCallbackPolicy.accepts(
+                capturedMediaEpoch: 10,
+                currentMediaEpoch: 10,
+                capturedTapRevision: preStopTapRevision,
+                currentTapRevision: terminalStopTapRevision,
+                microphoneInputEnabled: true,
+                routingTokenRecognized: true
+            ),
+            "a preserve-wake session stop must let already-admitted VPIO PCM reach the timeline while terminal stop invalidates every tap"
+        )
+        var preserveStopRouter = AudioCaptureTimelineRouter()
+        let preserveStopRealtimeToken = preserveStopRouter.advance(
+            atHostTime: 100
+        )
+        _ = preserveStopRouter.retirePrevious(
+            AudioCaptureRoutingToken(epoch: 0, beginsAtHostTime: 0)
+        )
+        let preserveStopRealtimeBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        preserveStopRealtimeBinding.token = preserveStopRealtimeToken
+        expect(
+            preserveStopRealtimeBinding.beginCaptureCallback(),
+            "a VPIO callback admitted before wake-preserving stop must hold its binding through the raw overlap"
+        )
+        let preserveStopRawActivation = preserveStopRouter.activate(
+            atHostTime: 300
+        )
+        let preserveStopSealed =
+            preserveStopRealtimeBinding.requestRetirement()
+        let preserveStopRawArrival = preserveStopRouter.route(
+            AudioCapturePCMBuffer(
+                token: preserveStopRawActivation.token,
+                startHostTime: 300,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(300..<340).map(Float.init)
+            )
+        )
+        let preserveStopRealtimeArrival = preserveStopRouter.route(
+            AudioCapturePCMBuffer(
+                token: preserveStopRealtimeToken,
+                startHostTime: 280,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(280..<320).map(Float.init)
+            )
+        )
+        let preserveStopRetirementReady =
+            preserveStopRealtimeBinding.finishCaptureCallback()
+        let preserveStopRetirement = preserveStopRouter.requestRetirement(
+            preserveStopRealtimeToken
+        )
+        expect(
+            !preserveStopSealed
+                && preserveStopRawArrival.isEmpty
+                && preserveStopRealtimeArrival.isEmpty
+                && preserveStopRetirementReady
+                && preserveStopRetirement.readyBuffers
+                    .flatMap(\.samples).map(Int.init)
+                    == Array(280..<340),
+            "wake-preserving stop must activate raw capture and drain already-admitted VPIO PCM exactly once across the cutover"
+        )
+        let planeTapFences = AudioCaptureInputTapFenceSet()
+        let preservedWakeTapRevision = planeTapFences.snapshot(
+            for: .idleWakeRaw
+        )
+        let retiringRealtimeTapRevision = planeTapFences.snapshot(
+            for: .realtimeFullDuplex
+        )
+        expect(
+            AudioCaptureInputCallbackPolicy.accepts(
+                capturedMediaEpoch: 11,
+                currentMediaEpoch: 11,
+                capturedTapRevision: preservedWakeTapRevision,
+                currentTapRevision: planeTapFences.snapshot(
+                    for: .idleWakeRaw
+                ),
+                microphoneInputEnabled: true,
+                routingTokenRecognized: true
+            )
+                && AudioCaptureInputCallbackPolicy.accepts(
+                    capturedMediaEpoch: 11,
+                    currentMediaEpoch: 11,
+                    capturedTapRevision: retiringRealtimeTapRevision,
+                    currentTapRevision: planeTapFences.snapshot(
+                        for: .realtimeFullDuplex
+                    ),
+                    microphoneInputEnabled: true,
+                    routingTokenRecognized: true
+                ),
+            "a failed Realtime startup must preserve the already-running raw wake tap and any admitted VPIO callback until binding retirement"
+        )
+        let retiringPlaybackBinding = AudioCaptureRouteBinding(
+            plane: .realtimeFullDuplex
+        )
+        retiringPlaybackBinding.token = sharedEngineToken
+        var playbackDrainEvents: [String] = []
+        var playbackRetirementReady = false
+        let playbackAdmitted =
+            retiringPlaybackBinding.beginCaptureCallback()
+        let playbackSealed =
+            retiringPlaybackBinding.requestRetirement()
+        AudioCaptureAsynchronousCallbackDrain.perform(
+            processing: {
+                playbackDrainEvents.append("processed")
+                expect(
+                    AudioCapturePlaybackReferenceCallbackPolicy.accepts(
+                        capturedMediaEpoch: 11,
+                        currentMediaEpoch: 12,
+                        routingTokenRecognized: true
+                    ),
+                    "an admitted playback-reference callback must survive media-epoch restart while its routing token remains recognized"
+                )
+            },
+            completion: {
+                playbackDrainEvents.append("completed")
+                playbackRetirementReady =
+                    retiringPlaybackBinding.finishCaptureCallback()
+            }
+        )
+        expect(
+            playbackAdmitted
+                && !playbackSealed
+                && playbackDrainEvents == ["processed", "completed"]
+                && playbackRetirementReady,
+            "an admitted playback-reference callback must survive media-epoch restart and hold binding retirement until asynchronous processing completes"
+        )
+        var timingTracker = AudioCaptureTimingTracker(
+            maximumUnavailableBuffers: 1
+        )
+        timingTracker.activate(timelineWakeToken)
+        timingTracker.activate(timelineRealtimeToken)
+        let staleTimingDisposition = timingTracker.record(
+            token: timelineWakeToken,
+            timestampAvailable: false,
+            recognized: timelineRouter.recognizes(timelineWakeToken),
+            isCurrent: false
+        )
+        let currentTimingDisposition = timingTracker.record(
+            token: timelineRealtimeToken,
+            timestampAvailable: false,
+            recognized: timelineRouter.recognizes(timelineRealtimeToken),
+            isCurrent: true
+        )
+        expect(
+            staleTimingDisposition == .ignoredStale
+                && currentTimingDisposition == .failed,
+            "a stale retiring binding must be rejected before missing timing can affect the current plane"
+        )
+        var integratedOverlapRouter = AudioCaptureTimelineRouter()
+        let integratedWakeToken = integratedOverlapRouter.advance(
+            atHostTime: 100
+        )
+        _ = integratedOverlapRouter.retirePrevious(
+            AudioCaptureRoutingToken(epoch: 0, beginsAtHostTime: 0)
+        )
+        let integratedRealtimeToken = integratedOverlapRouter.advance(
+            atHostTime: 300
+        )
+        var integratedTimingTracker = AudioCaptureTimingTracker(
+            maximumUnavailableBuffers: 1
+        )
+        integratedTimingTracker.activate(integratedWakeToken)
+        integratedTimingTracker.activate(integratedRealtimeToken)
+        let integratedMissingRetiringDisposition =
+            integratedTimingTracker.record(
+                token: integratedWakeToken,
+                timestampAvailable: false,
+                recognized: integratedOverlapRouter.recognizes(
+                    integratedWakeToken
+                ),
+                isCurrent: false
+            )
+        let integratedCurrentDisposition = integratedTimingTracker.record(
+            token: integratedRealtimeToken,
+            timestampAvailable: true,
+            recognized: integratedOverlapRouter.recognizes(
+                integratedRealtimeToken
+            ),
+            isCurrent: true
+        )
+        let integratedRetiringDisposition = integratedTimingTracker.record(
+            token: integratedWakeToken,
+            timestampAvailable: true,
+            recognized: integratedOverlapRouter.recognizes(
+                integratedWakeToken
+            ),
+            isCurrent: false
+        )
+        let integratedCurrentDelivery = integratedOverlapRouter.route(
+            AudioCapturePCMBuffer(
+                token: integratedRealtimeToken,
+                startHostTime: 300,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(300..<340).map(Float.init)
+            )
+        )
+        let integratedRetiringDelivery = integratedOverlapRouter.route(
+            AudioCapturePCMBuffer(
+                token: integratedWakeToken,
+                startHostTime: 280,
+                sampleRate: 1_000,
+                hostClockFrequency: 1_000,
+                samples: Array(280..<320).map(Float.init)
+            )
+        )
+        let integratedOverlapDelivery = integratedOverlapRouter.retirePrevious(
+            integratedWakeToken
+        ).flatMap(\.samples).map(Int.init)
+        expect(
+            integratedMissingRetiringDisposition == .ignoredStale
+                && integratedCurrentDisposition == .accepted
+                && integratedRetiringDisposition == .accepted
+                && integratedCurrentDelivery.isEmpty
+                && integratedRetiringDelivery.isEmpty
+                && integratedOverlapDelivery == Array(280..<340),
+            "valid retiring capture timing must reach sample-level overlap routing even when the current callback arrives first"
+        )
+        let idleWakeGraph = AudioCapturePlanePolicy.requirements(
+            for: .idleWakeRaw
+        )
+        let realtimeGraph = AudioCapturePlanePolicy.requirements(
+            for: .realtimeFullDuplex
+        )
+        expect(
+            !idleWakeGraph.voiceProcessing
+                && !idleWakeGraph.outputPlayback
+                && !idleWakeGraph.playbackReferenceTap,
+            "idle wake capture must remain raw input-only"
+        )
+        expect(
+            realtimeGraph.voiceProcessing
+                && realtimeGraph.outputPlayback
+                && realtimeGraph.playbackReferenceTap,
+            "active Realtime capture must retain full-duplex voice processing"
+        )
+        expect(
+            AudioCapturePlanePolicy.realtimeStartupDecision(
+                succeeded: false
+            ) == .keepCurrentPlane
+                && AudioCapturePlanePolicy.realtimeStartupDecision(
+                    succeeded: true
+                ) == .retireIdleWake,
+            "Realtime startup failure must preserve raw wake capture until the active plane is ready"
+        )
+        let startupFailurePlan =
+            AudioCapturePlanePolicy.realtimeStartupFailurePlan
+        let startupFailureFields = startupFailurePlan.eventFields(
+            wakePhraseEnabled: true
+        )
+        expect(
+            startupFailurePlan.preserveCaptureForWake
+                && startupFailurePlan.preserveHandoffJournal
+                && startupFailurePlan.rearmWakeAnalyzer
+                && !startupFailurePlan.allowsTransportRetry
+                && startupFailureFields["preserveWakeCapture"] == true
+                && startupFailureFields["preserveWakeJournal"] == true
+                && startupFailureFields["rearmWakeAnalyzer"] == true,
+            "Realtime startup failure must preserve raw wake capture, its journal, and analyzer rearm ownership"
+        )
+        expect(
+            AudioCapturePlanePolicy.wakeStartupDecision(
+                succeeded: true
+            ) == .retireRealtime
+                && AudioCapturePlanePolicy.wakeStartupDecision(
+                    succeeded: false
+                ) == .retireRealtimeAndRearmWake,
+            "active stop must release VPIO only after raw wake readiness or an explicit rearm fallback"
         )
         var timingHealth = AudioCaptureTimingHealth(
             maximumUnavailableBuffers: 3
@@ -471,40 +1847,85 @@ struct PolicyTests {
         let supportedFastProfile = CodexProfileSelectionPolicy.resolve(
             model: "inherit",
             reasoningEffort: "xhigh",
-            fastMode: true,
+            serviceTierSelection: .priority,
             effectiveModel: "model-a",
+            effectiveServiceTier: "default",
             capabilities: profileCapabilities
         )
         let supportedDefaultTierProfile = CodexProfileSelectionPolicy.resolve(
             model: "model-a",
             reasoningEffort: "inherit",
-            fastMode: false,
+            serviceTierSelection: .standard,
             effectiveModel: "model-a",
+            effectiveServiceTier: "priority",
+            capabilities: profileCapabilities
+        )
+        let supportedInheritedTierProfile = CodexProfileSelectionPolicy.resolve(
+            model: "model-a",
+            reasoningEffort: "inherit",
+            serviceTierSelection: .inherit,
+            effectiveModel: "model-a",
+            effectiveServiceTier: "default",
             capabilities: profileCapabilities
         )
         let unsupportedReasoningProfile = CodexProfileSelectionPolicy.resolve(
             model: "model-b",
             reasoningEffort: "xhigh",
-            fastMode: false,
+            serviceTierSelection: .standard,
             effectiveModel: "model-a",
+            effectiveServiceTier: "default",
             capabilities: profileCapabilities
         )
         let unsupportedFastProfile = CodexProfileSelectionPolicy.resolve(
             model: "model-b",
             reasoningEffort: "low",
-            fastMode: true,
+            serviceTierSelection: .priority,
             effectiveModel: "model-a",
+            effectiveServiceTier: "default",
             capabilities: profileCapabilities
         )
+        let unsupportedInheritedPriorityProfile =
+            CodexProfileSelectionPolicy.resolve(
+                model: "model-b",
+                reasoningEffort: "low",
+                serviceTierSelection: .inherit,
+                effectiveModel: "model-a",
+                effectiveServiceTier: "priority",
+                capabilities: profileCapabilities
+            )
+        let supportedInheritedStandardProfile =
+            CodexProfileSelectionPolicy.resolve(
+                model: "model-b",
+                reasoningEffort: "low",
+                serviceTierSelection: .inherit,
+                effectiveModel: "model-a",
+                effectiveServiceTier: "default",
+                capabilities: profileCapabilities
+            )
+        let unresolvedInheritedTierProfile =
+            CodexProfileSelectionPolicy.resolve(
+                model: "model-b",
+                reasoningEffort: "low",
+                serviceTierSelection: .inherit,
+                effectiveModel: "model-a",
+                effectiveServiceTier: "unknown",
+                capabilities: profileCapabilities
+            )
         expect(
             supportedFastProfile.isSupported
                 && supportedFastProfile.resolvedModelID == "model-a"
                 && supportedFastProfile.serviceTier == "priority"
                 && supportedDefaultTierProfile.isSupported
                 && supportedDefaultTierProfile.serviceTier == nil
+                && supportedInheritedTierProfile.isSupported
+                && supportedInheritedTierProfile.serviceTier == nil
+                && supportedInheritedStandardProfile.isSupported
+                && supportedInheritedStandardProfile.serviceTier == nil
                 && !unsupportedReasoningProfile.isSupported
-                && !unsupportedFastProfile.isSupported,
-            "Codex profile selection must use runtime capabilities and fail closed for unsupported thinking or Fast combinations"
+                && !unsupportedFastProfile.isSupported
+                && !unsupportedInheritedPriorityProfile.isSupported
+                && !unresolvedInheritedTierProfile.isSupported,
+            "Codex profile selection must gate inherited host priority by model capability and fail closed when the inherited tier is unresolved"
         )
         let orderedReasoningEfforts = CodexReasoningEffortOrder.sorted([
             "ultra",
@@ -539,7 +1960,7 @@ struct PolicyTests {
         var profileOnlySettings = previousSettings
         profileOnlySettings.codexModel = "model-a"
         profileOnlySettings.codexReasoningEffort = "high"
-        profileOnlySettings.codexFastMode = true
+        profileOnlySettings.codexServiceTierSelection = .priority
         var voiceChangedSettings = profileOnlySettings
         voiceChangedSettings.realtimeVoice = "cedar"
         expect(
@@ -2106,16 +3527,30 @@ struct PolicyTests {
                     == Data(repeating: 2, count: 100),
             "handoff replay must contain every frame after the recognized wake boundary exactly once"
         )
+        let failedStartupRearmBoundary =
+            wakeJournal.rollbackCommittedHandoffForRearm()
+        let failedStartupRearmPCM: Data
+        if let failedStartupRearmBoundary,
+           case let .ready(chunk) = wakeJournal.replay(
+                fromFrame: failedStartupRearmBoundary
+           ) {
+            failedStartupRearmPCM = chunk.data
+        } else {
+            failedStartupRearmPCM = Data()
+        }
+        expect(
+            failedStartupRearmBoundary
+                == wakeTicket.recognizedThroughFrame
+                && failedStartupRearmPCM == replayedWakePCM
+                && !wakeJournal.hasCommittedHandoff,
+            "Realtime startup failure must convert the committed handoff into analyzer-rearm replay without losing journal PCM"
+        )
         expect(
             !wakeJournal.claim(
                 ticketID: wakeTicket.id,
                 generation: 8
             ),
             "a claimed wake handoff identity must reject a second generation"
-        )
-        wakeJournal.finish(
-            ticketID: wakeTicket.id,
-            generation: 7
         )
         expect(
             wakeJournal.replay(
@@ -2863,6 +4298,188 @@ struct PolicyTests {
             ) && !assistantOutput.isActive,
             "the surface may collapse only after every output path and queue lease finishes"
         )
+
+        var playbackLeases = RealtimePlaybackLeaseReconciler()
+        playbackLeases.reset(generation: generation, playbackEpoch: 12)
+        let droppedCallbackTicket = playbackLeases.admit(
+            generation: generation,
+            playbackEpoch: 12,
+            responseID: "response-watchdog",
+            frameCount: 24_000,
+            now: 100
+        )
+        expect(
+            droppedCallbackTicket != nil
+                && playbackLeases.markResponseCompleted(
+                    generation: generation,
+                    responseID: "response-watchdog"
+                ) == nil,
+            "a completed response must retain its admitted native playback lease until callback or watchdog terminalization"
+        )
+        if let droppedCallbackTicket {
+            let beforeScheduledDuration = playbackLeases.reconcile(
+                droppedCallbackTicket,
+                now: 100.9,
+                playerIsPlaying: true,
+                renderedThroughTicket: false,
+                intentionallyPaused: false
+            )
+            expect(
+                beforeScheduledDuration == .pending,
+                "the watchdog must not reclaim playback before its scheduled duration"
+            )
+            let afterScheduledDuration = playbackLeases.reconcile(
+                droppedCallbackTicket,
+                now: 101.5,
+                playerIsPlaying: false,
+                renderedThroughTicket: false,
+                intentionallyPaused: false
+            )
+            expect(
+                afterScheduledDuration.terminalization?.reason == .watchdog
+                    && afterScheduledDuration.terminalization?.responseID
+                        == "response-watchdog"
+                    && playbackLeases.pendingBufferCount == 0
+                    && playbackLeases.queuedFrameCount == 0,
+                "a dropped native callback must be reconciled after bounded scheduled playback and clear its counters"
+            )
+            expect(
+                playbackLeases.reconcile(
+                    droppedCallbackTicket,
+                    now: 104,
+                    playerIsPlaying: false,
+                    renderedThroughTicket: true,
+                    intentionallyPaused: false
+                ) == .ignored
+                    && playbackLeases.complete(
+                        droppedCallbackTicket,
+                        reason: .callback
+                    ) == nil,
+                "watchdog terminalization must be exact once and a late native callback must be harmless"
+            )
+        }
+
+        var successorPlaybackLeases = RealtimePlaybackLeaseReconciler()
+        successorPlaybackLeases.reset(
+            generation: generation,
+            playbackEpoch: 22
+        )
+        let stalePredecessorTicket = successorPlaybackLeases.admit(
+            generation: generation,
+            playbackEpoch: 22,
+            responseID: "response-stale-predecessor",
+            frameCount: 24_000,
+            now: 300
+        )
+        let stalePredecessorCompleted = successorPlaybackLeases
+            .markResponseCompleted(
+                generation: generation,
+                responseID: "response-stale-predecessor"
+            )
+        let lostSuccessorTicket = successorPlaybackLeases.admit(
+            generation: generation,
+            playbackEpoch: 22,
+            responseID: "response-lost-successor",
+            frameCount: 12_000,
+            now: 301.1
+        )
+        let lostSuccessorCompleted = successorPlaybackLeases
+            .markResponseCompleted(
+                generation: generation,
+                responseID: "response-lost-successor"
+            )
+        expect(
+            (stalePredecessorTicket.map {
+                abs($0.expectedEnd - 301.35) < 0.000_001
+            } ?? false)
+                && stalePredecessorCompleted == nil
+                && lostSuccessorCompleted == nil
+                && (lostSuccessorTicket.map {
+                    abs($0.expectedEnd - 301.95) < 0.000_001
+                        && abs($0.hardDeadline - 303.6) < 0.000_001
+                } ?? false),
+            "a successor admitted after a lost-callback predecessor physically drains must use the monotonic queue tail instead of stale callback counters"
+        )
+        if let lostSuccessorTicket {
+            expect(
+                successorPlaybackLeases.reconcile(
+                    lostSuccessorTicket,
+                    now: 302,
+                    playerIsPlaying: false,
+                    renderedThroughTicket: false,
+                    intentionallyPaused: false
+                ).terminalization?.responseID == "response-lost-successor",
+                "a lost successor callback must reconcile at its actual bounded playback deadline"
+            )
+        } else {
+            expect(false, "the lost-callback successor lease must be admitted")
+        }
+
+        playbackLeases.reset(generation: generation + 1, playbackEpoch: 13)
+        expect(
+            droppedCallbackTicket.map {
+                playbackLeases.complete($0, reason: .callback) == nil
+            } ?? false,
+            "a prior generation playback callback must not mutate a replacement generation"
+        )
+
+        let callbackTicket = playbackLeases.admit(
+            generation: generation + 1,
+            playbackEpoch: 13,
+            responseID: "response-callback-first",
+            frameCount: 12_000,
+            now: 200
+        )
+        if let callbackTicket {
+            expect(
+                playbackLeases.completeResult(
+                    callbackTicket,
+                    reason: .callback
+                ) == .completed(nil)
+                    && playbackLeases.pendingBufferCount == 0,
+                "a native callback before response.done must release its buffer while retaining the response lease"
+            )
+            expect(
+                playbackLeases.markResponseCompleted(
+                    generation: generation + 1,
+                    responseID: "response-callback-first"
+                )?.reason == .callback,
+                "response.done after a native callback must terminalize through the normal callback path"
+            )
+        } else {
+            expect(false, "the callback-first playback lease must be admitted")
+        }
+
+        let interruptedTicket = playbackLeases.admit(
+            generation: generation + 1,
+            playbackEpoch: 13,
+            responseID: "response-interrupted",
+            frameCount: 6_000,
+            now: 210
+        )
+        let interrupted = playbackLeases.cancelAll(
+            generation: generation + 1,
+            playbackEpoch: 13,
+            reason: .interrupted
+        )
+        expect(
+            interrupted.count == 1
+                && interrupted.first?.responseID == "response-interrupted"
+                && interrupted.first?.reason == .interrupted
+                && playbackLeases.pendingBufferCount == 0
+                && playbackLeases.queuedFrameCount == 0,
+            "barge-in cancellation must terminalize each lease once and clear reconciler counters"
+        )
+        playbackLeases.reset(
+            generation: generation + 1,
+            playbackEpoch: 14
+        )
+        expect(
+            interruptedTicket.map {
+                playbackLeases.complete($0, reason: .callback) == nil
+            } ?? false,
+            "a late callback from an interrupted playback epoch must not mutate the resumed generation"
+        )
         expect(
             VoiceIdleTimeoutPolicy.shouldArm(
                 phase: .listening,
@@ -3288,6 +4905,155 @@ struct PolicyTests {
             ) == ["sv-SE", "ko-KR", "en-US", "de-DE"],
             "system primary plus up to three distinct additional languages must remain multilingual"
         )
+        let reliableLaneLocale = SpokenLocaleSelectionPolicy.resolve(
+            explicitOverrideIdentifier: nil,
+            laneEvidence: [
+                RecognitionLocaleEvidence(
+                    laneIndex: 0,
+                    localeIdentifier: "en-US",
+                    confidence: 0.99,
+                    isFinal: false
+                ),
+                RecognitionLocaleEvidence(
+                    laneIndex: 1,
+                    localeIdentifier: "sv-SE",
+                    confidence: 0.82,
+                    isFinal: true
+                ),
+                RecognitionLocaleEvidence(
+                    laneIndex: 2,
+                    localeIdentifier: "de-DE",
+                    confidence: 0.99,
+                    isFinal: true
+                ),
+                RecognitionLocaleEvidence(
+                    laneIndex: 3,
+                    localeIdentifier: "fr-FR",
+                    confidence: 1,
+                    isFinal: true
+                ),
+            ],
+            activationWakeLocaleIdentifier: "ko-KR",
+            configuredPrimaryLocaleIdentifier: "en-US",
+            configuredSupportedLocaleIdentifiers: [
+                "en-US", "sv-SE", "ko-KR",
+            ]
+        )
+        expect(
+            reliableLaneLocale.localeIdentifier == "sv-SE"
+                && reliableLaneLocale.reason == .reliableLaneEvidence
+                && reliableLaneLocale.laneIndex == 1
+                && reliableLaneLocale.isFinal == true
+                && reliableLaneLocale.confidence == 0.82,
+            "a finalized confident same-audio lane inside the configured supported set must outrank wake and primary fallbacks"
+        )
+        let reliableBaseLaneLocale = SpokenLocaleSelectionPolicy.resolve(
+            explicitOverrideIdentifier: nil,
+            laneEvidence: [
+                RecognitionLocaleEvidence(
+                    laneIndex: 2,
+                    localeIdentifier: "sv",
+                    confidence: 0.91,
+                    isFinal: true
+                ),
+            ],
+            activationWakeLocaleIdentifier: "ko-KR",
+            configuredPrimaryLocaleIdentifier: "en-US",
+            configuredSupportedLocaleIdentifiers: [
+                "en-US", "sv-SE", "ko-KR",
+            ]
+        )
+        expect(
+            reliableBaseLaneLocale.localeIdentifier == "sv-SE"
+                && reliableBaseLaneLocale.reason == .reliableLaneEvidence
+                && reliableBaseLaneLocale.laneIndex == 2,
+            "a finalized confident base-locale lane must resolve to its configured regional locale"
+        )
+        let explicitLocale = SpokenLocaleSelectionPolicy.resolve(
+            explicitOverrideIdentifier: "ko-KR",
+            laneEvidence: [
+                RecognitionLocaleEvidence(
+                    laneIndex: 1,
+                    localeIdentifier: "sv-SE",
+                    confidence: 0.98,
+                    isFinal: true
+                ),
+            ],
+            activationWakeLocaleIdentifier: "sv-SE",
+            configuredPrimaryLocaleIdentifier: "en-US",
+            configuredSupportedLocaleIdentifiers: [
+                "en-US", "sv-SE", "ko-KR",
+            ]
+        )
+        expect(
+            explicitLocale.localeIdentifier == "ko-KR"
+                && explicitLocale.reason == .explicitUserOverride
+                && explicitLocale.laneIndex == nil,
+            "an explicit locale override must outrank recognizer-lane, wake, and primary evidence"
+        )
+        let wakeFallbackLocale = SpokenLocaleSelectionPolicy.resolve(
+            explicitOverrideIdentifier: nil,
+            laneEvidence: [
+                RecognitionLocaleEvidence(
+                    laneIndex: 0,
+                    localeIdentifier: "sv-SE",
+                    confidence: 0.3,
+                    isFinal: true
+                ),
+            ],
+            activationWakeLocaleIdentifier: "ko-KR",
+            configuredPrimaryLocaleIdentifier: "en-US",
+            configuredSupportedLocaleIdentifiers: [
+                "en-US", "sv-SE", "ko-KR",
+            ]
+        )
+        expect(
+            wakeFallbackLocale.localeIdentifier == "ko-KR"
+                && wakeFallbackLocale.reason == .activationWakeLocale,
+            "weak lane evidence must fall back to the configured activation wake locale"
+        )
+        let unavailableConfidenceFallback = SpokenLocaleSelectionPolicy.resolve(
+            explicitOverrideIdentifier: nil,
+            laneEvidence: [
+                RecognitionLocaleEvidence(
+                    laneIndex: 0,
+                    localeIdentifier: "sv-SE",
+                    confidence: nil,
+                    isFinal: true
+                ),
+            ],
+            activationWakeLocaleIdentifier: "ko-KR",
+            configuredPrimaryLocaleIdentifier: "en-US",
+            configuredSupportedLocaleIdentifiers: [
+                "en-US", "sv-SE", "ko-KR",
+            ]
+        )
+        expect(
+            unavailableConfidenceFallback.localeIdentifier == "ko-KR"
+                && unavailableConfidenceFallback.reason == .activationWakeLocale,
+            "a final lane without calibrated confidence must not masquerade as reliable language evidence"
+        )
+        let primaryFallbackLocale = SpokenLocaleSelectionPolicy.resolve(
+            explicitOverrideIdentifier: nil,
+            laneEvidence: [],
+            activationWakeLocaleIdentifier: "de-DE",
+            configuredPrimaryLocaleIdentifier: "en-US",
+            configuredSupportedLocaleIdentifiers: ["en-US", "sv-SE"]
+        )
+        let clarificationLocale = SpokenLocaleSelectionPolicy.resolve(
+            explicitOverrideIdentifier: nil,
+            laneEvidence: [],
+            activationWakeLocaleIdentifier: "",
+            configuredPrimaryLocaleIdentifier: "",
+            configuredSupportedLocaleIdentifiers: []
+        )
+        expect(
+            primaryFallbackLocale.localeIdentifier == "en-US"
+                && primaryFallbackLocale.reason == .configuredPrimary
+                && clarificationLocale.localeIdentifier == nil
+                && clarificationLocale.reason == .clarificationRequired,
+            "locale selection must end in a configured primary or a bounded clarification instead of inventing a language"
+        )
         expect(
             SettingsStore.realtimeLanguageHint(
                 "ko-KR",
@@ -3385,6 +5151,10 @@ struct PolicyTests {
             "fresh installs must use an app-owned workspace instead of the user's home directory"
         )
         expect(
+            isolatedStore.load().codexServiceTierSelection == .inherit,
+            "fresh installs must inherit the live host service tier until the user chooses Standard or Fast"
+        )
+        expect(
             isolatedStore.load().preferModernSpeechAnalyzer,
             "fresh installs must prefer the latest SpeechAnalyzer when the runtime can support every selected language"
         )
@@ -3393,6 +5163,78 @@ struct PolicyTests {
         expect(
             !isolatedStore.load().hoverStartsVoice,
             "older hover-to-start preferences must migrate to explicit activation"
+        )
+        for (legacyFastMode, expectedSelection) in [
+            (true, CodexServiceTierSelection.priority),
+            (false, CodexServiceTierSelection.standard),
+        ] {
+            let migrationSuite =
+                "VoiceRelay.FastModeMigration.\(legacyFastMode).\(UUID().uuidString)"
+            let migrationDefaults =
+                EphemeralPolicyUserDefaults(suiteName: migrationSuite)!
+            migrationDefaults.removePersistentDomain(forName: migrationSuite)
+            defer {
+                migrationDefaults.removePersistentDomain(forName: migrationSuite)
+            }
+            migrationDefaults.set(
+                SettingsStore.currentSchemaVersion - 1,
+                forKey: "voiceRelay.settings.schemaVersion"
+            )
+            migrationDefaults.set(
+                legacyFastMode,
+                forKey: "voiceRelay.codex.fastMode"
+            )
+            let migrationStore = SettingsStore(
+                defaults: migrationDefaults,
+                threadBindingLockURL: temporaryRoot.appendingPathComponent(
+                    "fast-mode-\(legacyFastMode).lock"
+                )
+            )
+            expect(
+                migrationStore.load().codexServiceTierSelection
+                    == expectedSelection,
+                "legacy Fast \(legacyFastMode) must migrate to \(expectedSelection.rawValue) instead of becoming inherited host state"
+            )
+        }
+        let explicitTierSuite =
+            "VoiceRelay.ServiceTierPrecedence.\(UUID().uuidString)"
+        let explicitTierDefaults =
+            EphemeralPolicyUserDefaults(suiteName: explicitTierSuite)!
+        explicitTierDefaults.removePersistentDomain(forName: explicitTierSuite)
+        defer {
+            explicitTierDefaults.removePersistentDomain(forName: explicitTierSuite)
+        }
+        explicitTierDefaults.set(
+            SettingsStore.currentSchemaVersion - 1,
+            forKey: "voiceRelay.settings.schemaVersion"
+        )
+        explicitTierDefaults.set(
+            true,
+            forKey: "voiceRelay.codex.fastMode"
+        )
+        explicitTierDefaults.set(
+            CodexServiceTierSelection.inherit.rawValue,
+            forKey: "voiceRelay.codex.serviceTierSelection"
+        )
+        let explicitTierStore = SettingsStore(
+            defaults: explicitTierDefaults,
+            threadBindingLockURL: temporaryRoot.appendingPathComponent(
+                "service-tier-precedence.lock"
+            )
+        )
+        expect(
+            explicitTierStore.load().codexServiceTierSelection == .inherit
+                && explicitTierStore.load().codexServiceTierSelection
+                    == .inherit,
+            "the new service-tier key must win over the legacy Bool and migration must be idempotent"
+        )
+        explicitTierDefaults.set(
+            "unsupported-tier",
+            forKey: "voiceRelay.codex.serviceTierSelection"
+        )
+        expect(
+            explicitTierStore.load().codexServiceTierSelection == .standard,
+            "a corrupted explicit service-tier value must fail closed to Standard instead of inheriting host priority"
         )
         isolatedStore.codexAppConnectionCompleted = true
         expect(
@@ -3422,7 +5264,7 @@ struct PolicyTests {
         explicitSettings.realtimeSpeechRate = 1.1
         explicitSettings.codexModel = "model-a"
         explicitSettings.codexReasoningEffort = "high"
-        explicitSettings.codexFastMode = true
+        explicitSettings.codexServiceTierSelection = .priority
         explicitSettings.realtimeInstructions = "Use a short custom greeting."
         explicitSettings.productName = "  Orbit  "
         explicitSettings.assistantName = "  Nova  "
@@ -3461,8 +5303,8 @@ struct PolicyTests {
                     < 0.000_001
                 && savedVoiceSettings.codexModel == "model-a"
                 && savedVoiceSettings.codexReasoningEffort == "high"
-                && savedVoiceSettings.codexFastMode,
-            "the configurable voice inactivity timeout and speech speed must round-trip"
+                && savedVoiceSettings.codexServiceTierSelection == .priority,
+            "the configurable voice inactivity timeout, speech speed, and service-tier selection must round-trip"
         )
         expect(
             SettingsStore.clampedRealtimeSpeechRate(0.1) == 0.25
@@ -4023,6 +5865,41 @@ struct PolicyTests {
                 generation: 42
             ) == .dispatch,
             "a new generation may reuse an old request ID only after synchronous closure"
+        )
+
+        var codexRequestLease = CodexRequestLeaseState()
+        let cancelledLease = codexRequestLease.begin(
+            generation: 51,
+            requestID: "answer-1"
+        )
+        expect(
+            codexRequestLease.cancel(
+                generation: 51,
+                requestID: "answer-1"
+            ) == cancelledLease,
+            "current-answer cancellation must retire the exact active request"
+        )
+        let successorLease = codexRequestLease.begin(
+            generation: 51,
+            requestID: "answer-2"
+        )
+        expect(
+            !codexRequestLease.complete(cancelledLease)
+                && codexRequestLease.matches(successorLease),
+            "a late cancelled completion must not retire a successor in the same generation"
+        )
+        expect(
+            codexRequestLease.cancel(
+                generation: 51,
+                requestID: "answer-1"
+            ) == nil
+                && codexRequestLease.matches(successorLease),
+            "an obsolete exact cancellation must not interrupt the active successor"
+        )
+        expect(
+            codexRequestLease.complete(successorLease)
+                && codexRequestLease.active == nil,
+            "the exact active successor must complete and clear its lease"
         )
 
         print("Voice Relay policy tests passed")

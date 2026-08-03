@@ -144,6 +144,18 @@ safety instructions. A content fingerprint rotates an app-managed dedicated
 session when the pack changes. A user-selected existing Session ID must be
 cleared explicitly before a changed pack can be saved.
 
+Connector v1 is a separate read-only event plane. Settings validates a strict
+manifest and sibling executable without running it, persists the binding
+disabled, and requires an explicit unsandboxed-code acknowledgement to enable
+it. Trust is bound to exact manifest and executable SHA-256 digests. The host
+owns return, morning, and manual event envelopes, permission admission, bounded
+process execution, result validation, and the durable delivery ledger. A
+prepared connector brief goes directly to Realtime with tools disabled, so it
+cannot create or rotate a Codex task. The ledger records authoritative final and
+native playback-drain acknowledgements before marking completion. Automatic
+presence speech is separately gated on external-media status, and cooldown is
+written only after playback drain.
+
 Additional Context Providers are a distinct optional boundary and are also
 blank and disabled by default. The helper executes only bounded executable
 regular files from the exact selected folder, in filename order, with the
@@ -222,13 +234,14 @@ Codex task. Quit terminates the app through AppKit.
 The Advanced pane also contains About Voice Relay. Release builds embed the
 exact public alpha, beta, or release-candidate tag, numeric bundle version,
 build number, and internal preview channel. GitHub records these builds as
-ordinary releases and selects `Latest` automatically. The explicit update
-action is backed by pinned Sparkle 2. Its stable signed appcast points to
-preview-channel update archives, and its embedded EdDSA public key authenticates
-both the feed and enclosure before extraction. Sparkle owns download,
-replacement, authorization, and relaunch. Background checks and silent
-automatic installation are disabled. The first updater-enabled alpha is a
-one-time manual bootstrap installation.
+GitHub prereleases and cannot become `Latest`; only an explicitly approved
+stable release uses ordinary release metadata. The explicit update action is
+backed by pinned Sparkle 2. Its stable signed appcast points to preview-channel
+update archives, and its embedded EdDSA public key authenticates both the feed
+and enclosure before extraction. Sparkle owns download, replacement,
+authorization, and relaunch. Background checks and silent automatic
+installation are disabled. The first updater-enabled alpha is a one-time
+manual bootstrap installation.
 
 ## Distribution boundary
 

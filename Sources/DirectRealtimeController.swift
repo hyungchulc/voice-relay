@@ -29,6 +29,7 @@ final class DirectRealtimeController: NSObject {
     private let reasoningEffort: String
     private let instructions: String
     private let language: String
+    private let languageExplicitlyForced: Bool
     private let additionalLanguages: [String]
     private let productName: String
     private let assistantName: String
@@ -48,7 +49,13 @@ final class DirectRealtimeController: NSObject {
         activationID: String,
         wakeTranscript: String,
         wakeLocale: String,
-        wakeHandoffTicketID: String
+        spokenLocale: String,
+        spokenLocaleSelectionReason: String,
+        spokenLocaleLane: Int?,
+        spokenLocaleConfidence: Float?,
+        spokenLocaleFinal: Bool?,
+        wakeHandoffTicketID: String,
+        eventBriefing: ConnectorBriefingPresentation?
     )?
     private var wakeHandoffTicketIDsByGeneration: [Int: String] = [:]
     private var activeGeneration: Int?
@@ -83,6 +90,7 @@ final class DirectRealtimeController: NSObject {
         reasoningEffort: String,
         instructions: String,
         language: String,
+        languageExplicitlyForced: Bool,
         additionalLanguages: [String],
         productName: String,
         assistantName: String,
@@ -97,6 +105,7 @@ final class DirectRealtimeController: NSObject {
         self.reasoningEffort = reasoningEffort
         self.instructions = instructions
         self.language = language
+        self.languageExplicitlyForced = languageExplicitlyForced
         self.additionalLanguages = additionalLanguages
         self.productName = productName
         self.assistantName = assistantName
@@ -162,11 +171,13 @@ final class DirectRealtimeController: NSObject {
                 "Native Realtime stage=\(snapshot.stage, privacy: .public) generation=\(snapshot.generation) captured=\(snapshot.capturedChunks) sent=\(snapshot.sentChunks) received=\(snapshot.receivedChunks) rendered=\(snapshot.renderedChunks) dropped=\(snapshot.droppedCaptureChunks) echo_suppressed=\(snapshot.suppressedEchoChunks) voice_processing=\(snapshot.voiceProcessingEnabled ? "on" : "off", privacy: .public)"
             )
         }
-        transport.onError = { [weak self] generation, message in
+        transport.onError = {
+            [weak self] generation, message, failurePlan in
             guard let self, self.activeGeneration == generation else { return }
             self.handleTransportFailure(
                 generation: generation,
-                message: message
+                message: message,
+                failurePlan: failurePlan
             )
         }
         transport.onClosed = { [weak self] generation in
@@ -216,7 +227,8 @@ final class DirectRealtimeController: NSObject {
         prefill: String? = nil,
         shouldGreet: Bool = true,
         reason: String = "manual",
-        wakeActivation: WakeActivationContext? = nil
+        wakeActivation: WakeActivationContext? = nil,
+        eventBriefing: ConnectorBriefingPresentation? = nil
     ) {
         if let previousGeneration = activeGeneration,
            previousGeneration != generation {
@@ -264,7 +276,14 @@ final class DirectRealtimeController: NSObject {
             wakeActivation?.activationID ?? "",
             wakeActivation?.recognizedUtteranceText ?? "",
             wakeActivation?.wakeLocaleIdentifier ?? "",
-            wakeActivation?.handoffTicketID ?? ""
+            wakeActivation?.spokenLocaleIdentifier ?? "",
+            wakeActivation?.spokenLocaleSelectionReason.rawValue
+                ?? SpokenLocaleSelectionReason.configuredPrimary.rawValue,
+            wakeActivation?.spokenLocaleLaneIndex,
+            wakeActivation?.spokenLocaleConfidence,
+            wakeActivation?.spokenLocaleIsFinal,
+            wakeActivation?.handoffTicketID ?? "",
+            eventBriefing
         )
         if let ticketID = wakeActivation?.handoffTicketID,
            !ticketID.isEmpty {
@@ -278,7 +297,8 @@ final class DirectRealtimeController: NSObject {
     func stop(
         generation: Int,
         reason: String = "host_stop",
-        preserveCaptureForWake: Bool = true
+        preserveCaptureForWake: Bool = true,
+        preserveHandoffJournal: Bool = true
     ) {
         guard activeGeneration == generation else {
             VoiceRelayDiagnostics.flow(
@@ -313,7 +333,8 @@ final class DirectRealtimeController: NSObject {
         transport.stop(
             generation: generation,
             reason: reason,
-            preserveCaptureForWake: preserveCaptureForWake
+            preserveCaptureForWake: preserveCaptureForWake,
+            preserveHandoffJournal: preserveHandoffJournal
         )
         evaluate(
             method: "stop",
@@ -400,30 +421,51 @@ final class DirectRealtimeController: NSObject {
             return
         }
         self.pendingStart = nil
+        var payload: [String: Any] = [
+            "generation": pendingStart.generation,
+            "prefill": pendingStart.prefill ?? "",
+            "model": model,
+            "voice": voice,
+            "speechRate": speechRate,
+            "reasoningEffort": reasoningEffort,
+            "instructions": instructions,
+            "language": language,
+            "languageExplicitlyForced": languageExplicitlyForced,
+            "additionalLanguages": additionalLanguages,
+            "productName": productName,
+            "assistantName": assistantName,
+            "userDisplayName": userDisplayName,
+            "wakePhrases": wakePhrases,
+            "shouldGreet": pendingStart.shouldGreet,
+            "activationReason": pendingStart.reason,
+            "activationID": pendingStart.activationID,
+            "wakeTranscript": pendingStart.wakeTranscript,
+            "wakeLocale": pendingStart.wakeLocale,
+            "spokenLocale": pendingStart.spokenLocale,
+            "spokenLocaleSelectionReason":
+                pendingStart.spokenLocaleSelectionReason,
+            "wakeHandoffTicketID": pendingStart.wakeHandoffTicketID,
+        ]
+        if let lane = pendingStart.spokenLocaleLane {
+            payload["spokenLocaleLane"] = lane
+        }
+        if let confidence = pendingStart.spokenLocaleConfidence {
+            payload["spokenLocaleConfidence"] = confidence
+        }
+        if let final = pendingStart.spokenLocaleFinal {
+            payload["spokenLocaleFinal"] = final
+        }
+        payload["eventBriefing"] = pendingStart.eventBriefing.map { briefing in
+            [
+                "eventId": briefing.eventID,
+                "idempotencyKey": briefing.idempotencyKey,
+                "trigger": briefing.trigger.rawValue,
+                "speech": briefing.speech,
+            ]
+        } ?? [:]
         evaluate(
             method: "start",
-            payload: [
-                "generation": pendingStart.generation,
-                "prefill": pendingStart.prefill ?? "",
-                "model": model,
-                "voice": voice,
-                "speechRate": speechRate,
-                "reasoningEffort": reasoningEffort,
-                "instructions": instructions,
-                "language": language,
-                "additionalLanguages": additionalLanguages,
-                "productName": productName,
-                "assistantName": assistantName,
-                "userDisplayName": userDisplayName,
-                "wakePhrases": wakePhrases,
-                "shouldGreet": pendingStart.shouldGreet,
-                "activationReason": pendingStart.reason,
-                "activationID": pendingStart.activationID,
-                "wakeTranscript": pendingStart.wakeTranscript,
-                "wakeLocale": pendingStart.wakeLocale,
-                "wakeHandoffTicketID":
-                    pendingStart.wakeHandoffTicketID,
-            ]
+            payload: payload
         )
     }
 
@@ -542,12 +584,17 @@ extension DirectRealtimeController: WKScriptMessageHandler {
                 "ice",
                 "itemID",
                 "kind",
+                "lane",
+                "locale",
                 "peer",
                 "pendingItemID",
                 "reason",
                 "responseID",
                 "shape",
+                "selectionReason",
                 "source",
+                "confidence",
+                "final",
                 "status",
                 "turnID",
             ] {
@@ -703,7 +750,8 @@ extension DirectRealtimeController: WKScriptMessageHandler {
 
     private func handleTransportFailure(
         generation: Int,
-        message: String
+        message: String,
+        failurePlan: AudioCaptureStartupFailurePlan
     ) {
         guard generation == activeGeneration else { return }
         if let ticketID =
@@ -725,6 +773,33 @@ extension DirectRealtimeController: WKScriptMessageHandler {
                 "type": "error",
                 "generation": generation,
                 "message": message,
+                "preserveWakeCapture": failurePlan.preserveCaptureForWake,
+                "preserveWakeJournal": failurePlan.preserveHandoffJournal,
+                "rearmWakeAnalyzer": failurePlan.rearmWakeAnalyzer,
+            ])
+            return
+        }
+        if failurePlan.rearmWakeAnalyzer {
+            startupRetryWorkItem?.cancel()
+            startupRetryWorkItem = nil
+            startupRetryState.cancel(generation: generation)
+            VoiceRelayDiagnostics.flow(
+                "realtime_transport_failure_terminal",
+                generation: generation,
+                fields: [
+                    "reason": message,
+                    "retry": "disabled_for_wake_rearm",
+                ]
+            )
+            onEvent?([
+                "type": "error",
+                "generation": generation,
+                "message": message,
+                "preserveWakeCapture":
+                    failurePlan.preserveCaptureForWake,
+                "preserveWakeJournal":
+                    failurePlan.preserveHandoffJournal,
+                "rearmWakeAnalyzer": failurePlan.rearmWakeAnalyzer,
             ])
             return
         }
@@ -788,6 +863,9 @@ extension DirectRealtimeController: WKScriptMessageHandler {
             "type": "error",
             "generation": generation,
             "message": message,
+            "preserveWakeCapture": failurePlan.preserveCaptureForWake,
+            "preserveWakeJournal": failurePlan.preserveHandoffJournal,
+            "rearmWakeAnalyzer": failurePlan.rearmWakeAnalyzer,
         ])
     }
 
@@ -1082,6 +1160,7 @@ extension DirectRealtimeController: WKScriptMessageHandler {
         "codexHandoff",
         "codexRequest",
         "codexSteer",
+        "cancelCurrentAnswer",
         "stopIntent",
         "stopAcknowledgementFinal",
         "stopAcknowledgementDrained",
@@ -1707,7 +1786,7 @@ private extension DirectRealtimeController {
                 )) {
               speakControlResponse(
                 "clarify",
-                configuredLanguageTags()[0] || "und",
+                preferredConfiguredLanguageTag(),
                 "neutral"
               );
             }
@@ -1970,12 +2049,16 @@ private extension DirectRealtimeController {
               eventID: causalEventId
             }
           );
+          session.lifecycle = "failed";
+          state("failed", generation);
+          activeStartGeneration = 0;
           send({
             type: "error",
             generation,
             message:
               "The configured speech recognition languages are not supported by this Realtime session"
           });
+          closeSession();
           return;
         }
         if (causalEventId.startsWith("voice-relay-truncate-")) {
@@ -2224,7 +2307,8 @@ private extension DirectRealtimeController {
       function emitAssistantFinalOnce(
         spokenText,
         responseId = "",
-        displayText = ""
+        displayText = "",
+        kind = ""
       ) {
         const spokenValue = String(spokenText || "").trim();
         const visibleValue = String(displayText || spokenValue).trim();
@@ -2251,6 +2335,7 @@ private extension DirectRealtimeController {
           type: "assistantFinal",
           generation: session.generation,
           responseId: String(responseId || ""),
+          kind: String(kind || ""),
           text: visibleValue
         });
         return true;
@@ -2259,6 +2344,10 @@ private extension DirectRealtimeController {
       function normalizeSpokenLanguageTag(value) {
         const candidate = String(value || "").trim();
         const configured = configuredLanguageTags();
+        const preferred = preferredConfiguredLanguageSelection();
+        if (preferred.reason === "explicit_user_override") {
+          return preferred.tag;
+        }
         const candidateBase = languageBase(candidate);
         const exact = configured.find(tag =>
           tag.toLocaleLowerCase() === candidate.toLocaleLowerCase()
@@ -2267,7 +2356,7 @@ private extension DirectRealtimeController {
         const sameBase = configured.find(tag =>
           languageBase(tag) === candidateBase
         );
-        return sameBase || preferredConfiguredLanguageTag();
+        return sameBase || preferred.tag;
       }
 
       function languageBase(value) {
@@ -2306,27 +2395,94 @@ private extension DirectRealtimeController {
       }
 
       function realtimeTranscriptionConfiguration() {
-        const languages = configuredLanguageBases();
-        const configuration = { model: "gpt-live-transcribe" };
-        if (languages.length > 0) {
-          configuration.languages = languages;
+        const configuration = { model: "gpt-4o-transcribe" };
+        const explicitLanguage = languageBase(
+          session?.startPayload?.language
+        );
+        if (session?.startPayload?.languageExplicitlyForced
+            && explicitLanguage) {
+          configuration.language = explicitLanguage;
         }
         return configuration;
       }
 
-      function preferredConfiguredLanguageTag() {
+      function configuredLanguageMatch(value) {
         const configured = configuredLanguageTags();
-        const wakeLocale = String(
-          session?.startPayload?.wakeLocale || ""
-        ).replace(/_/gu, "-");
+        const normalized = String(value || "").replace(/_/gu, "-");
         const exact = configured.find(tag =>
-          tag.toLocaleLowerCase() === wakeLocale.toLocaleLowerCase()
+          tag.toLocaleLowerCase() === normalized.toLocaleLowerCase()
         );
         if (exact) return exact;
-        const wakeBase = languageBase(wakeLocale);
+        const candidateBase = languageBase(normalized);
+        if (!candidateBase) return "";
         return configured.find(tag =>
-          languageBase(tag) === wakeBase
-        ) || configured[0] || "und";
+          languageBase(tag) === candidateBase
+        ) || "";
+      }
+
+      function preferredConfiguredLanguageSelection() {
+        const payload = session?.startPayload || {};
+        const configured = configuredLanguageTags();
+        const explicit = payload.languageExplicitlyForced
+          ? configuredLanguageMatch(payload.language)
+          : "";
+        if (explicit) {
+          return {
+            tag: explicit,
+            reason: "explicit_user_override",
+            lane: "unavailable",
+            confidence: "unavailable",
+            final: "unavailable"
+          };
+        }
+        const selected = configuredLanguageMatch(payload.spokenLocale);
+        const selectedReason = String(
+          payload.spokenLocaleSelectionReason || ""
+        );
+        const selectedConfidence = Number(payload.spokenLocaleConfidence);
+        if (selected
+            && selectedReason === "reliable_lane_evidence"
+            && payload.spokenLocaleFinal === true
+            && Number.isFinite(selectedConfidence)
+            && selectedConfidence >= 0.55) {
+          return {
+            tag: selected,
+            reason: selectedReason,
+            lane: String(payload.spokenLocaleLane ?? "unavailable"),
+            confidence: String(selectedConfidence),
+            final: "true"
+          };
+        }
+        const wake = configuredLanguageMatch(payload.wakeLocale);
+        if (wake) {
+          return {
+            tag: wake,
+            reason: "activation_wake_locale",
+            lane: "unavailable",
+            confidence: "unavailable",
+            final: "unavailable"
+          };
+        }
+        if (configured[0]) {
+          return {
+            tag: configured[0],
+            reason: "configured_primary",
+            lane: "unavailable",
+            confidence: "unavailable",
+            final: "unavailable"
+          };
+        }
+        return {
+          tag: "und",
+          reason: "clarification_required",
+          lane: "unavailable",
+          confidence: "unavailable",
+          final: "unavailable"
+        };
+      }
+
+      function preferredConfiguredLanguageTag() {
+        return preferredConfiguredLanguageSelection().tag;
       }
 
       function configuredLocaleScripts() {
@@ -2444,7 +2600,11 @@ private extension DirectRealtimeController {
       }
 
       function numericRangeSpeechBoundary() {
-        return "When a tilde appears between numbers, speak it as a numeric range in the text's language and never concatenate the numbers.";
+        return "When a numeric range separator is a tilde, hyphen, en dash, or em dash between numeric endpoints, speak it as a range in the text's language and never concatenate the numbers.";
+      }
+
+      function transportEnvelopeSpeechBoundary() {
+        return "Read only the answer value. Never speak JSON or object field names, schema labels, status labels or values, punctuation, or wrappers.";
       }
 
       function boundedVoiceContextText(value, limit = 480) {
@@ -2798,6 +2958,41 @@ private extension DirectRealtimeController {
         }
       }
 
+      function normalizeNumericRangesForSpeech(value) {
+        const source = String(value || "");
+        const protectedSpans = [];
+        const rememberProtected = pattern => {
+          for (const match of source.matchAll(pattern)) {
+            protectedSpans.push([
+              Number(match.index || 0),
+              Number(match.index || 0) + String(match[0] || "").length
+            ]);
+          }
+        };
+        rememberProtected(/(?<!\p{L})\p{N}{4}-\p{N}{2}-\p{N}{2}(?!\p{N})/gu);
+        rememberProtected(/\bv?\p{N}+(?:\.\p{N}+){2,}(?:[~～〜\-–—]\p{N}+(?:\.\p{N}+){2,})?\b/giu);
+        rememberProtected(/\b\p{L}[\p{L}\p{N}_]*-\p{N}+\b/giu);
+        rememberProtected(/[+-]?\p{N}+(?:[.,]\p{N}+)?\s+-\s+[+-]?\p{N}+(?:[.,]\p{N}+)?/gu);
+        const overlapsProtected = (start, end) => protectedSpans.some(
+          ([protectedStart, protectedEnd]) =>
+            start < protectedEnd && end > protectedStart
+        );
+        const endpoint = "[+-]?\\p{N}+(?:[.,]\\p{N}+)?";
+        const range = new RegExp(
+          `(${endpoint})(\\s*)([~～〜\\-–—])(\\s*)(${endpoint})`,
+          "gu"
+        );
+        return source.replace(
+          range,
+          (match, left, _before, separator, _after, right, offset) => {
+            const start = Number(offset || 0);
+            const end = start + String(match || "").length;
+            if (overlapsProtected(start, end)) return match;
+            return `${left} ~ ${right}`;
+          }
+        );
+      }
+
       function codexSpeechText(text) {
         const sourceHeading =
           /^(?:#{1,6}\s*)?(?:sources?|references?|citations?|출처|참고(?:자료|문헌)?)\s*:?\s*$/iu;
@@ -2944,7 +3139,7 @@ private extension DirectRealtimeController {
             continue;
           }
 
-          const spokenLine = rawLine
+          const spokenLine = normalizeNumericRangesForSpeech(rawLine
             .replace(/!\[[^\]]*\]\([^)]+\)/gu, "")
             .replace(
               /\[([^\]]+)\]\((?:https?:\/\/|www\.)[^)]+\)/giu,
@@ -2962,13 +3157,12 @@ private extension DirectRealtimeController {
             .replace(canonicalUUID, "")
             .replace(fullHash, "")
             .replace(/~~(?=\S)(.*?\S)~~/gu, "$1")
-            .replace(/(\p{N})\s*[~～〜]\s*(?=[+-]?\p{N})/gu, "$1 ~ ")
             .replace(/[*_`]/gu, "")
             .replace(/<[^>]+>/gu, "")
             .replace(/\s+([,.;!?])/gu, "$1")
             .replace(/([.!?])(?:\s*[.!?])+/gu, "$1")
             .replace(/[ \t]{2,}/gu, " ")
-            .trim();
+            .trim());
           if (spokenLine) output.push(spokenLine);
         }
 
@@ -3417,7 +3611,11 @@ private extension DirectRealtimeController {
       }
 
       function semanticStopRoutingBoundary() {
-        return "Use stop_session only when stop, cancel, or end targets this assistant's current voice or Codex work, including current assistant output or a genuinely targetless stop whose conversational referent is that work. A command targeting another object or process, including media, an app action, a device action, a download, or other controlled content, is substantive work rather than a session stop. Discussion, quotation, hypothetical wording, and negation about stopping are not session stops. When the target is ambiguous, keep the request on the normal work path.";
+        return "Use cancel_current_answer only when stop or cancel targets the assistant's current answer or active Codex work. Use stop_session only when the complete utterance explicitly targets the whole Voice Relay session. A command targeting another object or process, including media, an app action, a device action, a download, or other controlled content, is substantive work rather than answer cancellation or a session stop. Discussion, quotation, hypothetical wording, and negation about stopping are not control actions. When the target is ambiguous, keep the request on the normal work path.";
+      }
+
+      function semanticCompletenessRoutingBoundary() {
+        return "Classify utterance_completeness from the meaning of the completed transcript, not its length, language, or a phrase list. Use complete only when the utterance expresses a self-contained request or conversational act. Use incomplete for a fragment that visibly depends on missing continuation, and uncertain when completeness cannot be established. Set confidence to high only when both the route and its semantic target are clear. Incomplete, uncertain, medium-confidence, low-confidence, malformed, or missing classifications must clarify and must not create or mutate Codex work.";
       }
 
       function semanticSessionClosureRoutingBoundary() {
@@ -3470,6 +3668,7 @@ private extension DirectRealtimeController {
               kind: {
                 type: "string",
                 enum: [
+                  "cancel_current_answer",
                   "stop_session",
                   "close_session",
                   "local_datetime",
@@ -3483,6 +3682,18 @@ private extension DirectRealtimeController {
                   "clarify",
                   "ignore"
                 ]
+              },
+              confidence: {
+                type: "string",
+                enum: ["high", "medium", "low"],
+                description:
+                  "Confidence that the completed utterance has the selected route and semantic target."
+              },
+              utterance_completeness: {
+                type: "string",
+                enum: ["complete", "incomplete", "uncertain"],
+                description:
+                  "Semantic completeness of the utterance. Judge meaning rather than text length or language."
               },
               social_origin: {
                 type: "string",
@@ -3507,7 +3718,8 @@ private extension DirectRealtimeController {
               stop_target: {
                 type: "string",
                 enum: [
-                  "current_voice_or_codex_work",
+                  "current_answer_or_codex_work",
+                  "voice_relay_session",
                   "external_or_other_object",
                   "not_applicable",
                   "ambiguous"
@@ -3526,6 +3738,8 @@ private extension DirectRealtimeController {
             },
             required: [
               "kind",
+              "confidence",
+              "utterance_completeness",
               "social_origin",
               "spoken_language",
               "spoken_register",
@@ -3540,6 +3754,7 @@ private extension DirectRealtimeController {
       function normalizeRouteKind(value) {
         const kind = String(value || "");
         const allowed = new Set([
+          "cancel_current_answer",
           "stop_session",
           "close_session",
           "local_datetime",
@@ -3581,12 +3796,28 @@ private extension DirectRealtimeController {
       function normalizeStopTarget(value) {
         const target = String(value || "");
         const allowed = new Set([
-          "current_voice_or_codex_work",
+          "current_answer_or_codex_work",
+          "voice_relay_session",
           "external_or_other_object",
           "not_applicable",
           "ambiguous"
         ]);
         return allowed.has(target) ? target : "ambiguous";
+      }
+
+      function normalizeRouteConfidence(value) {
+        const confidence = String(value || "");
+        return new Set(["high", "medium", "low"]).has(confidence)
+          ? confidence
+          : "low";
+      }
+
+      function normalizeUtteranceCompleteness(value) {
+        const completeness = String(value || "");
+        return new Set(["complete", "incomplete", "uncertain"])
+          .has(completeness)
+          ? completeness
+          : "uncertain";
       }
 
       function requestRouteDecision() {
@@ -3603,6 +3834,8 @@ private extension DirectRealtimeController {
               semanticStopRoutingBoundary() +
               " " +
               semanticSessionClosureRoutingBoundary() +
+              " " +
+              semanticCompletenessRoutingBoundary() +
               " Set stop_target from the semantic target of any stop, cancel, or end language, or not_applicable when none is present. " +
               configuredSpokenLanguageBoundary() +
               " For a codex route, set progress_summary to one short non-sensitive semantic summary. " +
@@ -3625,6 +3858,7 @@ private extension DirectRealtimeController {
         return Boolean(
           session
           && session.routeInFlight
+          && !session.routeDispositionPending
           && session.pendingCalls.size === 0
           && !session.awaitingFinal
           && !session.codexInFlight
@@ -3769,7 +4003,7 @@ private extension DirectRealtimeController {
             });
             speakControlResponse(
               "clarify",
-              configuredLanguageTags()[0] || "und",
+              preferredConfiguredLanguageTag(),
               "neutral"
             );
           }
@@ -3807,7 +4041,7 @@ private extension DirectRealtimeController {
             );
             speakControlResponse(
               "clarify",
-              configuredLanguageTags()[0] || "und",
+              preferredConfiguredLanguageTag(),
               "neutral"
             );
           }
@@ -3945,6 +4179,7 @@ private extension DirectRealtimeController {
       function completeAcceptedTurn() {
         if (!session || session.lifecycle !== "active") return;
         session.routeInFlight = false;
+        session.routeDispositionPending = false;
         session.activeUserTurn = null;
         session.userVoicePreemptionSettled = false;
         if (session.acceptedTurnQueue.length > 0) {
@@ -3970,6 +4205,7 @@ private extension DirectRealtimeController {
               action: {
                 type: "string",
                 enum: [
+                  "cancel_current_answer",
                   "stop_session",
                   "close_session",
                   "steer_active_codex",
@@ -3986,6 +4222,12 @@ private extension DirectRealtimeController {
                 description:
                   "Confidence that the completed utterance has the selected action."
               },
+              utterance_completeness: {
+                type: "string",
+                enum: ["complete", "incomplete", "uncertain"],
+                description:
+                  "Semantic completeness of the utterance. Judge meaning rather than text length or language."
+              },
               spoken_language: {
                 type: "string",
                 description:
@@ -4000,7 +4242,8 @@ private extension DirectRealtimeController {
               stop_target: {
                 type: "string",
                 enum: [
-                  "current_voice_or_codex_work",
+                  "current_answer_or_codex_work",
+                  "voice_relay_session",
                   "external_or_other_object",
                   "not_applicable",
                   "ambiguous"
@@ -4012,6 +4255,7 @@ private extension DirectRealtimeController {
             required: [
               "action",
               "confidence",
+              "utterance_completeness",
               "spoken_language",
               "spoken_register",
               "stop_target"
@@ -4045,6 +4289,8 @@ private extension DirectRealtimeController {
             return "Give one brief natural conversational acknowledgement.";
           case "applied":
             return "Briefly acknowledge that the requested adjustment was accepted and is being applied. Do not claim broader completion.";
+          case "cancelled":
+            return "Briefly acknowledge that the current answer was cancelled. Do not imply that the voice session ended.";
           case "working":
             return "Briefly state that the requested work is still underway.";
           case "finished":
@@ -4190,12 +4436,14 @@ private extension DirectRealtimeController {
               " " +
               semanticSessionClosureRoutingBoundary() +
               " " +
+              semanticCompletenessRoutingBoundary() +
+              " " +
               immediateDialogueTrajectoryBoundary(
                 control.text
               ) +
               " Set stop_target from the semantic target of any stop, cancel, or end language, or not_applicable when none is present. Use status for a question about current progress, repeat for a request to hear the last assistant output again, and steer_active_codex only for a clear substantive change. Use acknowledge_only only when the utterance adds no work. Use clarify when addressed speech is uncertain and ignore for non-addressed noise. Unknown, malformed, low-confidence, or ambiguous output must not mutate Codex. " +
               configuredSpokenLanguageBoundary() +
-              " Set confidence to high only when the action is clear. Set spoken_register to casual for familiar conversational wording, polite for respectful wording, and neutral only when the distinction cannot be determined. Do not answer before the tool call and do not use a phrase list."
+              " Set spoken_register to casual for familiar conversational wording, polite for respectful wording, and neutral only when the distinction cannot be determined. Do not answer before the tool call and do not use a phrase list."
           }
         });
       }
@@ -4315,6 +4563,80 @@ private extension DirectRealtimeController {
         return true;
       }
 
+      function cancelCurrentAnswer(
+        text,
+        spokenLanguage,
+        spokenRegister,
+        { control = null, routeCallID = "" } = {}
+      ) {
+        if (!session || session.lifecycle !== "active") return false;
+        const activeCallID = String(session.activeCodexCallID || "").trim();
+        const classifierCallID = String(routeCallID || "").trim();
+        if (classifierCallID) {
+          session.pendingCalls.delete(classifierCallID);
+          dataSend({
+            type: "conversation.item.create",
+            item: {
+              type: "function_call_output",
+              call_id: classifierCallID,
+              output: JSON.stringify({ status: "cancelled_current_answer" })
+            }
+          });
+        }
+        if (activeCallID) {
+          rememberBoundedSetValue(session.retiredCodexCallIDs, activeCallID);
+          session.pendingCalls.delete(activeCallID);
+          dataSend({
+            type: "conversation.item.create",
+            item: {
+              type: "function_call_output",
+              call_id: activeCallID,
+              output: JSON.stringify({ status: "cancelled" })
+            }
+          });
+          send({
+            type: "cancelCurrentAnswer",
+            generation: session.generation,
+            callId: activeCallID,
+            controlRequestID: String(control?.controlRequestID || ""),
+            turnId: String(control?.voiceTurnID || "")
+          });
+        }
+        session.activeCodexCallID = "";
+        session.codexInFlight = false;
+        session.routeDispositionPending = true;
+        session.commentaryProgressMarker = null;
+        session.awaitingFinal = false;
+        resetAssistantDraft();
+        suppressQueuedFinalForCommittedReplacement(
+          "current_answer_cancelled"
+        );
+        session.codexSpeechQueue.length = 0;
+        publishAssistantOutputQueueState();
+        if (control) {
+          terminalizeActiveControl(
+            control,
+            "cancel_current_answer",
+            "handled_locally"
+          );
+        }
+        diagnostic("current_answer_cancelled", session.generation, {
+          callID: activeCallID,
+          reason: "semantic_current_answer_cancel",
+          text: String(text || ""),
+          turnID: String(control?.voiceTurnID || "")
+        });
+        speakControlResponse(
+          "cancelled",
+          spokenLanguage,
+          spokenRegister,
+          { completesAcceptedTurn: true }
+        );
+        startNextCodexSpeech();
+        state("thinking", session.generation);
+        return true;
+      }
+
       function finishActiveCodexControlTurn(event) {
         if (!session || session.lifecycle !== "active"
             || !session.controlRouteInFlight) return;
@@ -4327,6 +4649,7 @@ private extension DirectRealtimeController {
         const text = String(control?.text || "").trim();
         const requestedAction = String(args.action || "");
         const allowedActions = new Set([
+          "cancel_current_answer",
           "stop_session",
           "close_session",
           "steer_active_codex",
@@ -4336,15 +4659,16 @@ private extension DirectRealtimeController {
           "clarify",
           "ignore"
         ]);
-        const confidence = new Set(["high", "medium", "low"]).has(
-          String(args.confidence || "")
-        ) ? String(args.confidence) : "low";
+        const confidence = normalizeRouteConfidence(args.confidence);
+        const utteranceCompleteness = normalizeUtteranceCompleteness(
+          args.utterance_completeness
+        );
         const stopTarget = normalizeStopTarget(args.stop_target);
         const configuredLanguage =
           isConfiguredSpokenLanguageTag(args.spoken_language);
         const spokenLanguage = configuredLanguage
           ? normalizeSpokenLanguageTag(args.spoken_language)
-          : configuredLanguageTags()[0] || "und";
+          : preferredConfiguredLanguageTag();
         const spokenRegister = normalizeSpokenRegister(
           args.spoken_register
         );
@@ -4356,17 +4680,24 @@ private extension DirectRealtimeController {
         let action = parsed && allowedActions.has(requestedAction)
           ? requestedAction
           : "clarify";
-        if (action === "stop_session"
-            && stopTarget !== "current_voice_or_codex_work") {
+        if (action === "cancel_current_answer"
+            && stopTarget !== "current_answer_or_codex_work") {
           action = stopTarget === "external_or_other_object"
             && confidence === "high"
+            && utteranceCompleteness === "complete"
             ? "steer_active_codex"
             : "clarify";
         }
-        if ((action === "steer_active_codex"
-              || action === "stop_session"
-              || action === "close_session")
-            && confidence !== "high") {
+        if (action === "stop_session"
+            && stopTarget !== "voice_relay_session") {
+          action = stopTarget === "external_or_other_object"
+            && confidence === "high"
+            && utteranceCompleteness === "complete"
+            ? "steer_active_codex"
+            : "clarify";
+        }
+        if (confidence !== "high"
+            || utteranceCompleteness !== "complete") {
           action = "clarify";
         }
         if (
@@ -4393,6 +4724,13 @@ private extension DirectRealtimeController {
               spokenLanguage,
               spokenRegister,
               "farewell"
+            );
+          } else if (action === "cancel_current_answer") {
+            speakControlResponse(
+              "finished",
+              spokenLanguage,
+              spokenRegister,
+              { completesAcceptedTurn: true }
             );
           } else if (action === "repeat") {
             replayLastAssistantOutput(
@@ -4431,6 +4769,16 @@ private extension DirectRealtimeController {
         if (action === "stop_session") {
           terminalizeActiveControl(control, action, "accepted");
           beginSemanticStop(text, spokenLanguage, spokenRegister);
+          return;
+        }
+
+        if (action === "cancel_current_answer") {
+          cancelCurrentAnswer(
+            text,
+            spokenLanguage,
+            spokenRegister,
+            { control }
+          );
           return;
         }
 
@@ -4880,7 +5228,7 @@ private extension DirectRealtimeController {
               isConfiguredSpokenLanguageTag(args.spoken_language);
             const spokenLanguage = classifierLanguageConfigured
               ? normalizeSpokenLanguageTag(args.spoken_language)
-              : configuredLanguageTags()[0] || "und";
+              : preferredConfiguredLanguageTag();
             const spokenRegister = normalizeSpokenRegister(
               args.spoken_register
             );
@@ -4897,15 +5245,26 @@ private extension DirectRealtimeController {
             }
             session.pendingCalls.add(callId);
             const requestedKind = normalizeRouteKind(args.kind);
+            const confidence = normalizeRouteConfidence(args.confidence);
+            const utteranceCompleteness = normalizeUtteranceCompleteness(
+              args.utterance_completeness
+            );
             const stopTarget = normalizeStopTarget(args.stop_target);
             const progressSummary = safeProgressSummary(
               args.progress_summary
             );
             let classifierKind =
-              requestedKind === "stop_session"
-                  && stopTarget !== "current_voice_or_codex_work"
+              requestedKind === "cancel_current_answer"
+                  && stopTarget !== "current_answer_or_codex_work"
+                ? "codex"
+                : requestedKind === "stop_session"
+                  && stopTarget !== "voice_relay_session"
                 ? "codex"
                 : requestedKind;
+            if (confidence !== "high"
+                || utteranceCompleteness !== "complete") {
+              classifierKind = "clarify";
+            }
             if (
               (
                 !classifierLanguageConfigured
@@ -4928,6 +5287,8 @@ private extension DirectRealtimeController {
               callID: callId,
               classifierKind,
               kind,
+              confidence,
+              utteranceCompleteness,
               reason: activeTurn?.playbackContended
                 ? "playback_contended"
                 : "normal",
@@ -4995,6 +5356,15 @@ private extension DirectRealtimeController {
             if (kind === "stop_session") {
               session.pendingCalls.delete(callId);
               beginSemanticStop(text, spokenLanguage, spokenRegister);
+              break;
+            }
+            if (kind === "cancel_current_answer") {
+              cancelCurrentAnswer(
+                text,
+                spokenLanguage,
+                spokenRegister,
+                { routeCallID: callId }
+              );
               break;
             }
             if (kind === "close_session") {
@@ -5086,6 +5456,7 @@ private extension DirectRealtimeController {
             }
             state("thinking", generation);
             session.codexInFlight = true;
+            session.activeCodexCallID = callId;
             const currentTurnID = String(
               session.activeUserTurn?.id || ""
             );
@@ -5136,6 +5507,17 @@ private extension DirectRealtimeController {
               event.response?.metadata?.voice_relay_kind || ""
             );
             session.activeResponseKind = responseKind;
+            if (session.activeResponseId && responseKind) {
+              session.responseKindsById.set(
+                session.activeResponseId,
+                responseKind
+              );
+              if (session.responseKindsById.size > 64) {
+                session.responseKindsById.delete(
+                  session.responseKindsById.keys().next().value
+                );
+              }
+            }
             if (
               isPreemptibleAssistantAudioKind(responseKind)
               && session.pendingAssistantAudioResponseCreates > 0
@@ -5332,17 +5714,21 @@ private extension DirectRealtimeController {
               event.transcript || session.currentAssistantTranscript || ""
             ).trim();
             session.lastAudioTranscript = text;
+            const responseKind = activeCodexSpeechKind(responseId)
+              || String(session.responseKindsById.get(responseId) || "");
             emitAssistantFinalOnce(
               text,
               responseId || event.item_id || "",
-              session.codexSpeechDisplayTexts.get(responseId) || ""
+              session.codexSpeechDisplayTexts.get(responseId) || "",
+              responseKind
             );
             break;
           }
           case "response.done": {
             const responseId = String(event.response?.id || "");
             const responseKind = activeCodexSpeechKind(responseId)
-              || String(event.response?.metadata?.voice_relay_kind || "");
+              || String(event.response?.metadata?.voice_relay_kind || "")
+              || String(session.responseKindsById.get(responseId) || "");
             if (isStopAcknowledgementResponse(responseId)) {
               break;
             }
@@ -5374,7 +5760,12 @@ private extension DirectRealtimeController {
                 && (!responseStatus || responseStatus === "completed");
               if (!playbackStillDraining) {
                 finishActiveCodexSpeech(responseId);
-                state("thinking", generation);
+                state(
+                  session.codexInFlight || session.routeInFlight
+                    ? "thinking"
+                    : "listening",
+                  generation
+                );
               }
               break;
             }
@@ -5425,7 +5816,8 @@ private extension DirectRealtimeController {
               emitAssistantFinalOnce(
                 text,
                 event.response?.id || "",
-                session.codexSpeechDisplayTexts.get(responseId) || ""
+                session.codexSpeechDisplayTexts.get(responseId) || "",
+                responseKind
               );
             }
             if (!hasFunctionCall && session.routeInFlight
@@ -5518,6 +5910,7 @@ private extension DirectRealtimeController {
           transportOpen: false,
           transportReady: false,
           pendingCalls: new Set(),
+          retiredCodexCallIDs: new Set(),
           reportedAssistantResponses: new Set(),
           finalAudioResponseIds: new Set(),
           audioResponseIds: new Set(),
@@ -5554,6 +5947,7 @@ private extension DirectRealtimeController {
           activeCodexSpeechResponseId: "",
           codexSpeechSequence: 0,
           codexSpeechResponseKinds: new Map(),
+          responseKindsById: new Map(),
           codexSpeechDisplayTexts: new Map(),
           transientAssistantTranscripts: new Map(),
           spokenCodexCommentaryIds: new Set(),
@@ -5564,8 +5958,10 @@ private extension DirectRealtimeController {
           acceptedTurnQueue: [],
           activeUserTurn: null,
           routeInFlight: false,
+          routeDispositionPending: false,
           routeClassifierRetryCount: 0,
           codexInFlight: false,
+          activeCodexCallID: "",
           activeCodexControlQueue: [],
           activeCodexControl: null,
           controlRouteInFlight: false,
@@ -5615,6 +6011,8 @@ private extension DirectRealtimeController {
         const acceptedLanguageCodes = configuredLanguageTags();
         const transcriptionConfiguration =
           realtimeTranscriptionConfiguration();
+        const localeSelection =
+          preferredConfiguredLanguageSelection();
         const transcriptionUpdateEventID =
           nextClientEventId("transcription-session-update");
         session.transcriptionUpdateEventID =
@@ -5629,7 +6027,7 @@ private extension DirectRealtimeController {
           configuredUserIdentityInstruction +
           `The configured product name is ${JSON.stringify(session.productName)}. ` +
           `The primary input language is ${JSON.stringify(primaryInputLanguage || "system")}. ` +
-          `For this activation, prefer ${JSON.stringify(preferredConfiguredLanguageTag())} when the current utterance is ambiguous. ` +
+          `For this activation, prefer ${JSON.stringify(localeSelection.tag)} when the current utterance is ambiguous. ` +
           `The only allowed languages are these normalized configured languages: ${JSON.stringify(acceptedLanguageCodes)}. ` +
           "Reply in the language actually spoken by the user. " +
           "When a short utterance is ambiguous, prefer the configured language selected for this activation and never switch scripts from weak evidence or introduce an unconfigured language.";
@@ -5641,10 +6039,15 @@ private extension DirectRealtimeController {
             "pcm24k;threshold=0.68;prefix_ms=300;silence_ms=1200;create_response=false;interrupt_response=false",
           source: String(transcriptionConfiguration.model || ""),
           status: JSON.stringify(
-            transcriptionConfiguration.languages
-              || transcriptionConfiguration.language
-              || []
+            transcriptionConfiguration.language || "auto_detect"
           )
+        });
+        diagnostic("route_language_selected", generation, {
+          confidence: localeSelection.confidence,
+          final: localeSelection.final,
+          lane: localeSelection.lane,
+          locale: localeSelection.tag,
+          selectionReason: localeSelection.reason
         });
         dataSend({
           type: "session.update",
@@ -5966,6 +6369,41 @@ private extension DirectRealtimeController {
         const activationID =
           String(startPayload.activationID || "")
           || `prefill-${generation}`;
+        const eventBriefing =
+          startPayload.eventBriefing
+          && typeof startPayload.eventBriefing === "object"
+            ? startPayload.eventBriefing
+            : null;
+        if (activationReason === "connector_event") {
+          const eventId = String(eventBriefing?.eventId || "").trim();
+          const trigger = String(eventBriefing?.trigger || "").trim();
+          const speech = String(eventBriefing?.speech || "").trim();
+          const triggerAllowed = ["return", "morning", "manual"]
+            .includes(trigger);
+          if (!eventId || !triggerAllowed || !speech || speech.length > 8000) {
+            diagnostic("connector_event_briefing_rejected", generation, {
+              reason: "invalid_host_prepared_payload"
+            });
+            state("listening", generation);
+            return;
+          }
+          session.awaitingFinal = true;
+          dataSend({
+            type: "response.create",
+            response: {
+              tool_choice: "none",
+              metadata: {
+                voice_relay_kind: "connector_event_briefing",
+                voice_relay_event_id: eventId,
+                voice_relay_trigger: trigger
+              },
+              instructions:
+                `Speak exactly this host-prepared read-only connector briefing, without adding, omitting, interpreting, or looking up facts: ${JSON.stringify(speech)}. Then stop and listen. Do not mention connectors, tools, routing, or capabilities.`
+            }
+          });
+          state("speaking", generation);
+          return;
+        }
         const visibleUserText = wakeTranscript || prefill;
         const hasReplayWakeBoundary =
           isWakeOnly
@@ -6060,7 +6498,7 @@ private extension DirectRealtimeController {
                 },
                 instructions:
                   isPresenceReturn
-                    ? `You are ${session.assistantName} in ${session.productName}. The user has just returned after being away. Use only the configured greeting language BCP 47 tag ${JSON.stringify(greetingLanguage)}. Give one very brief, natural welcome-back greeting, then stop and listen. Choose fresh wording freely instead of using a fixed stock phrase. Do not mention tools, routing, absence duration, or capabilities.`
+                    ? `You are ${session.assistantName} in ${session.productName}. The host observed only a heuristic return signal after an idle interval. Use only the configured greeting language BCP 47 tag ${JSON.stringify(greetingLanguage)}. Give one very brief, natural welcome-back greeting, then stop and listen. Choose fresh wording freely instead of using a fixed stock phrase. Do not mention tools, routing, absence duration, or capabilities.`
                     : `You are ${session.assistantName} in ${session.productName}. The user just called your configured wake phrase. Use only the configured greeting language BCP 47 tag ${JSON.stringify(greetingLanguage)}. Give one very brief, natural acknowledgement that you heard them and are listening, then stop and listen. Choose fresh wording freely instead of using a fixed stock phrase. Do not mention tools, routing, or capabilities.`
               }
             });
@@ -6165,11 +6603,25 @@ private extension DirectRealtimeController {
       function resolveCodex(payload) {
         if (!session || session.lifecycle !== "active"
             || session.generation !== Number(payload.generation)) return;
+        const callID = String(payload.callId || "").trim();
+        const activeCallID = String(session.activeCodexCallID || "");
+        if (!callID || session.retiredCodexCallIDs.has(callID)
+            || (activeCallID && activeCallID !== callID)) {
+          diagnostic("codex_result_retired", session.generation, {
+            callID,
+            reason: session.retiredCodexCallIDs.has(callID)
+              ? "cancelled_current_answer"
+              : "not_active_request"
+          });
+          return;
+        }
         session.codexInFlight = false;
-        session.pendingCalls.delete(payload.callId);
+        session.activeCodexCallID = "";
+        rememberBoundedSetValue(session.retiredCodexCallIDs, callID);
+        session.pendingCalls.delete(callID);
         diagnostic("codex_result_received", session.generation, {
           assistantText: String(payload.output || payload.error || ""),
-          callID: String(payload.callId || ""),
+          callID,
           status: payload.error ? "failure" : "success",
           turnID: String(session.activeUserTurn?.id || "")
         });
@@ -6190,7 +6642,7 @@ private extension DirectRealtimeController {
           type: "conversation.item.create",
           item: {
             type: "function_call_output",
-            call_id: payload.callId,
+            call_id: callID,
             output
           }
         });
@@ -6198,17 +6650,19 @@ private extension DirectRealtimeController {
           "codex_final",
           didFail
             ? [
-                "Read the answer field from the immediately preceding route_voice_turn function result exactly as written. Do not add, omit, paraphrase, summarize, translate, reinterpret, or answer from the conversation. This response is playback of a bounded failure notice only."
+                "Read the answer field from the immediately preceding route_voice_turn function result exactly as written. Do not add, omit, paraphrase, summarize, translate, reinterpret, or answer from the conversation. This response is playback of a bounded failure notice only.",
+                transportEnvelopeSpeechBoundary()
               ].join(" ")
             : [
                 "Read the answer field from the immediately preceding route_voice_turn function result exactly as written. Do not add, omit, paraphrase, summarize, translate, reinterpret, or answer from the conversation. This response is playback of Codex output only.",
+                transportEnvelopeSpeechBoundary(),
                 numericRangeSpeechBoundary()
               ].join(" "),
           {
             marksAwaitingFinal: true,
             detached: false,
             displayText: didFail ? failureNotice : String(payload.output || ""),
-            requestID: String(payload.callId || "")
+            requestID: callID
           }
         );
         state("thinking", session.generation);

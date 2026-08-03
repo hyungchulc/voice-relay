@@ -715,16 +715,16 @@ require_text \
   "microphone mute must preserve the active voice session"
 require_text \
   "$ROOT/Sources/SettingsWindowController.swift" \
-  'codexFastModeControl.title = "Fast mode"' \
-  "Settings must present priority service as Fast mode"
+  'private let codexServiceTierControl = NSPopUpButton()' \
+  "Settings must expose Inherit, Standard, and Fast as a real service-tier selection"
 reject_text \
   "$ROOT/Sources/SettingsWindowController.swift" \
-  'checkboxWithTitle: "priority"' \
-  "Settings must not expose the internal priority identifier as the primary label"
+  'checkboxWithTitle: "Fast mode"' \
+  "Settings must not collapse Inherit and explicit Standard into a Boolean Fast checkbox"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
-  'serviceTier: liveSettings.codexFastMode ? "priority" : nil' \
-  "subsequent Voice Relay Codex requests must map Fast mode to priority"
+  'serviceTier: liveSettings.codexServiceTierSelection.rawValue' \
+  "subsequent Voice Relay Codex requests must preserve tri-state service-tier provenance"
 require_count \
   "$ROOT/Sources/CodexAppRemoteClient.swift" \
   'params["serviceTier"] = options.serviceTier ?? NSNull()' \
@@ -1303,11 +1303,55 @@ require_text \
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'presence_return_greeting' \
-  "a confirmed presence return must create a distinct spoken greeting"
+  "a heuristic return signal must create a distinct spoken greeting"
 require_text \
   "$ROOT/Sources/PresenceMonitor.swift" \
-  'candidateClaimed = false' \
+  'lifecycle.release(candidateID:' \
   "a deferred return greeting must remain eligible for a later safe retry"
+require_text \
+  "$ROOT/Sources/PresenceMonitor.swift" \
+  'defaults.set(date, forKey: lastGreetingKey)' \
+  "presence cooldown must begin only after acknowledged playback"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'automaticSpeechPlaybackCorrelation.consumeDrain(' \
+  "automatic presence completion must require its exact response drain"
+require_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  '@objc private func chooseConnectorManifest()' \
+  "Connector installation must begin only from the explicit Settings picker"
+require_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  'panel.canChooseDirectories = false' \
+  "Connector installation must select one manifest file, never discover a directory"
+require_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  'guard url.lastPathComponent == "connector.json" else {' \
+  "Connector Settings must accept only the named manifest contract"
+require_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  'let binding = try connectorRegistry.addManifest(at: url)' \
+  "Connector Settings must route the selected artifact through strict registry validation"
+require_text \
+  "$ROOT/Sources/ConnectorCore.swift" \
+  '.appendingPathComponent("Voice Relay/Connectors/bindings.json")' \
+  "Connector bindings must persist only in the app-owned local registry"
+require_text \
+  "$ROOT/Sources/ConnectorCore.swift" \
+  'guard !manifest.capabilities.isEmpty, !manifest.triggers.isEmpty else {' \
+  "Connector binding must validate declared capabilities before persistence"
+require_text \
+  "$ROOT/Sources/ConnectorCore.swift" \
+  'Every declared data class must declare its matching read permission.' \
+  "Connector binding must validate data-class permission declarations"
+reject_text \
+  "$ROOT/Sources/SettingsWindowController.swift" \
+  'enumerator(at:' \
+  "Connector Settings must never auto-discover manifests"
+reject_text \
+  "$ROOT/Sources/ConnectorCore.swift" \
+  'readGroup.wait()' \
+  "connector execution limits must never end in an unbounded pipe wait"
 reject_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   '"다시 왔네"' \
@@ -1603,20 +1647,52 @@ require_text \
   "Realtime transcription must derive one immutable configuration from Voice Relay settings"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'model: "gpt-live-transcribe"' \
-  "configured bilingual transcription must use the supported multilingual model"
-require_text \
+  'model: "gpt-4o-transcribe"' \
+  "Realtime transcription must use a currently documented transcription model"
+reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'configuration.languages = languages' \
-  "multiple configured base languages must use the plural languages field"
+  "Realtime transcription must never send the undocumented plural languages field"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'const languages = ["ko", "en"]' \
   "Realtime transcription languages must come from settings instead of a production allowlist"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'configuration.language = explicitLanguage' \
+  "an explicit user locale override must send one singular documented language hint"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'languageExplicitlyForced' \
+  "Realtime language hints must retain explicit-override provenance"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'session.lifecycle = "failed"' \
+  "a rejected transcription session update must terminally fail the active session"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'struct RecognitionLocaleEvidence' \
+  "locale precedence must use typed recognition-lane evidence"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'enum SpokenLocaleSelectionPolicy' \
+  "locale precedence must live in one pure maintained policy"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'wake_locale_lane_evaluated' \
+  "wake recognition must emit transcript-free per-lane locale diagnostics"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'wake_locale_selected' \
+  "wake recognition must emit one transcript-free selected-locale diagnostic"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'function normalizeNumericRangesForSpeech' \
+  "speech projection must centralize protected numeric range normalization"
 reject_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
-  'configuration.language = languages[0]' \
-  "gpt-live-transcribe must never receive the legacy singular language field"
+  'configuredLanguageTags()[0] || "und"' \
+  "route, control, and clarification fallbacks must preserve the selected locale precedence"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'function hasClearlyUnconfiguredScript' \
@@ -1904,7 +1980,7 @@ require_text \
   "onboarding must mechanically block progress until pairing is verified"
 require_text \
   "$ROOT/Sources/SettingsStore.swift" \
-  'static let currentSchemaVersion = 20' \
+  'static let currentSchemaVersion = 21' \
   "Voice Relay preference migrations must be schema-gated"
 require_text \
   "$ROOT/Sources/SettingsStore.swift" \
@@ -2797,6 +2873,8 @@ NODE
         call_id: `route-${generation}`,
         arguments: JSON.stringify({
           kind: "codex",
+          confidence: "high",
+          utterance_completeness: "complete",
           social_origin: "not_applicable",
           spoken_language: "ko-KR",
           spoken_register: "casual",
@@ -2916,6 +2994,7 @@ NODE
       !== JSON.stringify([
         "action",
         "confidence",
+        "utterance_completeness",
         "spoken_language",
         "spoken_register",
         "stop_target"
@@ -2937,9 +3016,10 @@ NODE
       arguments: JSON.stringify({
         action: "stop_session",
         confidence: "high",
+        utterance_completeness: "complete",
         spoken_language: "ko-KR",
         spoken_register: "casual",
-        stop_target: "current_voice_or_codex_work"
+        stop_target: "voice_relay_session"
       })
     }
   });
@@ -3083,6 +3163,7 @@ NODE
       arguments: JSON.stringify({
         action: "steer_active_codex",
         confidence: "high",
+        utterance_completeness: "complete",
         spoken_language: "ko-KR",
         spoken_register: "casual",
         stop_target: "not_applicable"
@@ -3251,7 +3332,7 @@ require_text \
   "weak sparse playback noise must not authorize destructive barge-in"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
-  'if self.playbackExternallyPaused {' \
+  'if playbackExternallyPaused {' \
   "new external output overlap must quarantine microphone noise from destructive barge-in"
 reject_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
@@ -3397,6 +3478,14 @@ require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   '"stop_session"' \
   "the Realtime route must expose a semantic stop-session action"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"cancel_current_answer"' \
+  "the Realtime route must expose nonterminal current-answer cancellation"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'requestID: request.requestID' \
+  "Voice Relay must bind host cancellation to the exact Codex request identity"
 require_text \
   "$ROOT/Sources/DirectRealtimeController.swift" \
   'type: "stopIntent"' \
@@ -3567,8 +3656,12 @@ require_text \
   "modern wake recognition must recover from live audio-device reconfiguration"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
-  'result?.transcriptions.map(\.formattedString)' \
+  'let transcriptions = result?.transcriptions' \
   "legacy wake matching must inspect complete confidence-ordered alternatives"
+require_text \
+  "$ROOT/Sources/WakePhraseController.swift" \
+  'let selectedTranscription = transcriptions.first' \
+  "legacy wake confidence and frame evidence must stay bound to the selected hypothesis"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'wakePhrase.onWakeCandidate' \
@@ -3581,6 +3674,38 @@ require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'try startAudio(reason: "session_updated")' \
   "Realtime audio must begin only after the server session is ready"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'failurePlan.preserveCaptureForWake' \
+  "Realtime audio-start failure must keep the authoritative raw wake plane available"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'rollbackCommittedHandoffForRearm()' \
+  "Realtime audio-start failure must preserve committed wake PCM as analyzer-rearm replay"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"preserveWakeCapture": failurePlan.preserveCaptureForWake' \
+  "transport startup failure must carry wake-preservation through the controller event"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"preserveWakeJournal": failurePlan.preserveHandoffJournal' \
+  "transport startup failure must carry journal preservation through the controller event"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  '"rearmWakeAnalyzer": failurePlan.rearmWakeAnalyzer' \
+  "transport startup failure must carry analyzer rearm ownership through the controller event"
+require_text \
+  "$ROOT/Sources/DirectRealtimeController.swift" \
+  'if failurePlan.rearmWakeAnalyzer {' \
+  "audio-start failure must terminalize retry before analyzer rearm ownership can be lost"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'preserveCaptureForWake: preserveWakeCapture' \
+  "host error cleanup must honor the transport startup-failure wake-preservation decision"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'reason: "realtime_startup_failure",' \
+  "Realtime startup failure must explicitly rearm wake monitoring"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'markStopRequested(generation: generation)' \
@@ -3621,13 +3746,25 @@ require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'self.onClosed?(previousGeneration)' \
   "native capture ownership must be the sole ordinary stop completion owner"
-require_text \
+reject_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   '"microphone_capture_preserved"' \
-  "ordinary stop must preserve the Voice Processing graph for local wake analysis"
+  "ordinary stop must release the Voice Processing graph instead of preserving it for idle wake"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
-  'let wakeAudioConsumer = self.wakeAudioConsumer' \
+  '"wake_raw_capture_started"' \
+  "idle wake monitoring must use an observable raw input-only capture plane"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'for: .idleWakeRaw' \
+  "idle wake setup must consume the production capture-plane requirements policy"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'for: .realtimeFullDuplex' \
+  "active Realtime setup must consume the production full-duplex requirements policy"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'if let wakeAudioConsumer,' \
   "the preserved capture graph must route microphone buffers to local wake analysis"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
@@ -3655,7 +3792,7 @@ require_text \
   "wake analyzer rearm must replay the bounded microphone gap into the new consumer"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
-  '|| self.wakeAudioRearmBoundaryFrame != nil' \
+  '|| wakeAudioRearmBoundaryFrame != nil' \
   "persistent capture must keep journaling PCM while wake recognition rearms"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
@@ -3663,12 +3800,207 @@ require_text \
   "wake rearm continuity must leave an observable first-phoneme replay diagnostic"
 require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
-  'captureTimingHealth.record(' \
-  "missing capture timestamps must reach a bounded fail-closed path"
+  'recognized: self.captureTimelineRouter' \
+  "stale bindings must be rejected before missing capture timing affects the current plane"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'captureTimingTracker.record(' \
+  "current-plane missing capture timestamps must reach a bounded fail-closed path"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'captureTimelineRouter.route(' \
+  "capture buffers must be split and ordered on the absolute handoff timeline"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'microphoneTapRestartBinding(' \
+  "active microphone unmute must reuse the engine binding shared with playback reference"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'canReusePersistentRealtimeBinding(' \
+  "a successor generation must not reuse a VPIO binding after raw wake becomes the current routing plane"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '"persistent_capture_rebound"' \
+  "a stale persistent VPIO binding must be rebound before raw wake retirement"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'binding.requestRetirement()' \
+  "capture-plane retirement must seal new callbacks and wait for callbacks already in flight"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'routingBinding: binding' \
+  "the restarted microphone tap must receive the current engine binding"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'microphoneInputTapFences.invalidateAll()' \
+  "microphone mute must invalidate delayed raw and Realtime input callbacks without rebinding playback reference"
+require_count \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'captureTimingTracker.activate(routingToken)' \
+  '2' \
+  "active microphone unmute must reset timing health for the preserved engine binding"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'AudioCaptureSessionStopInputFencePolicy.decision(' \
+  "session stop must decide input fencing from whether capture continuity is preserved"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'preserveCaptureContinuity: shouldPreserveWakeCapture' \
+  "wake-preserving stop must keep already-admitted VPIO callbacks eligible for timeline drainage"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'if stopInputFenceDecision == .invalidateAll {' \
+  "only a terminal stop may invalidate every microphone-tap incarnation"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'microphoneInputTapFences.snapshot(for: plane)' \
+  "each capture plane must snapshot an independent microphone-tap incarnation"
+require_text \
+  "$ROOT/Sources/RealtimeEchoAdmissionPolicy.swift" \
+  'case unknown' \
+  "capture retirement must distinguish delayed unknown tokens from valid deferred and retired transitions"
+require_text \
+  "$ROOT/Sources/RealtimeEchoAdmissionPolicy.swift" \
+  'requestedRetirements.contains(oldest)' \
+  "out-of-order retirement must preserve cutover markers until the oldest contiguous requested prefix can drain"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '"audio_capture_routing_retirement_unknown"' \
+  "capture retirement ordering violations must remain observable"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'AudioCaptureInputCallbackPolicy.accepts(' \
+  "input callbacks must pass the microphone-tap incarnation fence before capture timing health"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'captureTimelineRouter.activate(' \
+  "capture activation must complete any deferred retirement after the former current token becomes previous"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '.requestRelease(' \
+  "capture release must seal late-published current-token ownership before retirement"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'routingBinding.recordProvisionalTiming(' \
+  "capture startup must bound missing timestamps before a routing token can be activated"
+require_text \
+  "$ROOT/Sources/RealtimeEchoAdmissionPolicy.swift" \
+  'guard acceptsCallbacks, !retirementScheduled else {' \
+  "late activation handlers and provisional timing must fail closed after binding retirement begins"
+require_count \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'afterActivationOf: binding' \
+  '2' \
+  "every in-place raw or VPIO successor must defer former-binding retirement until the successor publishes its first-buffer boundary"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'afterActivationOf: routingBinding' \
+  "a recovered VPIO successor must defer former-binding retirement until its first-buffer boundary"
+require_count \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'retireUnpublishedCaptureBinding(routingBinding)' \
+  '5' \
+  "every pre-assignment full-duplex start failure or cancellation path must retire the provisional capture binding"
+require_count \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'retireUnpublishedCaptureBinding(binding)' \
+  '2' \
+  "initial and restarted raw capture start failures must retire their provisional binding"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'stopHandoffFailureFallback.arm(' \
+  "VPIO-to-raw stop must own an exactly-once invalid-first-timestamp fallback"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'stopHandoffFailureFallback.triggerIfArmed(' \
+  "bounded raw timing failure must trigger the correlated stop-handoff fallback"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'AudioCaptureStopHandoffOwnership(' \
+  "VPIO-to-raw stop must bind delayed cleanup to one exact generation and engine pair"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'ownership.claimTransitionRelease(' \
+  "normal stop handoff must claim exact transition ownership before releasing VPIO"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'ownership.claimRealtimeRelease(' \
+  "delayed timing recovery must revalidate exact ownership before releasing VPIO"
+require_count \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'self.invalidateStopHandoffOwnership()' \
+  '2' \
+  "a successor start must revoke any prior delayed stop-handoff release"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'ownership.claimWakeRearm(' \
+  "a failed raw startup may rearm wake only while the stopped generation still owns the empty capture graphs"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'wake_raw_capture_timing_recovery' \
+  "stop-handoff timing recovery must remain observable"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'completion: @escaping () -> Void' \
+  "capture binding retirement must wait for asynchronous PCM routing completion"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'AudioCapturePlaybackReferenceCallbackPolicy.accepts(' \
+  "an admitted playback-reference callback must remain eligible across media-epoch restart while its routing token is recognized"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'defer { completion() }' \
+  "playback-reference binding ownership must end only after asynchronous reference processing finishes"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'guard binding.finishCaptureCallback() else { return }' \
+  "an admitted capture callback must release its binding only after its copied PCM is finished"
+require_count \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'wakeCaptureRoutingBinding = nil' \
+  '1' \
+  "idle microphone mute must preserve the raw wake binding for deterministic resume retirement"
+require_count \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '_ = invalidateCaptureRouting()' \
+  '1' \
+  "microphone mute must use the tap fence instead of leaving an orphan routing invalidation token"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'AudioCaptureBindingActivationPolicy.decision(' \
+  "capture cutover ownership must be decided from the first valid callback timestamp"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'firstBufferHostTime: bufferHostTime' \
+  "capture activation must bind the successor plane to its first valid buffer boundary"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'AudioCaptureReleaseCompletionBarrier(completion:' \
+  "capture release must join audio-engine retirement with timeline drainage"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'barrier.signal(.routingDrained)' \
+  "capture release completion must not run before routing drainage finishes"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'captureTimelineRouter.sealCurrentForRelease(' \
+  "release without a ready successor must seal current capture ownership before retirement"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  'AudioCaptureStopCompletionPolicy.decision(' \
+  "terminal UI completion must wait for the transport handoff callback"
+require_text \
+  "$ROOT/Sources/VoiceRelayOverlay.swift" \
+  '"transport_stop_handoff_pending"' \
+  "a pending transport handoff must remain observable instead of resuming wake on a timer"
+reject_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'advanceCaptureRoutingEpoch()' \
+  "mute and unmute must not invalidate the active playback-reference binding"
 require_text \
   "$ROOT/Sources/WakePhraseController.swift" \
-  '"persistent_realtime_capture"' \
-  "wake recognition must identify the reused Realtime capture source"
+  '"persistent_raw_wake_capture"' \
+  "wake recognition must identify the persistent raw input-only capture source"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'audioHandoffReady: false' \
@@ -3891,6 +4223,18 @@ require_text \
   "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
   'if let completedAudioResponseID {' \
   "the final Realtime event must register before playback-drained delivery"
+require_text \
+  "$ROOT/Sources/VoiceSurfacePolicy.swift" \
+  'struct RealtimePlaybackLeaseReconciler' \
+  "native playback completion must use the tested generation-fenced reconciler"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  'schedulePlaybackWatchdog(playbackTicket)' \
+  "every admitted native playback buffer must arm a bounded completion watchdog"
+require_text \
+  "$ROOT/Sources/NativeRealtimeAudioTransport.swift" \
+  '.completeResult(playbackTicket, reason: .callback)' \
+  "the native callback and watchdog must share one exact-once completion path"
 reject_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
   'mediaDetectedGeneration == generation' \
@@ -3972,6 +4316,14 @@ require_text \
   'Tests/PublicSourceAuditTests.sh' \
   "maintained builds must exercise the public source boundary fixtures"
 require_text \
+  "$ROOT/build.sh" \
+  'audit-public-source.sh" --content-only' \
+  "maintained builds must audit packaged first-party resources for private content"
+require_text \
+  "$ROOT/build.sh" \
+  'VoiceRelay.strings' \
+  "maintained builds must audit compiled first-party string content"
+require_text \
   "$ROOT/.github/workflows/ci.yml" \
   'run: ./audit-public-source.sh .' \
   "public CI must audit the exact checked-out source tree"
@@ -3987,6 +4339,18 @@ require_text \
   "$ROOT/Sources/SettingsStore.swift" \
   'var userDisplayName: String' \
   "the visible user identity must be a persisted setting"
+require_text \
+  "$ROOT/Sources/SettingsStore.swift" \
+  'userDisplayName: ""' \
+  "fresh public settings must not ship an identity-bearing user default"
+reject_text \
+  "$ROOT/Sources/SettingsStore.swift" \
+  'NSFullUserName()' \
+  "fresh public settings must not infer a personal name from the host account"
+reject_text \
+  "$ROOT/Sources/SettingsStore.swift" \
+  'NSUserName()' \
+  "fresh public settings must not infer a user identifier from the host account"
 require_text \
   "$ROOT/Sources/OnboardingWindowController.swift" \
   'userNameLabel.stringValue = localizedCopy.text(' \
@@ -4245,7 +4609,7 @@ for (const filename of expected) {
 NODE
 require_text \
   "$ROOT/Sources/SettingsStore.swift" \
-  'static let currentSchemaVersion = 20' \
+  'static let currentSchemaVersion = 21' \
   "Authority Pack settings must use the current schema"
 require_text \
   "$ROOT/Sources/VoiceRelayOverlay.swift" \
@@ -4314,7 +4678,7 @@ if /usr/bin/grep -RIlE \
   --exclude=LICENSE \
   --exclude=audit-public-source.sh \
   --exclude=SourcePolicyTests.sh \
-  '/Users/[^/[:space:]"]+' \
+  "$(printf '/%s/%s' Users '[^/[:space:]"]+')" \
   "$ROOT" >/dev/null; then
   echo "FAIL: public source must not contain an absolute macOS user-home path" >&2
   exit 1
@@ -4366,10 +4730,18 @@ require_text \
   "$ROOT/package-release.sh" \
   '/usr/bin/lipo "$BINARY" -verify_arch arm64 x86_64' \
   "release packaging must verify both architectures"
-reject_text \
+require_text \
   "$ROOT/publish-github-release.sh" \
   '--prerelease' \
-  "preview-channel publishing must create an ordinary GitHub release"
+  "preview-channel publishing must create a GitHub prerelease"
+require_text \
+  "$ROOT/ARCHITECTURE.md" \
+  'GitHub prereleases and cannot become `Latest`' \
+  "architecture documentation must preserve the preview prerelease boundary"
+reject_text \
+  "$ROOT/ARCHITECTURE.md" \
+  'ordinary releases and selects `Latest` automatically' \
+  "architecture documentation must not describe previews as ordinary Latest releases"
 reject_text \
   "$ROOT/publish-github-release.sh" \
   '--latest' \
@@ -4424,8 +4796,8 @@ require_text \
   "assistant-like playback must remain suppressed before finalized context admission"
 require_text \
   "$ROOT/publish-sparkle-feed.sh" \
-  "\$'false\\tfalse\\ttrue'" \
-  "Sparkle feed publication must require an ordinary GitHub release"
+  "\$'false\\ttrue\\ttrue'" \
+  "Sparkle feed publication must require a matching GitHub prerelease"
 
 "$ROOT/Tests/ReleasePolicyTests.sh"
 

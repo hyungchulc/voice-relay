@@ -178,11 +178,7 @@ final class SettingsWindowController:
     private let threadIDControl = NSTextField()
     private let codexModelControl = NSPopUpButton()
     private let codexReasoningControl = NSPopUpButton()
-    private let codexFastModeControl = NSButton(
-        checkboxWithTitle: "Fast mode",
-        target: nil,
-        action: nil
-    )
+    private let codexServiceTierControl = NSPopUpButton()
     private let codexProfileStatus = NSTextField(wrappingLabelWithString: "")
     private let productNameControl = NSTextField()
     private let assistantNameControl = NSTextField()
@@ -240,6 +236,14 @@ final class SettingsWindowController:
         action: nil
     )
     private let additionalContextProvidersRootControl = NSTextField()
+    private let connectorRegistry = ConnectorRegistry.shared
+    private let connectorControl = NSPopUpButton()
+    private let connectorEnabledControl = NSButton(
+        checkboxWithTitle: "Enable selected connector",
+        target: nil,
+        action: nil
+    )
+    private let connectorStatus = NSTextField(wrappingLabelWithString: "")
     private let launchAtLoginControl = NSButton(
         checkboxWithTitle: "로그인할 때 Voice Relay 열기",
         target: nil,
@@ -264,6 +268,7 @@ final class SettingsWindowController:
     private var explicitThreadBindingEditRequested = false
     private var codexModels: [CodexModelCapability] = []
     private var codexEffectiveModel = ""
+    private var codexEffectiveServiceTier = "unknown"
     private var codexCapabilitiesAvailable = false
 
     var onSave: ((Bool) -> Void)?
@@ -398,9 +403,8 @@ final class SettingsWindowController:
         codexModelControl.action = #selector(codexModelSelectionChanged)
         codexReasoningControl.target = self
         codexReasoningControl.action = #selector(codexProfileSelectionChanged)
-        codexFastModeControl.title = "Fast mode"
-        codexFastModeControl.target = self
-        codexFastModeControl.action = #selector(codexProfileSelectionChanged)
+        codexServiceTierControl.target = self
+        codexServiceTierControl.action = #selector(codexProfileSelectionChanged)
         codexProfileStatus.maximumNumberOfLines = 3
         codexProfileStatus.font = .systemFont(ofSize: 11.5)
         codexProfileStatus.textColor = .secondaryLabelColor
@@ -471,6 +475,17 @@ final class SettingsWindowController:
             .monospacedSystemFont(ofSize: 11.5, weight: .regular)
         additionalContextProvidersRootControl.isEditable = true
         additionalContextProvidersRootControl.isSelectable = true
+        connectorControl.target = self
+        connectorControl.action = #selector(connectorSelectionChanged)
+        connectorEnabledControl.title = localizedCopy.text(
+            "Enable selected connector",
+            "선택한 Connector를 활성화합니다."
+        )
+        connectorEnabledControl.target = self
+        connectorEnabledControl.action = #selector(toggleSelectedConnector)
+        connectorStatus.font = .systemFont(ofSize: 11.5)
+        connectorStatus.textColor = .secondaryLabelColor
+        connectorStatus.maximumNumberOfLines = 3
         realtimePromptStatus.font = .systemFont(ofSize: 11.5)
         realtimePromptStatus.textColor = .secondaryLabelColor
 
@@ -652,7 +667,10 @@ final class SettingsWindowController:
                     localizedCopy.text("Thinking level", "Thinking 수준"),
                     codexReasoningControl
                 ),
-                codexFastModeControl,
+                settingsRow(
+                    localizedCopy.text("Service tier", "서비스 tier"),
+                    codexServiceTierControl
+                ),
                 codexProfileStatus,
                 divider(),
                 fieldLabel(
@@ -817,10 +835,30 @@ final class SettingsWindowController:
                 )),
                 divider(),
                 fieldLabel(
+                    "Connector v1",
+                    detail: localizedCopy.text(
+                        "Add an explicit read-only event connector for return, morning, or manual Daily Brief delivery.",
+                        "복귀, 아침 또는 수동 Daily Brief를 위한 명시적 읽기 전용 event connector를 추가합니다."
+                    )
+                ),
+                settingsRow(
+                    localizedCopy.text("Connector", "Connector"),
+                    connectorControl,
+                    button(localizedCopy.text("Add…", "추가…"), #selector(chooseConnectorManifest)),
+                    button(localizedCopy.text("Remove", "제거"), #selector(removeSelectedConnector))
+                ),
+                connectorEnabledControl,
+                connectorStatus,
+                note(localizedCopy.text(
+                    "Disabled by default. When enabled, the selected executable runs unsandboxed with your macOS user privileges. Voice Relay binds approval to the exact manifest and executable digests and requires approval again after either changes.",
+                    "기본값은 비활성화입니다. 활성화하면 선택한 실행 파일이 현재 macOS 사용자 권한으로 sandbox 없이 실행됩니다. Voice Relay는 정확한 manifest와 실행 파일 digest에 승인을 묶고 둘 중 하나가 바뀌면 다시 승인을 요구합니다."
+                )),
+                divider(),
+                fieldLabel(
                     "Additional Context Providers",
                     detail: localizedCopy.text(
-                        "Optional local scripts that produce fresh grounding context for each Codex request.",
-                        "각 Codex 요청에 최신 grounding context를 만드는 선택형 로컬 스크립트입니다."
+                        "Legacy compatibility for request-bound Codex context only; it is not a Connector v1 event source.",
+                        "Codex 요청에 묶인 context용 레거시 호환 기능이며 Connector v1 event source가 아닙니다."
                     )
                 ),
                 additionalContextProvidersControl,
@@ -1396,6 +1434,7 @@ final class SettingsWindowController:
             settings.includeAdditionalContextProviders ? .on : .off
         additionalContextProvidersRootControl.stringValue =
             settings.additionalContextProvidersRoot
+        refreshConnectorControls()
         refreshLaunchAtLogin()
         loadedThreadID = settings.codexThreadID
         explicitThreadBindingEditRequested = false
@@ -1403,7 +1442,8 @@ final class SettingsWindowController:
         populateCodexProfileControls(
             settings: settings,
             preferredReasoningEffort: settings.codexReasoningEffort,
-            preferredFastMode: settings.codexFastMode
+            preferredServiceTierSelection:
+                settings.codexServiceTierSelection
         )
         taskStatus.stringValue = settings.codexThreadID.isEmpty
             ? localizedCopy.text(
@@ -1614,13 +1654,16 @@ final class SettingsWindowController:
                 case let .success(snapshot):
                     self.codexModels = snapshot.models
                     self.codexEffectiveModel = snapshot.effectiveConfig.model
+                    self.codexEffectiveServiceTier =
+                        snapshot.effectiveConfig.serviceTier
                     self.codexCapabilitiesAvailable = !snapshot.models.isEmpty
                     let settings = self.store.load()
                     self.populateCodexProfileControls(
                         settings: settings,
                         preferredReasoningEffort:
                             settings.codexReasoningEffort,
-                        preferredFastMode: settings.codexFastMode
+                        preferredServiceTierSelection:
+                            settings.codexServiceTierSelection
                     )
                     self.codexStatus.stringValue =
                         self.localizedCopy.text("Connected", "연결됨")
@@ -1631,10 +1674,11 @@ final class SettingsWindowController:
                     self.codexCapabilitiesAvailable = false
                     self.codexModels = []
                     self.codexEffectiveModel = ""
+                    self.codexEffectiveServiceTier = "unknown"
                     self.populateCodexProfileControls(
                         settings: self.store.load(),
                         preferredReasoningEffort: nil,
-                        preferredFastMode: nil
+                        preferredServiceTierSelection: nil
                     )
                     self.codexStatus.stringValue = error.localizedDescription
                     self.codexStatus.textColor = .systemRed
@@ -1841,6 +1885,152 @@ final class SettingsWindowController:
         additionalContextProvidersControl.state = .on
     }
 
+    @objc private func chooseConnectorManifest() {
+        let panel = NSOpenPanel()
+        panel.title = localizedCopy.text(
+            "Choose connector.json",
+            "connector.json 선택"
+        )
+        panel.prompt = localizedCopy.text("Add", "추가")
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard url.lastPathComponent == "connector.json" else {
+            present(ConnectorRegistryError.invalidManifest(
+                localizedCopy.text(
+                    "Select a file named connector.json.",
+                    "connector.json 파일을 선택하세요."
+                )
+            ))
+            return
+        }
+        do {
+            let binding = try connectorRegistry.addManifest(at: url)
+            refreshConnectorControls(selecting: binding.manifest.id)
+        } catch {
+            present(error)
+        }
+    }
+
+    @objc private func connectorSelectionChanged() {
+        refreshSelectedConnectorStatus()
+    }
+
+    @objc private func toggleSelectedConnector() {
+        guard let identifier = connectorControl.selectedItem?
+            .representedObject as? String,
+              let binding = connectorRegistry.binding(id: identifier) else {
+            connectorEnabledControl.state = .off
+            return
+        }
+        let shouldEnable = connectorEnabledControl.state == .on
+        if shouldEnable {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = localizedCopy.text(
+                "Run this connector unsandboxed?",
+                "이 Connector를 sandbox 없이 실행할까요?"
+            )
+            alert.informativeText = localizedCopy.text(
+                "Its executable will run with your macOS user privileges. Approval applies only to the currently validated manifest and executable digests.",
+                "실행 파일은 현재 macOS 사용자 권한으로 실행됩니다. 승인은 현재 검증된 manifest와 실행 파일 digest에만 적용됩니다."
+            )
+            alert.addButton(withTitle: localizedCopy.text("Enable", "활성화"))
+            alert.addButton(withTitle: localizedCopy.text("Cancel", "취소"))
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                connectorEnabledControl.state = .off
+                return
+            }
+        }
+        do {
+            _ = try connectorRegistry.setEnabled(
+                id: identifier,
+                enabled: shouldEnable,
+                approvedPermissions: shouldEnable
+                    ? binding.manifest.requiredPermissions
+                    : [],
+                acknowledgedUnsandboxedCode: shouldEnable
+            )
+            refreshConnectorControls(selecting: identifier)
+        } catch {
+            connectorEnabledControl.state = binding.enabled ? .on : .off
+            present(error)
+        }
+    }
+
+    @objc private func removeSelectedConnector() {
+        guard let identifier = connectorControl.selectedItem?
+            .representedObject as? String,
+              let binding = connectorRegistry.binding(id: identifier) else {
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = localizedCopy.text(
+            "Remove \(binding.manifest.name)?",
+            "\(binding.manifest.name)을 제거할까요?"
+        )
+        alert.informativeText = localizedCopy.text(
+            "This removes only the Voice Relay binding. It does not delete connector files.",
+            "Voice Relay 연결만 제거하며 connector 파일은 삭제하지 않습니다."
+        )
+        alert.addButton(withTitle: localizedCopy.text("Remove", "제거"))
+        alert.addButton(withTitle: localizedCopy.text("Cancel", "취소"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try connectorRegistry.remove(id: identifier)
+            refreshConnectorControls()
+        } catch {
+            present(error)
+        }
+    }
+
+    private func refreshConnectorControls(selecting identifier: String? = nil) {
+        let previous = identifier
+            ?? connectorControl.selectedItem?.representedObject as? String
+        connectorControl.removeAllItems()
+        for binding in connectorRegistry.bindings() {
+            connectorControl.addItem(withTitle: binding.manifest.name)
+            connectorControl.lastItem?.representedObject = binding.manifest.id
+        }
+        if let previous,
+           let item = connectorControl.itemArray.first(where: {
+               $0.representedObject as? String == previous
+           }) {
+            connectorControl.select(item)
+        }
+        refreshSelectedConnectorStatus()
+    }
+
+    private func refreshSelectedConnectorStatus() {
+        guard let identifier = connectorControl.selectedItem?
+            .representedObject as? String,
+              let binding = connectorRegistry.binding(id: identifier) else {
+            connectorEnabledControl.state = .off
+            connectorEnabledControl.isEnabled = false
+            connectorStatus.stringValue = localizedCopy.text(
+                "No connector is bound.",
+                "연결된 Connector가 없습니다."
+            )
+            return
+        }
+        connectorEnabledControl.isEnabled = true
+        connectorEnabledControl.state = binding.enabled ? .on : .off
+        let dataClasses = binding.manifest.dataClasses
+            .map(\.rawValue).sorted().joined(separator: ", ")
+        let permissions = binding.manifest.requiredPermissions
+            .map(\.rawValue).sorted().joined(separator: ", ")
+        connectorStatus.stringValue = localizedCopy.text(
+            "Status: \(binding.status.rawValue) · Data: \(dataClasses) · Permissions: \(permissions)",
+            "상태: \(binding.status.rawValue) · 데이터: \(dataClasses) · 권한: \(permissions)"
+        )
+        connectorStatus.textColor = binding.status == .healthy
+            ? .systemGreen
+            : .secondaryLabelColor
+    }
+
     @objc private func save() {
         var settings = store.load()
         let previousSettings = settings
@@ -1924,12 +2114,13 @@ final class SettingsWindowController:
         if codexCapabilitiesAvailable {
             let model = selectedCodexModel()
             let reasoningEffort = selectedCodexReasoningEffort()
-            let fastMode = codexFastModeControl.state == .on
+            let serviceTierSelection = selectedCodexServiceTierSelection()
             let resolution = CodexProfileSelectionPolicy.resolve(
                 model: model,
                 reasoningEffort: reasoningEffort,
-                fastMode: fastMode,
+                serviceTierSelection: serviceTierSelection,
                 effectiveModel: codexEffectiveModel,
+                effectiveServiceTier: codexEffectiveServiceTier,
                 capabilities: codexModels
             )
             guard resolution.isSupported else {
@@ -1938,7 +2129,7 @@ final class SettingsWindowController:
             }
             settings.codexModel = model
             settings.codexReasoningEffort = reasoningEffort
-            settings.codexFastMode = fastMode
+            settings.codexServiceTierSelection = serviceTierSelection
         }
         settings.codexSandbox = "inherit"
         settings.codexApprovalPolicy = "inherit"
@@ -2077,10 +2268,18 @@ final class SettingsWindowController:
             ?? "inherit"
     }
 
+    private func selectedCodexServiceTierSelection()
+        -> CodexServiceTierSelection
+    {
+        CodexServiceTierSelection.parse(
+            codexServiceTierControl.selectedItem?.representedObject as? String
+        )
+    }
+
     private func populateCodexProfileControls(
         settings: AppSettings,
         preferredReasoningEffort: String?,
-        preferredFastMode: Bool?
+        preferredServiceTierSelection: CodexServiceTierSelection?
     ) {
         let requestedModel = settings.codexModel
         codexModelControl.removeAllItems()
@@ -2112,11 +2311,27 @@ final class SettingsWindowController:
             preferred: preferredReasoningEffort
                 ?? settings.codexReasoningEffort
         )
-        codexFastModeControl.state = (
-            preferredFastMode ?? settings.codexFastMode
-        ) ? .on : .off
+        codexServiceTierControl.removeAllItems()
+        let serviceTierEntries: [(String, CodexServiceTierSelection)] = [
+            (localizedCopy.text("Inherit", "Codex 설정 따르기"), .inherit),
+            (localizedCopy.text("Standard", "표준"), .standard),
+            (localizedCopy.text("Fast", "Fast"), .priority),
+        ]
+        for (title, selection) in serviceTierEntries {
+            codexServiceTierControl.addItem(withTitle: title)
+            codexServiceTierControl.lastItem?.representedObject =
+                selection.rawValue
+        }
+        let selectedServiceTier = preferredServiceTierSelection
+            ?? settings.codexServiceTierSelection
+        if let item = codexServiceTierControl.itemArray.first(where: {
+            $0.representedObject as? String == selectedServiceTier.rawValue
+        }) {
+            codexServiceTierControl.select(item)
+        }
         codexModelControl.isEnabled = codexCapabilitiesAvailable
         codexReasoningControl.isEnabled = codexCapabilitiesAvailable
+        codexServiceTierControl.isEnabled = codexCapabilitiesAvailable
         updateCodexProfileStatus()
     }
 
@@ -2167,7 +2382,7 @@ final class SettingsWindowController:
 
     private func updateCodexProfileStatus() {
         guard codexCapabilitiesAvailable else {
-            codexFastModeControl.isEnabled = false
+            codexServiceTierControl.isEnabled = false
             codexProfileStatus.stringValue = localizedCopy.text(
                 "Codex profile controls are read-only until capabilities are available. Existing settings will be preserved.",
                 "기능 정보를 확인할 때까지 Codex 프로필은 읽기 전용입니다. 기존 설정은 유지됩니다."
@@ -2179,30 +2394,41 @@ final class SettingsWindowController:
         let resolution = CodexProfileSelectionPolicy.resolve(
             model: selectedCodexModel(),
             reasoningEffort: selectedCodexReasoningEffort(),
-            fastMode: codexFastModeControl.state == .on,
+            serviceTierSelection: selectedCodexServiceTierSelection(),
             effectiveModel: codexEffectiveModel,
+            effectiveServiceTier: codexEffectiveServiceTier,
             capabilities: codexModels
         )
-        let selectedCapability = codexModels.first {
-            $0.id == resolution.resolvedModelID
-        }
-        let supportsFast = selectedCapability?.serviceTierIDs.contains(
-            "priority"
-        ) == true
-        codexFastModeControl.isEnabled = supportsFast
-            || codexFastModeControl.state == .on
+        codexServiceTierControl.isEnabled = true
         saveButton.isEnabled = resolution.isSupported
         if resolution.isSupported {
-            codexProfileStatus.stringValue = codexFastModeControl.state == .on
-                ? localizedCopy.text(
+            switch selectedCodexServiceTierSelection() {
+            case .priority:
+                codexProfileStatus.stringValue = localizedCopy.text(
                     "Fast mode will use the supported accelerated service tier.",
                     "Fast mode는 지원되는 가속 서비스 tier를 사용합니다."
                 )
-                : localizedCopy.text(
-                    "Supported. The normal inherited service tier is preserved.",
-                    "지원됩니다. 기본 service tier를 그대로 사용합니다."
+            case .standard:
+                codexProfileStatus.stringValue = localizedCopy.text(
+                    "Standard explicitly disables Fast for subsequent Voice requests, even when the Codex host default is priority.",
+                    "표준은 Codex 호스트 기본값이 priority여도 다음 Voice 요청에서 Fast를 명시적으로 끕니다."
                 )
+            case .inherit:
+                let currentTier = codexEffectiveServiceTier == "priority"
+                    ? "Fast"
+                    : "Standard"
+                codexProfileStatus.stringValue = localizedCopy.text(
+                    "Inherit re-resolves the live Codex host service tier for every request (currently \(currentTier)).",
+                    "Codex 설정 따르기는 요청마다 현재 Codex 호스트 service tier를 다시 확인합니다 (현재 \(currentTier))."
+                )
+            }
             codexProfileStatus.textColor = .secondaryLabelColor
+        } else if !resolution.isServiceTierResolved {
+            codexProfileStatus.stringValue = localizedCopy.text(
+                "The current Codex service tier is unavailable. Refresh the connection before saving Inherit.",
+                "현재 Codex 서비스 tier를 확인할 수 없습니다. Codex 설정 따르기를 저장하기 전에 연결을 새로고침하세요."
+            )
+            codexProfileStatus.textColor = .systemOrange
         } else {
             codexProfileStatus.stringValue = localizedCopy.text(
                 "This model, thinking level, and Fast mode combination is not supported.",

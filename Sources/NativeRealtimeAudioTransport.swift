@@ -36,7 +36,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     var onInputLevel: ((Int, CGFloat) -> Void)?
     var onPlaybackDrained: ((Int, String) -> Void)?
     var onDiagnostic: ((DiagnosticSnapshot) -> Void)?
-    var onError: ((Int, String) -> Void)?
+    var onError: ((Int, String, AudioCaptureStartupFailurePlan) -> Void)?
     var onClosed: ((Int) -> Void)?
 
     private enum OutboundOrigin {
@@ -91,8 +91,16 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private let captureLock = NSLock()
     private let lifecycleSignalLock = NSLock()
     private var audioStartCancellation = AudioStartCancellationState()
-    private var captureRoutingEpoch = AudioCaptureRoutingEpoch()
-    private var captureTimingHealth = AudioCaptureTimingHealth()
+    private var captureTimelineRouter = AudioCaptureTimelineRouter()
+    private var captureTimingTracker = AudioCaptureTimingTracker()
+    private var microphoneInputTapFences = AudioCaptureInputTapFenceSet()
+    private var captureRoutingRetirementCompletions: [
+        AudioCaptureRoutingToken: [() -> Void]
+    ] = [:]
+    private var stopHandoffOwnership:
+        AudioCaptureStopHandoffOwnership?
+    private let stopHandoffFailureFallback =
+        AudioCaptureStopHandoffFailureFallback()
 
     private var urlSession: URLSession?
     private var webSocketTask: URLSessionWebSocketTask?
@@ -109,6 +117,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private let maximumOutboundMessages = 96
 
     private var audioEngine: AVAudioEngine?
+    private var wakeAudioEngine: AVAudioEngine?
     private var retiredAudioEngines: [AVAudioEngine] = []
     private var playerNode: AVAudioPlayerNode?
     private var wakeAudioConsumer: ((WakeAudioChunk) -> Void)?
@@ -125,9 +134,13 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private let wakeAudioHealthInterval: TimeInterval = 1.0
     private var voiceProcessingEnabled = false
     private var captureTapInstalled = false
+    private var wakeCaptureTapInstalled = false
+    private var realtimeCaptureRoutingBinding: AudioCaptureRouteBinding?
+    private var wakeCaptureRoutingBinding: AudioCaptureRouteBinding?
     private var microphoneInputEnabled = true
     private var playbackReferenceTapInstalled = false
     private var audioConfigurationObserver: NSObjectProtocol?
+    private var wakeAudioConfigurationObserver: NSObjectProtocol?
     private var audioRecoveryWorkItem: DispatchWorkItem?
     private var audioRecoveryStableWorkItem: DispatchWorkItem?
     private var audioRecoveryAttempts = 0
@@ -159,6 +172,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private var truncatableResponseIDs: Set<String> = []
     private var backpressureReportedResponseIDs: Set<String> = []
     private var playbackToken = 0
+    private var playbackLeaseReconciler = RealtimePlaybackLeaseReconciler()
+    private var playbackWatchdogWorkItems: [
+        UInt64: DispatchWorkItem
+    ] = [:]
     private var provisionalPauseToken = 0
     private var playbackProvisionallyPaused = false
     private let systemMediaPlaybackDetector =
@@ -205,6 +222,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 }
                 return
             }
+            self.invalidateStopHandoffOwnership()
             VoiceRelayDiagnostics.flow(
                 "realtime_transport_start_requested",
                 generation: generation,
@@ -235,17 +253,21 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                     self.stopCurrent(
                         emitClosed: false,
                         reason: "generation_replaced",
-                        preserveCaptureForWake: true
+                        preserveCaptureForWake: true,
+                        preserveHandoffJournal: true
                     )
-                }
-                if !claimedWakeHandoff {
-                    self.advanceCaptureRoutingEpoch()
+                    self.invalidateStopHandoffOwnership()
                 }
                 self.cancelWakeAudioHealthCheck()
                 self.wakeAudioConsumer = nil
                 self.wakeAudioFailureHandler = nil
                 self.activeGeneration = generation
                 self.resetCounters()
+                self.cancelPlaybackWatchdogWorkItems()
+                self.playbackLeaseReconciler.reset(
+                    generation: generation,
+                    playbackEpoch: self.playbackToken
+                )
             }
             self.wakeAudioHandoffLifecycle.reset()
             if claimedWakeHandoff {
@@ -400,7 +422,8 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     func stop(
         generation: Int,
         reason: String = "host_stop",
-        preserveCaptureForWake: Bool = true
+        preserveCaptureForWake: Bool = true,
+        preserveHandoffJournal: Bool = true
     ) {
         markStopRequested(generation: generation)
         stateQueue.async {
@@ -413,7 +436,8 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             self.stopCurrent(
                 emitClosed: true,
                 reason: reason,
-                preserveCaptureForWake: preserveCaptureForWake
+                preserveCaptureForWake: preserveCaptureForWake,
+                preserveHandoffJournal: preserveHandoffJournal
             )
         }
     }
@@ -451,13 +475,12 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             }
             guard microphoneInputEnabled != enabled else { return true }
             microphoneInputEnabled = enabled
-            advanceCaptureRoutingEpoch()
             if !wakeAudioHandoffLifecycle.requiresProtectedContinuity {
                 pendingPCM.removeAll(keepingCapacity: false)
             }
             pendingBargeInPCM.removeAll(keepingCapacity: false)
-            captureTimingHealth.reset()
             if !enabled {
+                microphoneInputTapFences.invalidateAll()
                 wakeAudioRearmBoundaryFrame = nil
                 if !wakeAudioHandoffJournal.hasCommittedHandoff {
                     wakeAudioHandoffJournal.cancel()
@@ -468,6 +491,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 if captureTapInstalled, let audioEngine {
                     audioEngine.inputNode.removeTap(onBus: 0)
                     captureTapInstalled = false
+                }
+                if wakeCaptureTapInstalled, let wakeAudioEngine {
+                    wakeAudioEngine.inputNode.removeTap(onBus: 0)
+                    wakeCaptureTapInstalled = false
                 }
                 if let activeGeneration {
                     emitOnMain {
@@ -481,6 +508,25 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                         "capture": "stopped",
                         "playback": "preserved",
                         "session": "preserved",
+                    ]
+                )
+                return true
+            }
+            if activeGeneration == nil,
+               let wakeAudioEngine {
+                do {
+                    try restartRawWakeCaptureEngineInPlace(
+                        engine: wakeAudioEngine
+                    )
+                } catch {
+                    microphoneInputEnabled = false
+                    return false
+                }
+                VoiceRelayDiagnostics.flow(
+                    "microphone_input_unmuted",
+                    fields: [
+                        "capture": "raw_wake_resumed",
+                        "voice_processing": "false",
                     ]
                 )
                 return true
@@ -511,7 +557,27 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                     microphoneInputEnabled = false
                     return false
                 }
-                installCaptureTap(on: input, format: captureFormat)
+                guard let binding = AudioCaptureEngineBindingPolicy
+                    .microphoneTapRestartBinding(
+                        activeBinding: realtimeCaptureRoutingBinding
+                    ) else {
+                    microphoneInputEnabled = false
+                    return false
+                }
+                guard let routingToken = captureRoutingToken(
+                    for: binding
+                ) else {
+                    microphoneInputEnabled = false
+                    return false
+                }
+                captureTimingTracker.activate(routingToken)
+                _ = installCaptureTap(
+                    on: input,
+                    format: captureFormat,
+                    plane: .realtimeFullDuplex,
+                    routingBinding: binding
+                )
+                captureTapInstalled = true
             }
             VoiceRelayDiagnostics.flow(
                 "microphone_input_unmuted",
@@ -540,8 +606,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         stateQueue.sync {
             guard activeGeneration == nil,
                   microphoneInputEnabled,
-                  audioEngine != nil,
-                  voiceProcessingEnabled else {
+                  let wakeAudioEngine,
+                  wakeCaptureTapInstalled,
+                  !wakeAudioEngine.inputNode.isVoiceProcessingEnabled,
+                  !wakeAudioEngine.outputNode.isVoiceProcessingEnabled else {
                 return nil
             }
             return AVAudioFormat(
@@ -562,40 +630,48 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         stateQueue.sync {
             guard activeGeneration == nil,
                   microphoneInputEnabled else { return false }
-            if let audioEngine,
-               voiceProcessingEnabled,
-               playbackReferenceTapInstalled {
-                if !audioEngine.isRunning {
+            if let wakeAudioEngine {
+                if !wakeAudioEngine.isRunning {
                     do {
-                        try restartFullDuplexEngineInPlace(
-                            engine: audioEngine,
-                            generation: nil
+                        try restartRawWakeCaptureEngineInPlace(
+                            engine: wakeAudioEngine
                         )
                     } catch {
-                        releaseAudioEngine(
-                            generation: nil,
+                        releaseWakeAudioEngine(
                             reason: "wake_shared_capture_restart_failed"
                         )
                         return false
                     }
-                } else if !captureTapInstalled {
-                    let input = audioEngine.inputNode
+                } else if !wakeCaptureTapInstalled {
+                    let input = wakeAudioEngine.inputNode
+                    let retiringBinding = wakeCaptureRoutingBinding
                     let captureFormat = input.outputFormat(forBus: 0)
                     guard captureFormat.sampleRate > 0,
                           captureFormat.channelCount > 0 else {
                         return false
                     }
-                    installCaptureTap(on: input, format: captureFormat)
+                    let binding = installCaptureTap(
+                        on: input,
+                        format: captureFormat,
+                        plane: .idleWakeRaw
+                    )
+                    wakeCaptureRoutingBinding = binding
+                    wakeCaptureTapInstalled = true
+                    scheduleCaptureRoutingRetirement(
+                        retiringBinding,
+                        afterActivationOf: binding
+                    )
                 }
                 return true
             }
             do {
-                try installDefaultFullDuplexEngine(generation: nil)
+                try installRawWakeCaptureEngine()
                 VoiceRelayDiagnostics.flow(
                     "wake_shared_capture_prepared",
                     fields: [
-                        "backend": "realtime_native_audio",
-                        "ownership": "single_persistent_graph",
+                        "backend": "raw_input_only",
+                        "ownership": "persistent_idle_wake_plane",
+                        "voice_processing": "false",
                     ]
                 )
                 return true
@@ -642,37 +718,34 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             audioRecoveryStableWorkItem = nil
             guard activeGeneration == nil,
                   microphoneInputEnabled,
-                  let audioEngine,
-                  voiceProcessingEnabled,
-                  captureTapInstalled else {
+                  let wakeAudioEngine,
+                  wakeCaptureTapInstalled,
+                  !wakeAudioEngine.inputNode.isVoiceProcessingEnabled else {
                 return false
             }
             let rearmBoundaryFrame = wakeAudioRearmBoundaryFrame
             if rearmBoundaryFrame == nil {
                 wakeAudioHandoffJournal.beginWake()
-                advanceCaptureRoutingEpoch()
             }
             wakeAudioConsumer = handler
             wakeAudioFailureHandler = onFailure
-            if !audioEngine.isRunning {
+            if !wakeAudioEngine.isRunning {
                 do {
-                    try restartFullDuplexEngineInPlace(
-                        engine: audioEngine,
-                        generation: nil
+                    try restartRawWakeCaptureEngineInPlace(
+                        engine: wakeAudioEngine
                     )
                 } catch {
                     wakeAudioConsumer = nil
                     wakeAudioFailureHandler = nil
-                    releaseAudioEngine(
-                        generation: nil,
+                    releaseWakeAudioEngine(
                         reason: "wake_audio_bind_recovery_failed"
                     )
                     return false
                 }
             }
-            observeAudioConfigurationChanges(for: audioEngine)
+            observeWakeAudioConfigurationChanges(for: wakeAudioEngine)
             scheduleWakeAudioHealthCheck(
-                engine: audioEngine,
+                engine: wakeAudioEngine,
                 capturedBaseline: wakeDeliveredChunks,
                 reason: "initial_binding"
             )
@@ -736,7 +809,6 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             audioRecoveryStableWorkItem = nil
             if wakeAudioRearmBoundaryFrame == nil,
                !wakeAudioHandoffJournal.hasCommittedHandoff {
-                advanceCaptureRoutingEpoch()
                 wakeAudioHandoffJournal.cancel()
             }
             cancelWakeAudioHealthCheck()
@@ -953,9 +1025,12 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 emitDiagnostic("audio_start_cancelled")
                 return
             } catch {
+                let failurePlan =
+                    AudioCapturePlanePolicy.realtimeStartupFailurePlan
                 fail(
                     "The audio engine could not start · \(error.localizedDescription)",
-                    stage: "audio_start"
+                    stage: "audio_start",
+                    failurePlan: failurePlan
                 )
                 return
             }
@@ -1101,9 +1176,13 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             }
         }
         if let completedAudioResponseID {
-            reportPlaybackDrainedIfReady(
-                responseID: completedAudioResponseID
-            )
+            if let terminalization = playbackLeaseReconciler
+                .markResponseCompleted(
+                    generation: generation,
+                    responseID: completedAudioResponseID
+                ) {
+                finishPlaybackResponse(terminalization)
+            }
         }
     }
 
@@ -1117,7 +1196,11 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             guard audioEngine.inputNode.isVoiceProcessingEnabled,
                   audioEngine.outputNode.isVoiceProcessingEnabled,
                   captureTapInstalled,
-                  playbackReferenceTapInstalled else {
+                  playbackReferenceTapInstalled,
+                  let realtimeBinding = realtimeCaptureRoutingBinding,
+                  let realtimeToken = captureRoutingToken(
+                      for: realtimeBinding
+                  ) else {
                 releaseAudioEngine(
                     generation: generation,
                     reason: "persistent_capture_invalid_before_reuse"
@@ -1134,7 +1217,16 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             wakeAudioConsumer = nil
             wakeAudioFailureHandler = nil
             let captureWasRunning = audioEngine.isRunning
-            if !captureWasRunning {
+            let bindingWasReusable = AudioCaptureEngineBindingPolicy
+                .canReusePersistentRealtimeBinding(
+                    routingTokenRecognized:
+                        captureTimelineRouter.recognizes(realtimeToken),
+                    routingTokenIsCurrent:
+                        captureTimelineRouter.isCurrent(realtimeToken)
+                )
+            let reboundCaptureBinding =
+                !captureWasRunning || !bindingWasReusable
+            if reboundCaptureBinding {
                 try restartFullDuplexEngineInPlace(
                     engine: audioEngine,
                     generation: generation
@@ -1150,12 +1242,47 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 generation: generation,
                 fields: [
                     "backend": "realtime_native_audio",
-                    "reason": captureWasRunning
-                        ? "persistent_capture_reused"
-                        : "persistent_capture_restarted",
+                    "reason": !captureWasRunning
+                        ? "persistent_capture_restarted"
+                        : reboundCaptureBinding
+                            ? "persistent_capture_rebound"
+                            : "persistent_capture_reused",
                     "voice_processing": "true",
                 ]
             )
+            if AudioCapturePlanePolicy.realtimeStartupDecision(
+                succeeded: true
+            ) == .retireIdleWake {
+                if reboundCaptureBinding,
+                   let successorBinding = realtimeCaptureRoutingBinding {
+                    successorBinding.registerActivationHandler {
+                        [weak self] routingToken in
+                        guard let self, routingToken != nil else { return }
+                        self.stateQueue.async {
+                            guard self.activeGeneration == generation,
+                                  self.realtimeCaptureRoutingBinding
+                                    === successorBinding,
+                                  let currentToken = self
+                                    .captureRoutingToken(
+                                        for: successorBinding
+                                    ),
+                                  self.captureTimelineRouter.isCurrent(
+                                      currentToken
+                                  ) else {
+                                return
+                            }
+                            self.releaseWakeAudioEngine(
+                                reason:
+                                    "realtime_capture_plane_rebound"
+                            )
+                        }
+                    }
+                } else {
+                    releaseWakeAudioEngine(
+                        reason: "realtime_capture_plane_reused"
+                    )
+                }
+            }
             return
         }
         VoiceRelayDiagnostics.flow(
@@ -1171,9 +1298,198 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         try installDefaultFullDuplexEngine(generation: generation)
     }
 
+    private func installRawWakeCaptureEngine() throws {
+        let requirements = AudioCapturePlanePolicy.requirements(
+            for: .idleWakeRaw
+        )
+        precondition(
+            !requirements.voiceProcessing
+                && !requirements.outputPlayback
+                && !requirements.playbackReferenceTap
+        )
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        guard !input.isVoiceProcessingEnabled,
+              !engine.outputNode.isVoiceProcessingEnabled else {
+            throw NSError(
+                domain: "VoiceRelay.NativeRealtimeAudioTransport",
+                code: 10,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "The idle wake graph unexpectedly enabled voice processing"
+                ]
+            )
+        }
+        let captureFormat = input.outputFormat(forBus: 0)
+        guard captureFormat.sampleRate > 0,
+              captureFormat.channelCount > 0 else {
+            throw NSError(
+                domain: "VoiceRelay.NativeRealtimeAudioTransport",
+                code: 11,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "The raw wake microphone format is unavailable"
+                ]
+            )
+        }
+        let binding = installCaptureTap(
+            on: input,
+            format: captureFormat,
+            plane: .idleWakeRaw
+        )
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            engine.stop()
+            retireUnpublishedCaptureBinding(binding)
+            throw error
+        }
+        wakeAudioEngine = engine
+        wakeCaptureTapInstalled = true
+        wakeCaptureRoutingBinding = binding
+        audioConfigurationRecoveryNotBefore =
+            ProcessInfo.processInfo.systemUptime
+                + audioConfigurationStartupGrace
+        observeWakeAudioConfigurationChanges(for: engine)
+        VoiceRelayDiagnostics.flow(
+            "wake_raw_capture_started",
+            fields: [
+                "channels": String(captureFormat.channelCount),
+                "output_player": "false",
+                "playback_reference": "false",
+                "sample_rate": String(
+                    format: "%.0f",
+                    captureFormat.sampleRate
+                ),
+                "voice_processing": "false",
+            ]
+        )
+    }
+
+    private func restartRawWakeCaptureEngineInPlace(
+        engine: AVAudioEngine
+    ) throws {
+        guard wakeAudioEngine === engine else {
+            throw NSError(
+                domain: "VoiceRelay.NativeRealtimeAudioTransport",
+                code: 12,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "The raw wake capture engine is stale"
+                ]
+            )
+        }
+        let input = engine.inputNode
+        let retiringBinding = wakeCaptureRoutingBinding
+        guard !input.isVoiceProcessingEnabled,
+              !engine.outputNode.isVoiceProcessingEnabled else {
+            throw NSError(
+                domain: "VoiceRelay.NativeRealtimeAudioTransport",
+                code: 13,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "The raw wake capture plane acquired voice processing"
+                ]
+            )
+        }
+        if wakeCaptureTapInstalled {
+            input.removeTap(onBus: 0)
+            wakeCaptureTapInstalled = false
+        }
+        let captureFormat = input.outputFormat(forBus: 0)
+        guard captureFormat.sampleRate > 0,
+              captureFormat.channelCount > 0 else {
+            throw NSError(
+                domain: "VoiceRelay.NativeRealtimeAudioTransport",
+                code: 14,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "The recovered raw wake microphone format is unavailable"
+                ]
+            )
+        }
+        let binding = installCaptureTap(
+            on: input,
+            format: captureFormat,
+            plane: .idleWakeRaw
+        )
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            retireUnpublishedCaptureBinding(binding)
+            throw error
+        }
+        wakeCaptureTapInstalled = true
+        wakeCaptureRoutingBinding = binding
+        scheduleCaptureRoutingRetirement(
+            retiringBinding,
+            afterActivationOf: binding
+        )
+        audioConfigurationRecoveryNotBefore =
+            ProcessInfo.processInfo.systemUptime
+                + audioConfigurationStartupGrace
+        observeWakeAudioConfigurationChanges(for: engine)
+    }
+
+    private func releaseWakeAudioEngine(
+        reason: String,
+        completion: (() -> Void)? = nil
+    ) {
+        let completionBarrier = completion.map {
+            AudioCaptureReleaseCompletionBarrier(completion: $0)
+        }
+        removeWakeAudioConfigurationObserver()
+        let engineToRetire = wakeAudioEngine
+        let routingBindingToRetire = wakeCaptureRoutingBinding
+        if let engineToRetire {
+            if wakeCaptureTapInstalled {
+                engineToRetire.inputNode.removeTap(onBus: 0)
+            }
+            engineToRetire.stop()
+            engineToRetire.reset()
+        }
+        wakeCaptureTapInstalled = false
+        wakeCaptureRoutingBinding = nil
+        wakeAudioEngine = nil
+        scheduleCaptureRoutingRetirement(
+            routingBindingToRetire,
+            completion: completionBarrier.map { barrier in
+                { barrier.signal(.routingDrained) }
+            }
+        )
+        if engineToRetire != nil {
+            VoiceRelayDiagnostics.flow(
+                "wake_raw_capture_stopped",
+                fields: ["reason": reason]
+            )
+        }
+        if let engineToRetire {
+            retireAudioEngine(
+                engineToRetire,
+                completion: completionBarrier.map { barrier in
+                    { barrier.signal(.engineRetired) }
+                }
+            )
+        } else {
+            completionBarrier?.signal(.engineRetired)
+        }
+    }
+
     private func installDefaultFullDuplexEngine(
         generation: Int?
     ) throws {
+        let requirements = AudioCapturePlanePolicy.requirements(
+            for: .realtimeFullDuplex
+        )
+        precondition(
+            requirements.voiceProcessing
+                && requirements.outputPlayback
+                && requirements.playbackReferenceTap
+        )
         guard generation.map({
             !isStartCancelled(generation: $0)
         }) ?? true else {
@@ -1231,7 +1547,6 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 enableAdvancedDucking: false,
                 duckingLevel: .min
             )
-        voiceProcessingEnabled = true
         VoiceRelayDiagnostics.flow(
             "voice_processing_activated",
             generation: generation,
@@ -1273,14 +1588,20 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 "sink": "macos_system_default_output",
             ]
         )
+        var captureBinding: AudioCaptureRouteBinding?
         if microphoneInputEnabled {
-            installCaptureTap(
+            captureBinding = installCaptureTap(
                 on: input,
-                format: captureFormat
+                format: captureFormat,
+                plane: .realtimeFullDuplex
             )
+            captureTapInstalled = true
         }
+        let routingBinding = captureBinding
+            ?? AudioCaptureRouteBinding(plane: .realtimeFullDuplex)
         try installPlaybackReferenceTap(
-            on: engine.mainMixerNode
+            on: engine.mainMixerNode,
+            routingBinding: routingBinding
         )
         guard generation.map({
             !isStartCancelled(generation: $0)
@@ -1291,6 +1612,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             }
             engine.mainMixerNode.removeTap(onBus: 0)
             playbackReferenceTapInstalled = false
+            retireUnpublishedCaptureBinding(routingBinding)
             throw AudioLifecycleError.startCancelled
         }
         engine.prepare()
@@ -1305,6 +1627,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             playbackReferenceTapInstalled = false
             engine.stop()
             voiceProcessingEnabled = false
+            retireUnpublishedCaptureBinding(routingBinding)
             throw error
         }
         guard generation.map({
@@ -1317,10 +1640,42 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             engine.mainMixerNode.removeTap(onBus: 0)
             playbackReferenceTapInstalled = false
             engine.stop()
+            retireUnpublishedCaptureBinding(routingBinding)
             throw AudioLifecycleError.startCancelled
         }
         audioEngine = engine
         playerNode = player
+        voiceProcessingEnabled = true
+        realtimeCaptureRoutingBinding = routingBinding
+        if microphoneInputEnabled {
+            routingBinding.registerActivationHandler {
+                [weak self] routingToken in
+                guard let self, routingToken != nil else { return }
+                self.stateQueue.async {
+                    guard self.realtimeCaptureRoutingBinding === routingBinding,
+                          AudioCapturePlanePolicy.realtimeStartupDecision(
+                              succeeded: true
+                          ) == .retireIdleWake else {
+                        return
+                    }
+                    self.releaseWakeAudioEngine(
+                        reason: "realtime_capture_plane_ready"
+                    )
+                }
+            }
+        } else {
+            activateCaptureRouting(
+                routingBinding,
+                atHostTime: AudioGetCurrentHostTime()
+            )
+            if AudioCapturePlanePolicy.realtimeStartupDecision(
+                succeeded: true
+            ) == .retireIdleWake {
+                releaseWakeAudioEngine(
+                    reason: "realtime_capture_plane_ready"
+                )
+            }
+        }
         audioConfigurationRecoveryNotBefore =
             ProcessInfo.processInfo.systemUptime
                 + audioConfigurationStartupGrace
@@ -1350,6 +1705,9 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         reason: String,
         completion: (() -> Void)? = nil
     ) {
+        let completionBarrier = completion.map {
+            AudioCaptureReleaseCompletionBarrier(completion: $0)
+        }
         let hadActiveCapture =
             audioEngine != nil
             || voiceProcessingEnabled
@@ -1374,14 +1732,6 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 ]
             )
         }
-        mediaEpoch &+= 1
-        advanceCaptureRoutingEpoch()
-        if wakeAudioRearmBoundaryFrame != nil {
-            wakeAudioRearmBoundaryFrame = nil
-            if !wakeAudioHandoffJournal.hasCommittedHandoff {
-                wakeAudioHandoffJournal.cancel()
-            }
-        }
         cancelWakeAudioHealthCheck()
         provisionalPauseToken &+= 1
         playbackProvisionallyPaused = false
@@ -1391,6 +1741,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         removeAudioConfigurationObserver()
         playerNode?.stop()
         let engineToRetire = audioEngine
+        let routingBindingToRetire = realtimeCaptureRoutingBinding
         if let engine = engineToRetire {
             engine.inputNode.removeTap(onBus: 0)
             captureTapInstalled = false
@@ -1402,7 +1753,14 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
         playbackReferenceTapInstalled = false
         playerNode = nil
+        realtimeCaptureRoutingBinding = nil
         audioEngine = nil
+        scheduleCaptureRoutingRetirement(
+            routingBindingToRetire,
+            completion: completionBarrier.map { barrier in
+                { barrier.signal(.routingDrained) }
+            }
+        )
         voiceProcessingEnabled = false
         lastCaptureClassification = ""
         if hadActiveCapture {
@@ -1418,10 +1776,12 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         if let engineToRetire {
             retireAudioEngine(
                 engineToRetire,
-                completion: completion
+                completion: completionBarrier.map { barrier in
+                    { barrier.signal(.engineRetired) }
+                }
             )
-        } else if let completion {
-            stateQueue.async(execute: completion)
+        } else {
+            completionBarrier?.signal(.engineRetired)
         }
     }
 
@@ -1446,11 +1806,17 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
     }
 
+    @discardableResult
     private func installCaptureTap(
         on input: AVAudioInputNode,
-        format: AVAudioFormat
-    ) {
+        format: AVAudioFormat,
+        plane: AudioCapturePlane,
+        routingBinding: AudioCaptureRouteBinding? = nil
+    ) -> AudioCaptureRouteBinding {
         let epoch = mediaEpoch
+        let inputTapRevision = microphoneInputTapFences.snapshot(for: plane)
+        let binding = routingBinding
+            ?? AudioCaptureRouteBinding(plane: plane)
         let bufferFrames = AVAudioFrameCount(
             max(256, min(4_096, Int(format.sampleRate * 0.04)))
         )
@@ -1460,21 +1826,28 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             format: format
         ) { [weak self] buffer, time in
             guard let self else { return }
-            let routingToken = self.currentCaptureRoutingToken()
+            guard binding.beginCaptureCallback() else { return }
             self.capture(
                 buffer,
                 format: format,
                 time: time,
                 epoch: epoch,
-                routingToken: routingToken,
-                bufferHostTime: time.isHostTimeValid ? time.hostTime : nil
+                inputTapPlane: plane,
+                inputTapRevision: inputTapRevision,
+                routingBinding: binding,
+                bufferHostTime: time.isHostTimeValid ? time.hostTime : nil,
+                completion: { [weak self] in
+                    guard binding.finishCaptureCallback() else { return }
+                    self?.enqueueCaptureRoutingRetirement(binding)
+                }
             )
         }
-        captureTapInstalled = true
+        return binding
     }
 
     private func installPlaybackReferenceTap(
-        on mixer: AVAudioMixerNode
+        on mixer: AVAudioMixerNode,
+        routingBinding: AudioCaptureRouteBinding
     ) throws {
         let format = mixer.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
@@ -1497,14 +1870,20 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             format: format
         ) { [weak self] buffer, time in
             guard let self else { return }
-            let routingToken = self.currentCaptureRoutingToken()
+            guard routingBinding.beginCaptureCallback() else { return }
+            let finishCallback = { [weak self] in
+                if routingBinding.finishCaptureCallback() {
+                    self?.enqueueCaptureRoutingRetirement(routingBinding)
+                }
+            }
             self.capturePlaybackReference(
                 buffer,
                 format: format,
                 time: time,
                 epoch: epoch,
-                routingToken: routingToken,
-                bufferHostTime: time.isHostTimeValid ? time.hostTime : nil
+                routingBinding: routingBinding,
+                bufferHostTime: time.isHostTimeValid ? time.hostTime : nil,
+                completion: finishCallback
             )
         }
         playbackReferenceTapInstalled = true
@@ -1544,6 +1923,26 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
     }
 
+    private func observeWakeAudioConfigurationChanges(
+        for engine: AVAudioEngine
+    ) {
+        removeWakeAudioConfigurationObserver()
+        wakeAudioConfigurationObserver =
+            NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange,
+                object: engine,
+                queue: nil
+            ) { [weak self, weak engine] _ in
+                guard let self, let engine else { return }
+                self.stateQueue.async {
+                    guard self.wakeAudioEngine === engine else {
+                        return
+                    }
+                    self.scheduleWakeAudioRecovery(engine: engine)
+                }
+            }
+    }
+
     private func scheduleWakeAudioRecovery(engine: AVAudioEngine) {
         audioRecoveryWorkItem?.cancel()
         audioRecoveryWorkItem = nil
@@ -1568,15 +1967,15 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             guard self.audioConfigurationRecoveryPolicy.isCurrent(
                 token: plan.token
             ),
-            self.audioEngine === engine,
+            self.wakeAudioEngine === engine,
             self.activeGeneration == nil,
             self.wakeAudioConsumer != nil else {
                 return
             }
             self.audioRecoveryWorkItem = nil
             if engine.isRunning,
-               engine.inputNode.isVoiceProcessingEnabled,
-               engine.outputNode.isVoiceProcessingEnabled,
+               !engine.inputNode.isVoiceProcessingEnabled,
+               !engine.outputNode.isVoiceProcessingEnabled,
                self.wakeDeliveredChunks > capturedBaseline {
                 VoiceRelayDiagnostics.flow(
                     "wake_audio_route_change_settled",
@@ -1591,9 +1990,8 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 return
             }
             do {
-                try self.restartFullDuplexEngineInPlace(
-                    engine: engine,
-                    generation: nil
+                try self.restartRawWakeCaptureEngineInPlace(
+                    engine: engine
                 )
                 VoiceRelayDiagnostics.flow(
                     "wake_audio_recovery_completed",
@@ -1631,15 +2029,15 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             self.stateQueue.async {
                 guard self.wakeAudioHealthWorkItem != nil,
                       self.wakeAudioHealthToken == healthToken,
-                      self.audioEngine === engine,
+                      self.wakeAudioEngine === engine,
                       self.activeGeneration == nil,
                       self.wakeAudioConsumer != nil else {
                     return
                 }
                 self.wakeAudioHealthWorkItem = nil
                 guard engine.isRunning,
-                      engine.inputNode.isVoiceProcessingEnabled,
-                      engine.outputNode.isVoiceProcessingEnabled,
+                      !engine.inputNode.isVoiceProcessingEnabled,
+                      !engine.outputNode.isVoiceProcessingEnabled,
                       self.wakeDeliveredChunks > capturedBaseline else {
                     self.failWakeAudioSource(
                         engine: engine,
@@ -1671,13 +2069,12 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         engine: AVAudioEngine,
         reason: String
     ) {
-        guard audioEngine === engine,
+        guard wakeAudioEngine === engine,
               activeGeneration == nil,
               wakeAudioConsumer != nil else {
             return
         }
         let failureHandler = wakeAudioFailureHandler
-        advanceCaptureRoutingEpoch()
         cancelWakeAudioHealthCheck()
         wakeAudioConsumer = nil
         wakeAudioFailureHandler = nil
@@ -1686,8 +2083,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             generation: nil,
             fields: ["reason": reason]
         )
-        releaseAudioEngine(
-            generation: nil,
+        releaseWakeAudioEngine(
             reason: "wake_audio_source_\(reason)",
             completion: {
                 if let failureHandler {
@@ -1811,7 +2207,9 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         engine: AVAudioEngine,
         generation: Int?
     ) throws {
+        let engineWasRunning = engine.isRunning
         let input = engine.inputNode
+        let retiringBinding = realtimeCaptureRoutingBinding
         if let generation,
            isStartCancelled(generation: generation) {
             throw AudioLifecycleError.startCancelled
@@ -1829,7 +2227,6 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
 
         mediaEpoch &+= 1
-        advanceCaptureRoutingEpoch()
         cancelWakeAudioHealthCheck()
         if captureTapInstalled {
             input.removeTap(onBus: 0)
@@ -1857,17 +2254,41 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 ]
             )
         }
+        var captureBinding: AudioCaptureRouteBinding?
         if microphoneInputEnabled {
-            installCaptureTap(
+            captureBinding = installCaptureTap(
                 on: input,
-                format: captureFormat
+                format: captureFormat,
+                plane: .realtimeFullDuplex
+            )
+            captureTapInstalled = true
+        }
+        let routingBinding = captureBinding
+            ?? AudioCaptureRouteBinding(plane: .realtimeFullDuplex)
+        try installPlaybackReferenceTap(
+            on: engine.mainMixerNode,
+            routingBinding: routingBinding
+        )
+        if !engineWasRunning {
+            engine.prepare()
+            do {
+                try engine.start()
+            } catch {
+                retireUnpublishedCaptureBinding(routingBinding)
+                throw error
+            }
+        }
+        realtimeCaptureRoutingBinding = routingBinding
+        if !microphoneInputEnabled {
+            activateCaptureRouting(
+                routingBinding,
+                atHostTime: AudioGetCurrentHostTime()
             )
         }
-        try installPlaybackReferenceTap(
-            on: engine.mainMixerNode
+        scheduleCaptureRoutingRetirement(
+            retiringBinding,
+            afterActivationOf: routingBinding
         )
-        engine.prepare()
-        try engine.start()
         if let generation,
            isStartCancelled(generation: generation) {
             if captureTapInstalled {
@@ -1877,6 +2298,7 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             engine.mainMixerNode.removeTap(onBus: 0)
             playbackReferenceTapInstalled = false
             engine.stop()
+            retireUnpublishedCaptureBinding(routingBinding)
             throw AudioLifecycleError.startCancelled
         }
         if scheduledPlaybackBuffers > 0,
@@ -2033,17 +2455,47 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         audioConfigurationObserver = nil
     }
 
+    private func removeWakeAudioConfigurationObserver() {
+        if let wakeAudioConfigurationObserver {
+            NotificationCenter.default.removeObserver(
+                wakeAudioConfigurationObserver
+            )
+        }
+        wakeAudioConfigurationObserver = nil
+    }
+
     private func capture(
         _ buffer: AVAudioPCMBuffer,
         format: AVAudioFormat,
         time: AVAudioTime,
         epoch: Int,
-        routingToken: AudioCaptureRoutingToken,
-        bufferHostTime: UInt64?
+        inputTapPlane: AudioCapturePlane,
+        inputTapRevision: UInt64,
+        routingBinding: AudioCaptureRouteBinding,
+        bufferHostTime: UInt64?,
+        completion: @escaping () -> Void
     ) {
         guard reserveCaptureSlot() else {
             stateQueue.async {
-                guard self.mediaEpoch == epoch,
+                defer { completion() }
+                guard let routingToken = self.captureRoutingToken(
+                          for: routingBinding
+                      ),
+                      AudioCaptureInputCallbackPolicy.accepts(
+                          capturedMediaEpoch: epoch,
+                          currentMediaEpoch: self.mediaEpoch,
+                          capturedTapRevision: inputTapRevision,
+                          currentTapRevision:
+                              self.microphoneInputTapFences.snapshot(
+                                  for: inputTapPlane
+                              ),
+                          microphoneInputEnabled:
+                              self.microphoneInputEnabled,
+                          routingTokenRecognized:
+                              self.captureTimelineRouter.recognizes(
+                                  routingToken
+                              )
+                      ),
                       self.acceptsCaptureRouting(
                           routingToken,
                           bufferHostTime: bufferHostTime
@@ -2065,12 +2517,14 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
         guard let channels = buffer.floatChannelData else {
             releaseCaptureSlot()
+            completion()
             return
         }
         let frameCount = Int(buffer.frameLength)
         let channelCount = Int(format.channelCount)
         guard frameCount > 0, channelCount > 0 else {
             releaseCaptureSlot()
+            completion()
             return
         }
         var channelSamples: [[Float]] = []
@@ -2086,158 +2540,226 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             )
         }
         let sourceRate = format.sampleRate
-        let startTime = Self.monotonicSeconds(for: time)
         audioProcessingQueue.async { [weak self] in
-            guard let self else { return }
-            let inputLevel = OrbAudioLevelPolicy.normalizedRMS(channelSamples)
+            guard let self else {
+                completion()
+                return
+            }
             let samples = Self.mixAndResample(
                 channelSamples,
                 sourceRate: sourceRate
             )
             self.stateQueue.async {
-                defer { self.releaseCaptureSlot() }
-                guard self.mediaEpoch == epoch,
-                      self.microphoneInputEnabled,
-                      self.isCurrentCaptureRoutingToken(routingToken) else {
+                defer {
+                    self.releaseCaptureSlot()
+                    completion()
+                }
+                guard AudioCaptureInputCallbackPolicy
+                    .acceptsBeforeRouting(
+                        capturedTapRevision: inputTapRevision,
+                        currentTapRevision:
+                            self.microphoneInputTapFences.snapshot(
+                                for: inputTapPlane
+                            ),
+                        microphoneInputEnabled:
+                            self.microphoneInputEnabled
+                    ) else {
                     return
                 }
-                guard let bufferHostTime else {
+                switch routingBinding.recordProvisionalTiming(
+                    timestampAvailable: bufferHostTime != nil
+                ) {
+                case .ready:
+                    break
+                case .awaitingValidTimestamp, .ignoredStale:
+                    return
+                case .failed:
                     if self.wakeAudioHandoffLifecycle
                         .requiresProtectedContinuity {
                         self.failWakeAudioHandoff(
                             "The wake audio handoff lost capture timing",
                             stage: "wake_audio_handoff_capture_timing"
                         )
-                        return
-                    }
-                    if self.captureTimingHealth.record(
-                        timestampAvailable: false
-                    ) {
-                        self.handleUnavailableCaptureTiming()
-                    }
-                    return
-                }
-                _ = self.captureTimingHealth.record(timestampAvailable: true)
-                guard self.acceptsCaptureRouting(
-                    routingToken,
-                    bufferHostTime: bufferHostTime
-                ), !samples.isEmpty else {
-                    return
-                }
-                let wakePCM = Self.encodePCM16(samples)
-                let handoffCaptureDisposition =
-                    self.wakeAudioHandoffLifecycle
-                        .captureDisposition
-                let shouldJournalWakeAudio =
-                    handoffCaptureDisposition
-                        == .committedJournal
-                    || (
-                        self.wakeAudioConsumer != nil
-                        || self.wakeAudioRearmBoundaryFrame != nil
-                        || self.wakeAudioHandoffJournal
-                            .hasCommittedHandoff
-                    )
-                let wakeSpan = shouldJournalWakeAudio
-                    ? self.wakeAudioHandoffJournal.append(pcm: wakePCM)
-                    : nil
-                if let wakeAudioConsumer = self.wakeAudioConsumer,
-                   let wakeSpan,
-                   let wakeBuffer = Self.wakeAudioBuffer(from: samples) {
-                    self.wakeDeliveredChunks += 1
-                    wakeAudioConsumer(
-                        WakeAudioChunk(
-                            buffer: wakeBuffer,
-                            span: wakeSpan
+                    } else {
+                        self.handleUnavailableCaptureTiming(
+                            routingBinding: routingBinding
                         )
-                    )
-                }
-                if handoffCaptureDisposition
-                    == .committedJournal {
-                    return
-                }
-                if handoffCaptureDisposition
-                    == .protectedLiveBuffer {
-                    guard self.pendingPCM.count + wakePCM.count
-                        <= self.maximumProtectedLivePCMBytes else {
-                        self.failWakeAudioHandoff(
-                            "The wake audio handoff live buffer overflowed",
-                            stage: "wake_audio_handoff_live_buffer"
-                        )
-                        return
                     }
-                    self.pendingPCM.append(wakePCM)
                     return
                 }
-                guard self.sessionUpdated,
-                      let generation = self.activeGeneration,
-                      !self.stopping else {
-                    return
-                }
-                self.emitOnMain {
-                    self.onInputLevel?(generation, inputLevel)
-                }
-                self.capturedChunks += 1
-                if self.playbackExternallyPaused {
-                    self.echoAdmissionPolicy.cancelProvisionalSpeech()
-                    self.pendingBargeInPCM.removeAll(
-                        keepingCapacity: true
-                    )
-                    self.suppressedEchoChunks += 1
-                    self.reportCaptureClassificationIfChanged(
-                        .echoOnly,
-                        correlation: 0,
-                        generation: generation
-                    )
-                    self.emitDiagnosticIfUseful()
-                    return
-                }
-                let filtered = self.echoAdmissionPolicy.filterCapture(
-                    samples,
-                    startTime: startTime,
-                    playbackActive:
-                        RealtimePlaybackActivityPolicy.isActive(
-                            scheduledPlaybackBuffers:
-                                self.scheduledPlaybackBuffers,
-                            playbackProvisionallyPaused:
-                                self.playbackProvisionallyPaused
+                guard let routingToken = self.resolveCaptureRoutingToken(
+                    for: routingBinding,
+                    firstBufferHostTime: bufferHostTime
+                ), AudioCaptureInputCallbackPolicy.accepts(
+                    capturedMediaEpoch: epoch,
+                    currentMediaEpoch: self.mediaEpoch,
+                    capturedTapRevision: inputTapRevision,
+                    currentTapRevision:
+                        self.microphoneInputTapFences.snapshot(
+                            for: inputTapPlane
                         ),
-                    playbackProvisionallyPaused:
-                        self.playbackProvisionallyPaused
+                    microphoneInputEnabled:
+                        self.microphoneInputEnabled,
+                    routingTokenRecognized:
+                        self.captureTimelineRouter.recognizes(
+                            routingToken
+                        )
+                ) else {
+                    return
+                }
+                let timingDisposition =
+                    self.captureTimingTracker.record(
+                        token: routingToken,
+                        timestampAvailable: bufferHostTime != nil,
+                        recognized: self.captureTimelineRouter
+                            .recognizes(routingToken),
+                        isCurrent: self.captureTimelineRouter
+                            .isCurrent(routingToken)
+                    )
+                switch timingDisposition {
+                case .ignoredStale:
+                    return
+                case .failed:
+                    if self.wakeAudioHandoffLifecycle
+                        .requiresProtectedContinuity {
+                        self.failWakeAudioHandoff(
+                            "The wake audio handoff lost capture timing",
+                            stage: "wake_audio_handoff_capture_timing"
+                        )
+                    } else {
+                        self.handleUnavailableCaptureTiming(
+                            routingBinding: routingBinding
+                        )
+                    }
+                    return
+                case .accepted:
+                    break
+                }
+                guard let bufferHostTime, !samples.isEmpty else {
+                    return
+                }
+                let ready = self.captureTimelineRouter.route(
+                    AudioCapturePCMBuffer(
+                        token: routingToken,
+                        startHostTime: bufferHostTime,
+                        sampleRate: 24_000,
+                        hostClockFrequency: AudioGetHostClockFrequency(),
+                        samples: samples
+                    )
                 )
-                self.reportCaptureClassificationIfChanged(
-                    filtered.classification,
-                    correlation: filtered.correlation,
+                self.processRoutedCaptureBuffers(ready)
+            }
+        }
+    }
+
+    private func processRoutedCaptureBuffers(
+        _ buffers: [AudioCaptureRoutedPCMBuffer]
+    ) {
+        for buffer in buffers where !buffer.samples.isEmpty {
+            let samples = buffer.samples
+            let startTime = AVAudioTime.seconds(
+                forHostTime: buffer.startHostTime
+            )
+            let inputLevel = OrbAudioLevelPolicy.normalizedRMS([samples])
+            let wakePCM = Self.encodePCM16(samples)
+            let handoffCaptureDisposition =
+                wakeAudioHandoffLifecycle.captureDisposition
+            let shouldJournalWakeAudio =
+                handoffCaptureDisposition == .committedJournal
+                || (
+                    wakeAudioConsumer != nil
+                    || wakeAudioRearmBoundaryFrame != nil
+                    || wakeAudioHandoffJournal.hasCommittedHandoff
+                )
+            let wakeSpan = shouldJournalWakeAudio
+                ? wakeAudioHandoffJournal.append(pcm: wakePCM)
+                : nil
+            if let wakeAudioConsumer,
+               let wakeSpan,
+               let wakeBuffer = Self.wakeAudioBuffer(from: samples) {
+                wakeDeliveredChunks += 1
+                wakeAudioConsumer(
+                    WakeAudioChunk(
+                        buffer: wakeBuffer,
+                        span: wakeSpan
+                    )
+                )
+            }
+            if handoffCaptureDisposition == .committedJournal {
+                continue
+            }
+            if handoffCaptureDisposition == .protectedLiveBuffer {
+                guard pendingPCM.count + wakePCM.count
+                    <= maximumProtectedLivePCMBytes else {
+                    failWakeAudioHandoff(
+                        "The wake audio handoff live buffer overflowed",
+                        stage: "wake_audio_handoff_live_buffer"
+                    )
+                    return
+                }
+                pendingPCM.append(wakePCM)
+                continue
+            }
+            guard sessionUpdated,
+                  let generation = activeGeneration,
+                  !stopping else {
+                continue
+            }
+            emitOnMain {
+                self.onInputLevel?(generation, inputLevel)
+            }
+            capturedChunks += 1
+            if playbackExternallyPaused {
+                echoAdmissionPolicy.cancelProvisionalSpeech()
+                pendingBargeInPCM.removeAll(keepingCapacity: true)
+                suppressedEchoChunks += 1
+                reportCaptureClassificationIfChanged(
+                    .echoOnly,
+                    correlation: 0,
                     generation: generation
                 )
-                if filtered.classification == .echoOnly {
-                    if !self.echoAdmissionPolicy
-                        .shouldRetainPendingSpeechCandidate(
-                            at: startTime
-                        ) {
-                        self.pendingBargeInPCM.removeAll(keepingCapacity: true)
-                    }
-                    self.suppressedEchoChunks += 1
-                    self.emitDiagnosticIfUseful()
-                    return
-                }
-                if filtered.classification == .uncertainSpeech {
-                    self.appendBargeInPreroll(
-                        Self.encodePCM16(filtered.samples)
-                    )
-                    return
-                }
-                let pcm = Self.encodePCM16(filtered.samples)
-                guard !pcm.isEmpty else { return }
-                if filtered.classification == .residualSpeech,
-                   !self.pendingBargeInPCM.isEmpty {
-                    self.pendingPCM.append(self.pendingBargeInPCM)
-                    self.pendingBargeInPCM.removeAll(keepingCapacity: true)
-                } else if filtered.classification == .noPlaybackReference {
-                    self.pendingBargeInPCM.removeAll(keepingCapacity: true)
-                }
-                self.enqueueInputPCM(pcm)
-                self.emitDiagnosticIfUseful()
+                emitDiagnosticIfUseful()
+                continue
             }
+            let filtered = echoAdmissionPolicy.filterCapture(
+                samples,
+                startTime: startTime,
+                playbackActive: RealtimePlaybackActivityPolicy.isActive(
+                    scheduledPlaybackBuffers: scheduledPlaybackBuffers,
+                    playbackProvisionallyPaused: playbackProvisionallyPaused
+                ),
+                playbackProvisionallyPaused: playbackProvisionallyPaused
+            )
+            reportCaptureClassificationIfChanged(
+                filtered.classification,
+                correlation: filtered.correlation,
+                generation: generation
+            )
+            if filtered.classification == .echoOnly {
+                if !echoAdmissionPolicy.shouldRetainPendingSpeechCandidate(
+                    at: startTime
+                ) {
+                    pendingBargeInPCM.removeAll(keepingCapacity: true)
+                }
+                suppressedEchoChunks += 1
+                emitDiagnosticIfUseful()
+                continue
+            }
+            if filtered.classification == .uncertainSpeech {
+                appendBargeInPreroll(Self.encodePCM16(filtered.samples))
+                continue
+            }
+            let pcm = Self.encodePCM16(filtered.samples)
+            guard !pcm.isEmpty else { continue }
+            if filtered.classification == .residualSpeech,
+               !pendingBargeInPCM.isEmpty {
+                pendingPCM.append(pendingBargeInPCM)
+                pendingBargeInPCM.removeAll(keepingCapacity: true)
+            } else if filtered.classification == .noPlaybackReference {
+                pendingBargeInPCM.removeAll(keepingCapacity: true)
+            }
+            enqueueInputPCM(pcm)
+            emitDiagnosticIfUseful()
         }
     }
 
@@ -2521,13 +3043,20 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         format: AVAudioFormat,
         time: AVAudioTime,
         epoch: Int,
-        routingToken: AudioCaptureRoutingToken,
-        bufferHostTime: UInt64?
+        routingBinding: AudioCaptureRouteBinding,
+        bufferHostTime: UInt64?,
+        completion: @escaping () -> Void
     ) {
-        guard let channels = buffer.floatChannelData else { return }
+        guard let channels = buffer.floatChannelData else {
+            completion()
+            return
+        }
         let frameCount = Int(buffer.frameLength)
         let channelCount = Int(format.channelCount)
-        guard frameCount > 0, channelCount > 0 else { return }
+        guard frameCount > 0, channelCount > 0 else {
+            completion()
+            return
+        }
         var channelSamples: [[Float]] = []
         channelSamples.reserveCapacity(channelCount)
         for channel in 0..<channelCount {
@@ -2543,30 +3072,68 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         let sourceRate = format.sampleRate
         let startTime = Self.monotonicSeconds(for: time)
         audioProcessingQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self else {
+                completion()
+                return
+            }
             let samples = Self.mixAndResample(
                 channelSamples,
                 sourceRate: sourceRate
             )
             self.stateQueue.async {
-                guard self.activeGeneration != nil,
-                      self.mediaEpoch == epoch,
-                      self.acceptsCaptureRouting(
-                          routingToken,
-                          bufferHostTime: bufferHostTime
-                      ),
-                      !samples.isEmpty else {
-                    return
-                }
-                if Self.audioRMS(samples) >= 0.001 {
-                    self.echoAdmissionPolicy.markPlaybackActive(
-                        at: startTime
+                let processReference = {
+                    (routingToken: AudioCaptureRoutingToken) in
+                    AudioCaptureAsynchronousCallbackDrain.perform(
+                        processing: {
+                            guard self.activeGeneration != nil,
+                                  AudioCapturePlaybackReferenceCallbackPolicy.accepts(
+                                      capturedMediaEpoch: epoch,
+                                      currentMediaEpoch: self.mediaEpoch,
+                                      routingTokenRecognized:
+                                          self.captureTimelineRouter.recognizes(
+                                              routingToken
+                                          )
+                                  ),
+                                  self.acceptsCaptureRouting(
+                                      routingToken,
+                                      bufferHostTime: bufferHostTime
+                                  ),
+                                  !samples.isEmpty else {
+                                return
+                            }
+                            if Self.audioRMS(samples) >= 0.001 {
+                                self.echoAdmissionPolicy.markPlaybackActive(
+                                    at: startTime
+                                )
+                            }
+                            self.echoAdmissionPolicy.appendPlaybackReference(
+                                samples,
+                                startTime: startTime
+                            )
+                        },
+                        completion: completion
                     )
                 }
-                self.echoAdmissionPolicy.appendPlaybackReference(
-                    samples,
-                    startTime: startTime
-                )
+                if let routingToken = self.captureRoutingToken(
+                    for: routingBinding
+                ) {
+                    processReference(routingToken)
+                } else {
+                    routingBinding.registerActivationHandler {
+                        [weak self] routingToken in
+                        guard let self else {
+                            completion()
+                            return
+                        }
+                        self.stateQueue.async {
+                            guard let routingToken else {
+                                completion()
+                                return
+                            }
+                            processReference(routingToken)
+                        }
+                    }
+                }
             }
         }
     }
@@ -2692,6 +3259,24 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
               let buffer = Self.playbackBuffer(from: chunk.data) else {
             return
         }
+        let token = playbackToken
+        let playbackTicket: RealtimePlaybackLeaseTicket?
+        if !responseID.isEmpty,
+           let generation = activeGeneration {
+            guard let ticket = playbackLeaseReconciler.admit(
+                generation: generation,
+                playbackEpoch: token,
+                responseID: responseID,
+                frameCount: chunk.frameCount,
+                now: ProcessInfo.processInfo.systemUptime
+            ) else {
+                emitDiagnostic("playback_lease_admission_rejected")
+                return
+            }
+            playbackTicket = ticket
+        } else {
+            playbackTicket = nil
+        }
         let firstChunkForResponse =
             !responseID.isEmpty
                 && playbackBuffersByResponseID[responseID] == nil
@@ -2728,7 +3313,9 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         if firstChunkForResponse {
             beginPlaybackOverlapMonitoring()
         }
-        let token = playbackToken
+        if let playbackTicket {
+            schedulePlaybackWatchdog(playbackTicket)
+        }
         player.scheduleBuffer(
             buffer,
             completionCallbackType: .dataPlayedBack
@@ -2736,27 +3323,31 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
             guard let self else { return }
             self.stateQueue.async {
                 guard token == self.playbackToken else { return }
-                self.queuedPlaybackFrames = max(
-                    0,
-                    self.queuedPlaybackFrames - chunk.frameCount
-                )
-                self.scheduledPlaybackBuffers = max(
-                    0,
-                    self.scheduledPlaybackBuffers - 1
-                )
-                if self.scheduledPlaybackBuffers == 0 {
-                    self.echoAdmissionPolicy.markPlaybackEnded(
-                        at: ProcessInfo.processInfo.systemUptime
+                if let playbackTicket {
+                    let reconciliation = self.playbackLeaseReconciler
+                        .completeResult(playbackTicket, reason: .callback)
+                    guard reconciliation.consumedTicket else { return }
+                    self.cancelPlaybackWatchdog(
+                        ticketID: playbackTicket.ticketID
                     )
-                }
-                if !chunk.responseID.isEmpty {
-                    self.playbackBuffersByResponseID[chunk.responseID] = max(
+                    self.consumePlaybackTicket(
+                        playbackTicket,
+                        terminalization: reconciliation.terminalization
+                    )
+                } else {
+                    self.queuedPlaybackFrames = max(
                         0,
-                        (self.playbackBuffersByResponseID[chunk.responseID] ?? 1) - 1
+                        self.queuedPlaybackFrames - chunk.frameCount
                     )
-                    self.reportPlaybackDrainedIfReady(
-                        responseID: chunk.responseID
+                    self.scheduledPlaybackBuffers = max(
+                        0,
+                        self.scheduledPlaybackBuffers - 1
                     )
+                    if self.scheduledPlaybackBuffers == 0 {
+                        self.echoAdmissionPolicy.markPlaybackEnded(
+                            at: ProcessInfo.processInfo.systemUptime
+                        )
+                    }
                 }
                 self.renderedChunks += 1
                 self.emitDiagnosticIfUseful()
@@ -2779,10 +3370,137 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
     }
 
-    private func reportPlaybackDrainedIfReady(responseID: String) {
-        guard let generation = activeGeneration,
-              completedAudioResponseIDs.contains(responseID),
-              playbackBuffersByResponseID[responseID] == 0,
+    private func schedulePlaybackWatchdog(
+        _ ticket: RealtimePlaybackLeaseTicket,
+        deadline: TimeInterval? = nil
+    ) {
+        cancelPlaybackWatchdog(ticketID: ticket.ticketID)
+        let targetDeadline = deadline ?? ticket.expectedEnd
+        let delay = max(
+            0,
+            targetDeadline - ProcessInfo.processInfo.systemUptime
+        )
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.stateQueue.async {
+                self.playbackWatchdogWorkItems.removeValue(
+                    forKey: ticket.ticketID
+                )
+                guard ticket.generation == self.activeGeneration,
+                      ticket.playbackEpoch == self.playbackToken else {
+                    return
+                }
+                let renderedThroughTicket: Bool
+                if let start = self.activePlaybackStartSampleTime,
+                   let current = self.currentPlaybackSampleTime() {
+                    renderedThroughTicket = current - start
+                        >= AVAudioFramePosition(
+                            self.activePlaybackScheduledFrames
+                        )
+                } else {
+                    renderedThroughTicket = false
+                }
+                let reconciliation = self.playbackLeaseReconciler.reconcile(
+                    ticket,
+                    now: ProcessInfo.processInfo.systemUptime,
+                    playerIsPlaying: self.playerNode?.isPlaying == true,
+                    renderedThroughTicket: renderedThroughTicket,
+                    intentionallyPaused: self.playbackProvisionallyPaused
+                        || self.playbackExternallyPaused
+                )
+                switch reconciliation {
+                case .pending:
+                    self.schedulePlaybackWatchdog(
+                        ticket,
+                        deadline: ProcessInfo.processInfo.systemUptime
+                            + RealtimePlaybackLeaseReconciler
+                                .pausedPollInterval
+                    )
+                case let .rearm(deadline):
+                    self.schedulePlaybackWatchdog(
+                        ticket,
+                        deadline: deadline
+                    )
+                case let .completed(terminalization):
+                    self.consumePlaybackTicket(
+                        ticket,
+                        terminalization: terminalization
+                    )
+                    self.emitDiagnosticIfUseful()
+                case .ignored:
+                    break
+                }
+            }
+        }
+        playbackWatchdogWorkItems[ticket.ticketID] = workItem
+        stateQueue.asyncAfter(
+            deadline: .now() + delay,
+            execute: workItem
+        )
+    }
+
+    private func cancelPlaybackWatchdog(ticketID: UInt64) {
+        playbackWatchdogWorkItems.removeValue(forKey: ticketID)?.cancel()
+    }
+
+    private func cancelPlaybackWatchdogWorkItems() {
+        for workItem in playbackWatchdogWorkItems.values {
+            workItem.cancel()
+        }
+        playbackWatchdogWorkItems.removeAll()
+    }
+
+    private func cancelPlaybackLeaseReconciliation(
+        generation: Int,
+        reason: RealtimePlaybackLeaseTerminalReason
+    ) {
+        cancelPlaybackWatchdogWorkItems()
+        let terminalizations = playbackLeaseReconciler.cancelAll(
+            generation: generation,
+            playbackEpoch: playbackToken,
+            reason: reason
+        )
+        for terminalization in terminalizations {
+            VoiceRelayDiagnostics.flow(
+                "assistant_playback_cancelled_native",
+                generation: terminalization.generation,
+                fields: [
+                    "reason": terminalization.reason.rawValue,
+                    "responseID": terminalization.responseID,
+                ]
+            )
+        }
+    }
+
+    private func consumePlaybackTicket(
+        _ ticket: RealtimePlaybackLeaseTicket,
+        terminalization: RealtimePlaybackLeaseTerminalization?
+    ) {
+        queuedPlaybackFrames = max(
+            0,
+            queuedPlaybackFrames - ticket.frameCount
+        )
+        scheduledPlaybackBuffers = max(0, scheduledPlaybackBuffers - 1)
+        playbackBuffersByResponseID[ticket.responseID] = max(
+            0,
+            (playbackBuffersByResponseID[ticket.responseID] ?? 1) - 1
+        )
+        if scheduledPlaybackBuffers == 0 {
+            echoAdmissionPolicy.markPlaybackEnded(
+                at: ProcessInfo.processInfo.systemUptime
+            )
+        }
+        if let terminalization {
+            finishPlaybackResponse(terminalization)
+        }
+    }
+
+    private func finishPlaybackResponse(
+        _ terminalization: RealtimePlaybackLeaseTerminalization
+    ) {
+        let generation = terminalization.generation
+        let responseID = terminalization.responseID
+        guard generation == activeGeneration,
               drainedAudioResponseIDs.insert(responseID).inserted else {
             return
         }
@@ -2796,7 +3514,10 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         VoiceRelayDiagnostics.flow(
             "assistant_playback_drained_native",
             generation: generation,
-            fields: ["responseID": responseID]
+            fields: [
+                "reason": terminalization.reason.rawValue,
+                "responseID": responseID,
+            ]
         )
         audioAdmissionPolicy.finish(responseID: responseID)
         emitOnMain {
@@ -2949,7 +3670,19 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         if !activePlaybackResponseID.isEmpty {
             discardedAudioResponseIDs.insert(activePlaybackResponseID)
         }
+        if let generation = activeGeneration {
+            cancelPlaybackLeaseReconciliation(
+                generation: generation,
+                reason: .interrupted
+            )
+        }
         playbackToken += 1
+        if let generation = activeGeneration {
+            playbackLeaseReconciler.reset(
+                generation: generation,
+                playbackEpoch: playbackToken
+            )
+        }
         provisionalPauseToken &+= 1
         playbackProvisionallyPaused = false
         endPlaybackOverlapMonitoring()
@@ -3100,18 +3833,19 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
     private func stopCurrent(
         emitClosed: Bool,
         reason: String,
-        preserveCaptureForWake: Bool = false
+        preserveCaptureForWake: Bool = false,
+        preserveHandoffJournal: Bool = false
     ) {
         let previousGeneration = activeGeneration
         if let previousGeneration {
             markStopRequested(generation: previousGeneration)
         }
-        advanceCaptureRoutingEpoch()
         let hadActiveTransport =
             previousGeneration != nil
             || webSocketTask != nil
             || urlSession != nil
             || audioEngine != nil
+            || wakeAudioEngine != nil
             || socketOpen
             || sessionUpdated
         if hadActiveTransport {
@@ -3129,14 +3863,23 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 self.onInputLevel?(previousGeneration, 0)
             }
         }
-        let keepsCaptureRunning =
-            preserveCaptureForWake
-            && audioEngine?.isRunning == true
-            && voiceProcessingEnabled
-        if !keepsCaptureRunning {
+        let shouldPreserveWakeCapture =
+            preserveCaptureForWake && microphoneInputEnabled
+        let shouldPreserveHandoffJournal =
+            preserveHandoffJournal && microphoneInputEnabled
+        let stopInputFenceDecision =
+            AudioCaptureSessionStopInputFencePolicy.decision(
+                preserveCaptureContinuity: shouldPreserveWakeCapture
+            )
+        if stopInputFenceDecision == .invalidateAll {
+            microphoneInputTapFences.invalidateAll()
+        }
+        if !shouldPreserveWakeCapture {
             mediaEpoch &+= 1
+            _ = invalidateCaptureRouting()
         }
         stopping = true
+        invalidateStopHandoffOwnership()
         deferredTerminalFailureGeneration = nil
         openTimeout?.cancel()
         openTimeout = nil
@@ -3146,6 +3889,14 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         audioRecoveryStableWorkItem?.cancel()
         audioRecoveryStableWorkItem = nil
         audioRecoveryAttempts = 0
+        if let previousGeneration {
+            cancelPlaybackLeaseReconciliation(
+                generation: previousGeneration,
+                reason: reason.hasPrefix("failure_")
+                    ? .transportFailure
+                    : .cancelled
+            )
+        }
         playbackToken += 1
         provisionalPauseToken &+= 1
         playbackProvisionallyPaused = false
@@ -3160,27 +3911,238 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
                 self.onClosed?(previousGeneration)
             }
         }
-        if keepsCaptureRunning {
-            playerNode?.stop()
-            wakeAudioConsumer = nil
-            wakeAudioFailureHandler = nil
-            VoiceRelayDiagnostics.flow(
-                "microphone_capture_preserved",
-                generation: previousGeneration,
-                fields: [
-                    "backend": "realtime_native_audio",
-                    "next": "local_wake_analysis",
-                    "reason": reason,
-                ]
+        wakeAudioConsumer = nil
+        wakeAudioFailureHandler = nil
+        if shouldPreserveWakeCapture {
+            if wakeAudioRearmBoundaryFrame == nil,
+               !wakeAudioHandoffJournal.hasCommittedHandoff {
+                wakeAudioRearmBoundaryFrame =
+                    wakeAudioHandoffJournal.nextFrame
+            }
+            var wakeStarted = wakeAudioEngine?.isRunning == true
+            if !wakeStarted {
+                do {
+                    if let wakeAudioEngine {
+                        try restartRawWakeCaptureEngineInPlace(
+                            engine: wakeAudioEngine
+                        )
+                    } else {
+                        try installRawWakeCaptureEngine()
+                    }
+                    wakeStarted = true
+                } catch {
+                    if wakeAudioEngine != nil {
+                        releaseWakeAudioEngine(
+                            reason: "\(reason)_wake_raw_restart_failed"
+                        )
+                    }
+                    VoiceRelayDiagnostics.flow(
+                        "wake_raw_capture_overlap_failed",
+                        generation: previousGeneration,
+                        fields: [
+                            "error_code": String((error as NSError).code),
+                            "error_domain": (error as NSError).domain,
+                        ]
+                    )
+                }
+            }
+            let wakeDecision =
+                AudioCapturePlanePolicy.wakeStartupDecision(
+                    succeeded: wakeStarted
             )
-            closeAfterAudioTransition()
+            switch wakeDecision {
+            case .retireRealtime:
+                guard let previousGeneration,
+                      let realtimeEngine = audioEngine,
+                      let realtimeBinding = realtimeCaptureRoutingBinding,
+                      let wakeEngine = wakeAudioEngine,
+                      let wakeBinding = wakeCaptureRoutingBinding else {
+                    releaseAudioEngine(
+                        generation: previousGeneration,
+                        reason: "\(reason)_wake_raw_ready",
+                        completion: closeAfterAudioTransition
+                    )
+                    break
+                }
+                let ownership = AudioCaptureStopHandoffOwnership(
+                    generation: previousGeneration,
+                    realtimeEngine: realtimeEngine,
+                    realtimeBinding: realtimeBinding,
+                    wakeEngine: wakeEngine,
+                    wakeBinding: wakeBinding,
+                    completion: closeAfterAudioTransition
+                )
+                stopHandoffOwnership = ownership
+                let retireRealtime = { [weak self] in
+                    guard let self else {
+                        ownership.revoke()
+                        return
+                    }
+                    guard self.stopHandoffOwnership === ownership,
+                          ownership.claimTransitionRelease(
+                              activeGeneration: self.activeGeneration,
+                              realtimeEngine: self.audioEngine,
+                              realtimeBinding:
+                                  self.realtimeCaptureRoutingBinding,
+                              wakeEngine: self.wakeAudioEngine,
+                              wakeBinding:
+                                  self.wakeCaptureRoutingBinding
+                          ) else {
+                        if self.stopHandoffOwnership === ownership {
+                            self.stopHandoffOwnership = nil
+                        }
+                        ownership.revoke()
+                        return
+                    }
+                    self.stopHandoffOwnership = nil
+                    self.releaseAudioEngine(
+                        generation: previousGeneration,
+                        reason: "\(reason)_wake_raw_ready",
+                        completion: ownership.finish
+                    )
+                }
+                stopHandoffFailureFallback.arm(
+                    ownership: ownership,
+                    binding: wakeBinding
+                ) { [weak self] in
+                    self?.recoverStopHandoffAfterWakeTimingFailure(
+                        ownership: ownership,
+                        generation: previousGeneration,
+                        reason: reason
+                    )
+                }
+                wakeBinding.registerActivationHandler {
+                    [weak self] routingToken in
+                    guard let self else {
+                        ownership.revoke()
+                        return
+                    }
+                    self.stateQueue.async {
+                        guard self.stopHandoffOwnership === ownership else {
+                            return
+                        }
+                        guard routingToken != nil else {
+                            _ = self.stopHandoffFailureFallback
+                                .triggerIfArmed(
+                                    for: wakeBinding,
+                                    activeGeneration:
+                                        self.activeGeneration,
+                                    realtimeEngine: self.audioEngine,
+                                    realtimeBinding:
+                                        self.realtimeCaptureRoutingBinding,
+                                    wakeEngine: self.wakeAudioEngine,
+                                    wakeBinding:
+                                        self.wakeCaptureRoutingBinding
+                                )
+                            return
+                        }
+                        guard self.stopHandoffFailureFallback.disarm(
+                            ownership: ownership,
+                            binding: wakeBinding
+                        ) else {
+                            return
+                        }
+                        retireRealtime()
+                    }
+                }
+            case .retireRealtimeAndRearmWake:
+                guard let previousGeneration,
+                      let realtimeEngine = audioEngine,
+                      let realtimeBinding = realtimeCaptureRoutingBinding else {
+                    releaseAudioEngine(
+                        generation: previousGeneration,
+                        reason: "\(reason)_wake_raw_rearm",
+                        completion: closeAfterAudioTransition
+                    )
+                    break
+                }
+                let ownership = AudioCaptureStopHandoffOwnership(
+                    generation: previousGeneration,
+                    realtimeEngine: realtimeEngine,
+                    realtimeBinding: realtimeBinding,
+                    completion: closeAfterAudioTransition
+                )
+                stopHandoffOwnership = ownership
+                guard ownership.claimRealtimeRelease(
+                    activeGeneration: activeGeneration,
+                    realtimeEngine: audioEngine,
+                    realtimeBinding: realtimeCaptureRoutingBinding
+                ) else {
+                    stopHandoffOwnership = nil
+                    ownership.revoke()
+                    break
+                }
+                releaseAudioEngine(
+                    generation: previousGeneration,
+                    reason: "\(reason)_wake_raw_rearm",
+                    completion: { [weak self] in
+                        guard let self else {
+                            ownership.revoke()
+                            return
+                        }
+                        guard self.stopHandoffOwnership === ownership,
+                              ownership.claimWakeRearm(
+                                  activeGeneration: self.activeGeneration,
+                                  realtimeEngine: self.audioEngine,
+                                  realtimeBinding:
+                                      self.realtimeCaptureRoutingBinding,
+                                  wakeEngine: self.wakeAudioEngine,
+                                  wakeBinding:
+                                      self.wakeCaptureRoutingBinding
+                              ) else {
+                            if self.stopHandoffOwnership === ownership {
+                                self.stopHandoffOwnership = nil
+                            }
+                            ownership.revoke()
+                            return
+                        }
+                        self.stopHandoffOwnership = nil
+                        if self.microphoneInputEnabled {
+                            do {
+                                try self.installRawWakeCaptureEngine()
+                                VoiceRelayDiagnostics.flow(
+                                    "wake_raw_capture_rearmed",
+                                    generation: previousGeneration,
+                                    fields: [
+                                        "strategy": "after_vpio_release"
+                                    ]
+                                )
+                            } catch {
+                                VoiceRelayDiagnostics.flow(
+                                    "wake_raw_capture_rearm_failed",
+                                    generation: previousGeneration,
+                                    fields: [
+                                        "error_code": String(
+                                            (error as NSError).code
+                                        ),
+                                        "error_domain":
+                                            (error as NSError).domain,
+                                    ]
+                                )
+                            }
+                        }
+                        ownership.finish()
+                    }
+                )
+            case .keepCurrentPlane, .retireIdleWake:
+                assertionFailure("Unexpected stop handoff decision")
+                releaseAudioEngine(
+                    generation: previousGeneration,
+                    reason: reason,
+                    completion: closeAfterAudioTransition
+                )
+            }
         } else {
-            wakeAudioConsumer = nil
-            wakeAudioFailureHandler = nil
             releaseAudioEngine(
                 generation: previousGeneration,
                 reason: reason,
-                completion: closeAfterAudioTransition
+                completion: { [weak self] in
+                    guard let self else { return }
+                    self.releaseWakeAudioEngine(
+                        reason: reason,
+                        completion: closeAfterAudioTransition
+                    )
+                }
             )
         }
         queuedPlaybackFrames = 0
@@ -3203,9 +4165,11 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         echoAdmissionPolicy.reset()
         pendingPCM.removeAll(keepingCapacity: false)
         pendingBargeInPCM.removeAll(keepingCapacity: false)
-        wakeAudioRearmBoundaryFrame = nil
         wakeAudioHandoffLifecycle.cancel()
-        wakeAudioHandoffJournal.cancel()
+        if !shouldPreserveHandoffJournal {
+            wakeAudioRearmBoundaryFrame = nil
+            wakeAudioHandoffJournal.cancel()
+        }
         wakeAudioReplayPump.reset()
         wakeAudioHandoffLifecycle.reset()
         bufferedWakeHandoffEvents.removeAll(keepingCapacity: false)
@@ -3231,6 +4195,87 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
     }
 
+    private func recoverStopHandoffAfterWakeTimingFailure(
+        ownership: AudioCaptureStopHandoffOwnership,
+        generation: Int?,
+        reason: String
+    ) {
+        guard stopHandoffOwnership === ownership,
+              ownership.ownsTransition(
+                  activeGeneration: activeGeneration,
+                  realtimeEngine: audioEngine,
+                  realtimeBinding: realtimeCaptureRoutingBinding,
+                  wakeEngine: wakeAudioEngine,
+                  wakeBinding: wakeCaptureRoutingBinding
+              ) else {
+            if stopHandoffOwnership === ownership {
+                stopHandoffOwnership = nil
+            }
+            ownership.revoke()
+            return
+        }
+        VoiceRelayDiagnostics.flow(
+            "wake_raw_capture_timing_recovery",
+            generation: generation,
+            fields: ["strategy": "release_vpio_then_rearm_raw"]
+        )
+        releaseWakeAudioEngine(
+            reason: "\(reason)_wake_raw_timing_failed",
+            completion: { [weak self] in
+                guard let self else {
+                    ownership.revoke()
+                    return
+                }
+                guard self.stopHandoffOwnership === ownership,
+                      ownership.claimRealtimeRelease(
+                          activeGeneration: self.activeGeneration,
+                          realtimeEngine: self.audioEngine,
+                          realtimeBinding:
+                              self.realtimeCaptureRoutingBinding
+                      ) else {
+                    if self.stopHandoffOwnership === ownership {
+                        self.stopHandoffOwnership = nil
+                    }
+                    ownership.revoke()
+                    return
+                }
+                self.stopHandoffOwnership = nil
+                self.releaseAudioEngine(
+                    generation: generation,
+                    reason: "\(reason)_wake_raw_timing_recovery",
+                    completion: { [weak self] in
+                        guard let self else { return }
+                        if self.microphoneInputEnabled {
+                            do {
+                                try self.installRawWakeCaptureEngine()
+                                VoiceRelayDiagnostics.flow(
+                                    "wake_raw_capture_rearmed",
+                                    generation: generation,
+                                    fields: [
+                                        "strategy": "after_timing_failure"
+                                    ]
+                                )
+                            } catch {
+                                VoiceRelayDiagnostics.flow(
+                                    "wake_raw_capture_rearm_failed",
+                                    generation: generation,
+                                    fields: [
+                                        "error_code": String(
+                                            (error as NSError).code
+                                        ),
+                                        "error_domain":
+                                            (error as NSError).domain,
+                                    ]
+                                )
+                            }
+                        }
+                        ownership.finish()
+                    }
+                )
+            }
+        )
+    }
+
     private func markStartRequested(generation: Int) {
         lifecycleSignalLock.withLock {
             audioStartCancellation.requestStart(generation: generation)
@@ -3249,33 +4294,111 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
     }
 
-    private func currentCaptureRoutingToken() -> AudioCaptureRoutingToken {
-        lifecycleSignalLock.withLock {
-            captureRoutingEpoch.token
+    private func invalidateStopHandoffOwnership() {
+        let ownership = stopHandoffOwnership
+        stopHandoffOwnership = nil
+        stopHandoffFailureFallback.cancel()
+        ownership?.revoke()
+    }
+
+    private func captureRoutingToken(
+        for binding: AudioCaptureRouteBinding
+    ) -> AudioCaptureRoutingToken? {
+        binding.token
+    }
+
+    private func resolveCaptureRoutingToken(
+        for binding: AudioCaptureRouteBinding,
+        firstBufferHostTime: UInt64?
+    ) -> AudioCaptureRoutingToken? {
+        switch AudioCaptureBindingActivationPolicy.decision(
+            existingToken: captureRoutingToken(for: binding),
+            firstBufferHostTime: firstBufferHostTime
+        ) {
+        case let .use(token):
+            return token
+        case let .activate(atHostTime):
+            activateCaptureRouting(
+                binding,
+                atHostTime: atHostTime
+            )
+            return captureRoutingToken(for: binding)
+        case .awaitValidTimestamp:
+            return nil
         }
+    }
+
+    private func activateCaptureRouting(
+        _ binding: AudioCaptureRouteBinding,
+        atHostTime hostTime: UInt64
+    ) {
+        var transition: AudioCaptureRoutingTransition?
+        guard let publication = binding.publishIfAccepting(
+            tokenProvider: {
+                let nextTransition = captureTimelineRouter.activate(
+                    atHostTime: hostTime
+                )
+                transition = nextTransition
+                return nextTransition.token
+            }
+        ), let transition else {
+            return
+        }
+        let routingToken = publication.token
+        captureTimingTracker.activate(routingToken)
+        for retiredToken in transition.retiredTokens {
+            captureTimingTracker.retire(retiredToken)
+        }
+        processRoutedCaptureBuffers(transition.readyBuffers)
+        completeCaptureRoutingRetirements(
+            transition.retiredTokens
+        )
+        if let previousToken =
+            captureTimelineRouter.routingEpoch.previousToken,
+           previousToken.epoch == 0 {
+            let ready = captureTimelineRouter.retirePrevious(previousToken)
+            captureTimingTracker.retire(previousToken)
+            processRoutedCaptureBuffers(ready)
+            completeCaptureRoutingRetirements([previousToken])
+        }
+        for activationHandler in publication.handlers {
+            activationHandler(routingToken)
+        }
+        VoiceRelayDiagnostics.flow(
+            "audio_capture_plane_activated",
+            generation: activeGeneration,
+            fields: [
+                "host_time": String(hostTime),
+                "plane": binding.plane == .idleWakeRaw
+                    ? "idle_wake_raw"
+                    : "realtime_full_duplex",
+            ]
+        )
     }
 
     private func acceptsCaptureRouting(
         _ token: AudioCaptureRoutingToken,
         bufferHostTime: UInt64?
     ) -> Bool {
-        lifecycleSignalLock.withLock {
-            captureRoutingEpoch.accepts(
-                token,
-                bufferHostTime: bufferHostTime
-            )
-        }
+        captureTimelineRouter.routingEpoch.accepts(
+            token,
+            bufferHostTime: bufferHostTime
+        )
     }
 
-    private func isCurrentCaptureRoutingToken(
-        _ token: AudioCaptureRoutingToken
-    ) -> Bool {
-        lifecycleSignalLock.withLock {
-            captureRoutingEpoch.isCurrent(token)
+    private func handleUnavailableCaptureTiming(
+        routingBinding: AudioCaptureRouteBinding
+    ) {
+        if stopHandoffFailureFallback.triggerIfArmed(
+            for: routingBinding,
+            activeGeneration: activeGeneration,
+            realtimeEngine: audioEngine,
+            realtimeBinding: realtimeCaptureRoutingBinding,
+            wakeEngine: wakeAudioEngine,
+            wakeBinding: wakeCaptureRoutingBinding
+        ) {
+            return
         }
-    }
-
-    private func handleUnavailableCaptureTiming() {
         if activeGeneration != nil, !stopping {
             fail(
                 "The microphone did not provide safe capture timing",
@@ -3285,27 +4408,147 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         }
         if activeGeneration == nil,
            wakeAudioConsumer != nil,
-           let audioEngine {
+           let wakeAudioEngine {
             failWakeAudioSource(
-                engine: audioEngine,
+                engine: wakeAudioEngine,
                 reason: "capture_timing_unavailable"
             )
         }
     }
 
     @discardableResult
-    private func advanceCaptureRoutingEpoch() -> AudioCaptureRoutingToken {
-        captureTimingHealth.reset()
-        return lifecycleSignalLock.withLock {
-            captureRoutingEpoch.advance(
-                atHostTime: AudioGetCurrentHostTime()
-            )
+    private func invalidateCaptureRouting() -> AudioCaptureRoutingToken {
+        captureTimingTracker.reset()
+        return captureTimelineRouter.invalidate(
+            atHostTime: AudioGetCurrentHostTime()
+        )
+    }
+
+    private func scheduleCaptureRoutingRetirement(
+        _ binding: AudioCaptureRouteBinding?,
+        completion: (() -> Void)? = nil
+    ) {
+        guard let binding else {
+            if let completion {
+                stateQueue.async(execute: completion)
+            }
+            return
+        }
+        let token = captureRoutingToken(for: binding)
+        if let token {
+            if let completion {
+                captureRoutingRetirementCompletions[token, default: []]
+                    .append(completion)
+            }
+            if captureTimelineRouter.isCurrent(token) {
+                _ = captureTimelineRouter.sealCurrentForRelease(
+                    atHostTime: AudioGetCurrentHostTime()
+                )
+            }
+        } else if let completion {
+            binding.registerRetirementCompletion(completion)
+        }
+        let retirementReady = binding.requestRetirement()
+        binding.cancelPendingActivationHandlers()
+        if retirementReady {
+            enqueueCaptureRoutingRetirement(binding)
         }
     }
 
-    private func fail(_ message: String, stage: String) {
+    private func scheduleCaptureRoutingRetirement(
+        _ binding: AudioCaptureRouteBinding?,
+        afterActivationOf successor: AudioCaptureRouteBinding
+    ) {
+        guard let binding else { return }
+        AudioCaptureSuccessorActivationPolicy.register(
+            successor: successor
+        ) { [weak self] _ in
+            self?.stateQueue.async { [weak self] in
+                self?.scheduleCaptureRoutingRetirement(binding)
+            }
+        }
+    }
+
+    private func retireUnpublishedCaptureBinding(
+        _ binding: AudioCaptureRouteBinding
+    ) {
+        scheduleCaptureRoutingRetirement(binding)
+    }
+
+    private func enqueueCaptureRoutingRetirement(
+        _ binding: AudioCaptureRouteBinding
+    ) {
+        audioProcessingQueue.async { [weak self] in
+            guard let self else { return }
+            self.stateQueue.async {
+                guard let token = self.captureRoutingToken(
+                    for: binding
+                ) else {
+                    for completion in binding
+                        .takeRetirementCompletions() {
+                        completion()
+                    }
+                    return
+                }
+                let provisionalCompletions = binding
+                    .takeRetirementCompletions()
+                if !provisionalCompletions.isEmpty {
+                    self.captureRoutingRetirementCompletions[
+                        token,
+                        default: []
+                    ].append(contentsOf: provisionalCompletions)
+                }
+                let retirement = self.captureTimelineRouter
+                    .requestRelease(
+                        token,
+                        atHostTime: AudioGetCurrentHostTime()
+                    )
+                if retirement.disposition == .unknown {
+                    VoiceRelayDiagnostics.flow(
+                        "audio_capture_routing_retirement_unknown",
+                        generation: self.activeGeneration,
+                        fields: ["routing_epoch": String(token.epoch)]
+                    )
+                }
+                for retiredToken in retirement.retiredTokens {
+                    self.captureTimingTracker.retire(retiredToken)
+                }
+                self.processRoutedCaptureBuffers(
+                    retirement.readyBuffers
+                )
+                let completedTokens = retirement.disposition == .unknown
+                    ? [token]
+                    : retirement.retiredTokens
+                self.completeCaptureRoutingRetirements(completedTokens)
+            }
+        }
+    }
+
+    private func completeCaptureRoutingRetirements(
+        _ retiredTokens: [AudioCaptureRoutingToken]
+    ) {
+        for retiredToken in retiredTokens {
+            let completions = captureRoutingRetirementCompletions
+                .removeValue(forKey: retiredToken) ?? []
+            for completion in completions {
+                completion()
+            }
+        }
+    }
+
+    private func fail(
+        _ message: String,
+        stage: String,
+        failurePlan: AudioCaptureStartupFailurePlan = .teardown
+    ) {
         guard let generation = activeGeneration else { return }
         let established = listeningReadyReported
+        if failurePlan.rearmWakeAnalyzer,
+           let rearmBoundary =
+                wakeAudioHandoffJournal
+                    .rollbackCommittedHandoffForRearm() {
+            wakeAudioRearmBoundaryFrame = rearmBoundary
+        }
         let safeMessage = VoiceRelayDiagnostics.safe(message)
         Self.logger.error(
             "Realtime transport failed stage=\(stage, privacy: .public) generation=\(generation) established=\(established) message=\(safeMessage, privacy: .public)"
@@ -3338,10 +4581,15 @@ final class NativeRealtimeAudioTransport: NSObject, WakeAudioBufferSource {
         stopCurrent(
             emitClosed: false,
             reason: "failure_\(stage)",
-            preserveCaptureForWake: false
+            preserveCaptureForWake: failurePlan.preserveCaptureForWake,
+            preserveHandoffJournal: failurePlan.preserveHandoffJournal
         )
         emitOnMain {
-            self.onError?(generation, message)
+            self.onError?(
+                generation,
+                message,
+                failurePlan
+            )
         }
     }
 

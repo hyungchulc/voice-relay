@@ -145,6 +145,9 @@ COMMAND=(
   --repo
   "$REPOSITORY"
 )
+if [[ "$RELEASE_KIND" == "preview" ]]; then
+  COMMAND+=(--prerelease)
+fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '%q ' "${COMMAND[@]}"

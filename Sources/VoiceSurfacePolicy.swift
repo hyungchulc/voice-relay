@@ -951,6 +951,288 @@ enum ExternalMediaTurnBoundaryPolicy {
     }
 }
 
+enum RealtimePlaybackLeaseTerminalReason: String, Equatable {
+    case callback
+    case watchdog
+    case interrupted
+    case cancelled
+    case transportFailure = "transport_failure"
+}
+
+struct RealtimePlaybackLeaseTicket: Equatable, Hashable {
+    let generation: Int
+    let playbackEpoch: Int
+    let ticketID: UInt64
+    let responseID: String
+    let frameCount: Int
+    let expectedEnd: TimeInterval
+    let hardDeadline: TimeInterval
+}
+
+struct RealtimePlaybackLeaseTerminalization: Equatable {
+    let generation: Int
+    let responseID: String
+    let reason: RealtimePlaybackLeaseTerminalReason
+    let releasedBufferCount: Int
+    let releasedFrameCount: Int
+}
+
+enum RealtimePlaybackLeaseReconciliation: Equatable {
+    case pending
+    case rearm(deadline: TimeInterval)
+    case completed(RealtimePlaybackLeaseTerminalization?)
+    case ignored
+
+    var terminalization: RealtimePlaybackLeaseTerminalization? {
+        guard case let .completed(terminalization) = self else {
+            return nil
+        }
+        return terminalization
+    }
+
+    var consumedTicket: Bool {
+        if case .completed = self {
+            return true
+        }
+        return false
+    }
+}
+
+struct RealtimePlaybackLeaseReconciler {
+    static let sampleRate = 24_000.0
+    static let watchdogGrace: TimeInterval = 0.35
+    static let watchdogHardGrace: TimeInterval = 2.0
+    static let pausedPollInterval: TimeInterval = 0.25
+
+    private struct ResponseLease {
+        var tickets: [UInt64: RealtimePlaybackLeaseTicket] = [:]
+        var serverCompleted = false
+        var usedWatchdog = false
+    }
+
+    private(set) var generation = 0
+    private(set) var playbackEpoch = 0
+    private(set) var pendingBufferCount = 0
+    private(set) var queuedFrameCount = 0
+    private var nextTicketID: UInt64 = 0
+    private var estimatedPlayerQueueTail: TimeInterval = 0
+    private var leasesByResponseID: [String: ResponseLease] = [:]
+    private var responseIDByTicketID: [UInt64: String] = [:]
+    private var terminalizedResponseIDs = Set<String>()
+
+    mutating func reset(generation: Int, playbackEpoch: Int) {
+        self.generation = generation
+        self.playbackEpoch = playbackEpoch
+        pendingBufferCount = 0
+        queuedFrameCount = 0
+        nextTicketID = 0
+        estimatedPlayerQueueTail = 0
+        leasesByResponseID.removeAll()
+        responseIDByTicketID.removeAll()
+        terminalizedResponseIDs.removeAll()
+    }
+
+    mutating func admit(
+        generation: Int,
+        playbackEpoch: Int,
+        responseID: String,
+        frameCount: Int,
+        now: TimeInterval
+    ) -> RealtimePlaybackLeaseTicket? {
+        let normalizedResponseID = responseID.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard generation == self.generation,
+              playbackEpoch == self.playbackEpoch,
+              !normalizedResponseID.isEmpty,
+              frameCount > 0,
+              !terminalizedResponseIDs.contains(normalizedResponseID) else {
+            return nil
+        }
+        nextTicketID &+= 1
+        let scheduledStart = max(now, estimatedPlayerQueueTail)
+        let expectedEnd = scheduledStart
+            + TimeInterval(frameCount) / Self.sampleRate
+        estimatedPlayerQueueTail = expectedEnd
+        let ticket = RealtimePlaybackLeaseTicket(
+            generation: generation,
+            playbackEpoch: playbackEpoch,
+            ticketID: nextTicketID,
+            responseID: normalizedResponseID,
+            frameCount: frameCount,
+            expectedEnd: expectedEnd + Self.watchdogGrace,
+            hardDeadline: expectedEnd + Self.watchdogHardGrace
+        )
+        var lease = leasesByResponseID[normalizedResponseID]
+            ?? ResponseLease()
+        lease.tickets[ticket.ticketID] = ticket
+        leasesByResponseID[normalizedResponseID] = lease
+        responseIDByTicketID[ticket.ticketID] = normalizedResponseID
+        pendingBufferCount += 1
+        queuedFrameCount += frameCount
+        return ticket
+    }
+
+    mutating func markResponseCompleted(
+        generation: Int,
+        responseID: String
+    ) -> RealtimePlaybackLeaseTerminalization? {
+        guard generation == self.generation,
+              !terminalizedResponseIDs.contains(responseID),
+              var lease = leasesByResponseID[responseID] else {
+            return nil
+        }
+        lease.serverCompleted = true
+        leasesByResponseID[responseID] = lease
+        guard lease.tickets.isEmpty else { return nil }
+        return terminalizeResponse(
+            responseID: responseID,
+            reason: lease.usedWatchdog ? .watchdog : .callback
+        )
+    }
+
+    mutating func complete(
+        _ ticket: RealtimePlaybackLeaseTicket,
+        reason: RealtimePlaybackLeaseTerminalReason
+    ) -> RealtimePlaybackLeaseTerminalization? {
+        completeResult(ticket, reason: reason).terminalization
+    }
+
+    mutating func completeResult(
+        _ ticket: RealtimePlaybackLeaseTicket,
+        reason: RealtimePlaybackLeaseTerminalReason
+    ) -> RealtimePlaybackLeaseReconciliation {
+        guard owns(ticket),
+              var lease = leasesByResponseID[ticket.responseID],
+              lease.tickets.removeValue(forKey: ticket.ticketID) != nil else {
+            return .ignored
+        }
+        responseIDByTicketID.removeValue(forKey: ticket.ticketID)
+        pendingBufferCount = max(0, pendingBufferCount - 1)
+        queuedFrameCount = max(0, queuedFrameCount - ticket.frameCount)
+        if reason == .watchdog {
+            lease.usedWatchdog = true
+        }
+        leasesByResponseID[ticket.responseID] = lease
+        guard lease.serverCompleted, lease.tickets.isEmpty else {
+            return .completed(nil)
+        }
+        return .completed(
+            terminalizeResponse(
+                responseID: ticket.responseID,
+                reason: lease.usedWatchdog ? .watchdog : reason
+            )
+        )
+    }
+
+    mutating func reconcile(
+        _ ticket: RealtimePlaybackLeaseTicket,
+        now: TimeInterval,
+        playerIsPlaying: Bool,
+        renderedThroughTicket: Bool,
+        intentionallyPaused: Bool
+    ) -> RealtimePlaybackLeaseReconciliation {
+        guard owns(ticket),
+              let currentTicket = leasesByResponseID[ticket.responseID]?
+                .tickets[ticket.ticketID] else {
+            return .ignored
+        }
+        guard now >= currentTicket.expectedEnd else { return .pending }
+        if intentionallyPaused {
+            let extensionDuration = max(
+                Self.pausedPollInterval,
+                now - currentTicket.expectedEnd + Self.pausedPollInterval
+            )
+            guard shiftTicketDeadlines(
+                currentTicket,
+                by: extensionDuration
+            ) != nil else {
+                return .ignored
+            }
+            return .rearm(deadline: now + Self.pausedPollInterval)
+        }
+        guard !playerIsPlaying
+                || renderedThroughTicket
+                || now >= currentTicket.hardDeadline else {
+            return .rearm(deadline: currentTicket.hardDeadline)
+        }
+        return completeResult(currentTicket, reason: .watchdog)
+    }
+
+    mutating func cancelAll(
+        generation: Int,
+        playbackEpoch: Int,
+        reason: RealtimePlaybackLeaseTerminalReason
+    ) -> [RealtimePlaybackLeaseTerminalization] {
+        guard generation == self.generation,
+              playbackEpoch == self.playbackEpoch else {
+            return []
+        }
+        return leasesByResponseID.keys.sorted().compactMap { responseID in
+            terminalizeResponse(responseID: responseID, reason: reason)
+        }
+    }
+
+    private func owns(_ ticket: RealtimePlaybackLeaseTicket) -> Bool {
+        ticket.generation == generation
+            && ticket.playbackEpoch == playbackEpoch
+            && responseIDByTicketID[ticket.ticketID] == ticket.responseID
+            && !terminalizedResponseIDs.contains(ticket.responseID)
+    }
+
+    @discardableResult
+    private mutating func shiftTicketDeadlines(
+        _ ticket: RealtimePlaybackLeaseTicket,
+        by duration: TimeInterval
+    ) -> RealtimePlaybackLeaseTicket? {
+        guard var lease = leasesByResponseID[ticket.responseID],
+              lease.tickets[ticket.ticketID] == ticket else {
+            return nil
+        }
+        let shifted = RealtimePlaybackLeaseTicket(
+            generation: ticket.generation,
+            playbackEpoch: ticket.playbackEpoch,
+            ticketID: ticket.ticketID,
+            responseID: ticket.responseID,
+            frameCount: ticket.frameCount,
+            expectedEnd: ticket.expectedEnd + duration,
+            hardDeadline: ticket.hardDeadline + duration
+        )
+        lease.tickets[ticket.ticketID] = shifted
+        leasesByResponseID[ticket.responseID] = lease
+        return shifted
+    }
+
+    private mutating func terminalizeResponse(
+        responseID: String,
+        reason: RealtimePlaybackLeaseTerminalReason
+    ) -> RealtimePlaybackLeaseTerminalization? {
+        guard terminalizedResponseIDs.insert(responseID).inserted,
+              let lease = leasesByResponseID.removeValue(forKey: responseID) else {
+            return nil
+        }
+        let releasedTickets = Array(lease.tickets.values)
+        for ticket in releasedTickets {
+            responseIDByTicketID.removeValue(forKey: ticket.ticketID)
+        }
+        let releasedFrames = releasedTickets.reduce(0) {
+            $0 + $1.frameCount
+        }
+        pendingBufferCount = max(
+            0,
+            pendingBufferCount - releasedTickets.count
+        )
+        queuedFrameCount = max(0, queuedFrameCount - releasedFrames)
+        return RealtimePlaybackLeaseTerminalization(
+            generation: generation,
+            responseID: responseID,
+            reason: reason,
+            releasedBufferCount: releasedTickets.count,
+            releasedFrameCount: releasedFrames
+        )
+    }
+}
+
 struct AssistantOutputLifecycle {
     private(set) var generation = 0
     private(set) var pendingNativeResponseIDs = Set<String>()
@@ -1052,6 +1334,57 @@ enum WakeMonitoringResumePolicy {
     }
 }
 
+struct CodexRequestLease: Equatable {
+    let generation: Int
+    let requestID: String
+    fileprivate let sequence: UInt64
+}
+
+struct CodexRequestLeaseState {
+    private(set) var active: CodexRequestLease?
+    private var nextSequence: UInt64 = 0
+
+    @discardableResult
+    mutating func begin(
+        generation: Int,
+        requestID: String
+    ) -> CodexRequestLease {
+        nextSequence &+= 1
+        let lease = CodexRequestLease(
+            generation: generation,
+            requestID: requestID,
+            sequence: nextSequence
+        )
+        active = lease
+        return lease
+    }
+
+    func matches(_ lease: CodexRequestLease) -> Bool {
+        active == lease
+    }
+
+    @discardableResult
+    mutating func cancel(
+        generation: Int,
+        requestID: String
+    ) -> CodexRequestLease? {
+        guard let active,
+              active.generation == generation,
+              active.requestID == requestID else {
+            return nil
+        }
+        self.active = nil
+        return active
+    }
+
+    @discardableResult
+    mutating func complete(_ lease: CodexRequestLease) -> Bool {
+        guard matches(lease) else { return false }
+        active = nil
+        return true
+    }
+}
+
 struct ExpandedVoiceControlsState: Equatable {
     let transportEnabled: Bool
     let transportSymbolName: String
@@ -1104,7 +1437,9 @@ enum MicrophoneInputControlPolicy {
 
 struct CodexProfileSelectionResolution: Equatable {
     let resolvedModelID: String
-    let fastModeEnabled: Bool
+    let serviceTierSelection: CodexServiceTierSelection
+    let inheritedServiceTierIsPriority: Bool
+    let isServiceTierResolved: Bool
     let isModelSupported: Bool
     let isReasoningEffortSupported: Bool
     let isFastModeSupported: Bool
@@ -1112,11 +1447,22 @@ struct CodexProfileSelectionResolution: Equatable {
     var isSupported: Bool {
         isModelSupported
             && isReasoningEffortSupported
+            && isServiceTierResolved
             && isFastModeSupported
     }
 
     var serviceTier: String? {
-        fastModeEnabled && isFastModeSupported ? "priority" : nil
+        isServiceTierResolved
+            && isFastModeSupported
+            && (
+                serviceTierSelection == .priority
+                    || (
+                        serviceTierSelection == .inherit
+                            && inheritedServiceTierIsPriority
+                    )
+            )
+            ? "priority"
+            : nil
     }
 }
 
@@ -1124,8 +1470,9 @@ enum CodexProfileSelectionPolicy {
     static func resolve(
         model: String,
         reasoningEffort: String,
-        fastMode: Bool,
+        serviceTierSelection: CodexServiceTierSelection,
         effectiveModel: String,
+        effectiveServiceTier: String,
         capabilities: [CodexModelCapability]
     ) -> CodexProfileSelectionResolution {
         let requestedModel = model.trimmingCharacters(
@@ -1140,11 +1487,31 @@ enum CodexProfileSelectionPolicy {
             || capability?.supportedReasoningEfforts.contains(
                 reasoningEffort
             ) == true
-        let isFastModeSupported = !fastMode
+        let normalizedEffectiveServiceTier = effectiveServiceTier
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let inheritedServiceTierIsPriority =
+            normalizedEffectiveServiceTier == "priority"
+        let isInheritedServiceTierKnown = [
+            "default",
+            "priority",
+            "standard",
+        ].contains(normalizedEffectiveServiceTier)
+        let isServiceTierResolved = serviceTierSelection != .inherit
+            || isInheritedServiceTierKnown
+        let requiresPriorityCapability = serviceTierSelection == .priority
+            || (
+                serviceTierSelection == .inherit
+                    && inheritedServiceTierIsPriority
+            )
+        let isFastModeSupported = !requiresPriorityCapability
             || capability?.serviceTierIDs.contains("priority") == true
         return CodexProfileSelectionResolution(
             resolvedModelID: resolvedModelID,
-            fastModeEnabled: fastMode,
+            serviceTierSelection: serviceTierSelection,
+            inheritedServiceTierIsPriority:
+                inheritedServiceTierIsPriority,
+            isServiceTierResolved: isServiceTierResolved,
             isModelSupported: isModelSupported,
             isReasoningEffortSupported: isReasoningEffortSupported,
             isFastModeSupported: isFastModeSupported
@@ -1161,7 +1528,8 @@ enum SettingsSaveImpactPolicy {
         normalizedPrevious.codexModel = updated.codexModel
         normalizedPrevious.codexReasoningEffort =
             updated.codexReasoningEffort
-        normalizedPrevious.codexFastMode = updated.codexFastMode
+        normalizedPrevious.codexServiceTierSelection =
+            updated.codexServiceTierSelection
         return normalizedPrevious != updated
     }
 }
@@ -1278,11 +1646,182 @@ struct WakePhraseMatch: Equatable {
     let command: String
 }
 
+struct RecognitionLocaleEvidence: Equatable {
+    let laneIndex: Int
+    let localeIdentifier: String
+    let confidence: Float?
+    let isFinal: Bool
+}
+
+enum SpokenLocaleSelectionReason: String, Equatable {
+    case explicitUserOverride = "explicit_user_override"
+    case reliableLaneEvidence = "reliable_lane_evidence"
+    case activationWakeLocale = "activation_wake_locale"
+    case configuredPrimary = "configured_primary"
+    case clarificationRequired = "clarification_required"
+}
+
+struct SpokenLocaleSelectionDecision: Equatable {
+    let localeIdentifier: String?
+    let reason: SpokenLocaleSelectionReason
+    let laneIndex: Int?
+    let confidence: Float?
+    let isFinal: Bool?
+}
+
+enum SpokenLocaleSelectionPolicy {
+    static let reliableConfidenceThreshold: Float = 0.55
+
+    static func resolve(
+        explicitOverrideIdentifier: String?,
+        laneEvidence: [RecognitionLocaleEvidence],
+        activationWakeLocaleIdentifier: String,
+        configuredPrimaryLocaleIdentifier: String,
+        configuredSupportedLocaleIdentifiers: [String]
+    ) -> SpokenLocaleSelectionDecision {
+        let supported = normalizedUnique(
+            configuredSupportedLocaleIdentifiers
+        )
+        if let explicit = configuredMatch(
+            explicitOverrideIdentifier,
+            in: supported
+        ) {
+            return SpokenLocaleSelectionDecision(
+                localeIdentifier: explicit,
+                reason: .explicitUserOverride,
+                laneIndex: nil,
+                confidence: nil,
+                isFinal: nil
+            )
+        }
+
+        let reliable = laneEvidence.compactMap { evidence -> (
+            evidence: RecognitionLocaleEvidence,
+            locale: String
+        )? in
+            guard evidence.isFinal,
+                  let confidence = evidence.confidence,
+                  confidence.isFinite,
+                  confidence >= reliableConfidenceThreshold,
+                  let locale = configuredMatch(
+                    evidence.localeIdentifier,
+                    in: supported
+                  ) else {
+                return nil
+            }
+            return (evidence, locale)
+        }.sorted {
+            let left = $0.evidence.confidence ?? 0
+            let right = $1.evidence.confidence ?? 0
+            if left != right { return left > right }
+            return $0.evidence.laneIndex < $1.evidence.laneIndex
+        }.first
+        if let reliable {
+            return SpokenLocaleSelectionDecision(
+                localeIdentifier: reliable.locale,
+                reason: .reliableLaneEvidence,
+                laneIndex: reliable.evidence.laneIndex,
+                confidence: reliable.evidence.confidence,
+                isFinal: reliable.evidence.isFinal
+            )
+        }
+
+        if let wake = configuredMatch(
+            activationWakeLocaleIdentifier,
+            in: supported
+        ) {
+            return SpokenLocaleSelectionDecision(
+                localeIdentifier: wake,
+                reason: .activationWakeLocale,
+                laneIndex: nil,
+                confidence: nil,
+                isFinal: nil
+            )
+        }
+        if let primary = configuredMatch(
+            configuredPrimaryLocaleIdentifier,
+            in: supported
+        ) {
+            return SpokenLocaleSelectionDecision(
+                localeIdentifier: primary,
+                reason: .configuredPrimary,
+                laneIndex: nil,
+                confidence: nil,
+                isFinal: nil
+            )
+        }
+        return SpokenLocaleSelectionDecision(
+            localeIdentifier: nil,
+            reason: .clarificationRequired,
+            laneIndex: nil,
+            confidence: nil,
+            isFinal: nil
+        )
+    }
+
+    private static func normalizedUnique(_ values: [String]) -> [String] {
+        var result: [String] = []
+        for value in values {
+            let normalized = value
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "_", with: "-")
+            guard !normalized.isEmpty,
+                  !result.contains(where: {
+                    $0.caseInsensitiveCompare(normalized) == .orderedSame
+                  }) else {
+                continue
+            }
+            result.append(normalized)
+        }
+        return result
+    }
+
+    private static func configuredMatch(
+        _ candidate: String?,
+        in supported: [String]
+    ) -> String? {
+        let normalized = (candidate ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "_", with: "-")
+        guard !normalized.isEmpty else { return nil }
+        if let exact = supported.first(where: {
+            $0.caseInsensitiveCompare(normalized) == .orderedSame
+        }) {
+            return exact
+        }
+        guard let candidateBase = localeLanguageBase(normalized) else {
+            return nil
+        }
+        return supported.first(where: {
+            localeLanguageBase($0) == candidateBase
+        })
+    }
+
+    private static func localeLanguageBase(_ identifier: String) -> String? {
+        let normalized = identifier
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "_", with: "-")
+        guard let base = normalized.split(separator: "-", maxSplits: 1)
+            .first,
+              base.count >= 2,
+              base.count <= 8,
+              base.allSatisfy({ $0.isASCII && $0.isLetter }) else {
+            return nil
+        }
+        return base.lowercased()
+    }
+}
+
 struct WakeActivationContext: Equatable {
     let activationID: String
     let commandText: String
     let recognizedUtteranceText: String
     let wakeLocaleIdentifier: String
+    let spokenLocaleIdentifier: String
+    let spokenLocaleSelectionReason: SpokenLocaleSelectionReason
+    let spokenLocaleLaneIndex: Int?
+    let spokenLocaleConfidence: Float?
+    let spokenLocaleIsFinal: Bool?
     let handoffTicketID: String?
 }
 
@@ -1924,6 +2463,15 @@ struct WakeAudioHandoffJournal {
             return
         }
         beginWake()
+    }
+
+    mutating func rollbackCommittedHandoffForRearm() -> Int64? {
+        guard let ticket else { return nil }
+        let boundary = ticket.recognizedThroughFrame
+        self.ticket = nil
+        claimedGeneration = nil
+        truncated = false
+        return boundary
     }
 
     mutating func cancel(ticketID: String? = nil) {

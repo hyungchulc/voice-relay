@@ -177,6 +177,8 @@ assert.deepEqual(
   Array.from(responseCreates().at(-1).response.tools[0].parameters.required),
   [
     "kind",
+    "confidence",
+    "utterance_completeness",
     "social_origin",
     "spoken_language",
     "spoken_register",
@@ -184,6 +186,19 @@ assert.deepEqual(
     "progress_summary",
   ],
   "the route tool must require semantic stop-target, social-origin, language, register, and bounded progress-summary classification",
+);
+assert.ok(
+  responseCreates().at(-1).response.tools[0]
+    .parameters.properties.kind.enum.includes("cancel_current_answer"),
+  "ordinary routing must expose current-answer cancellation separately from session stop",
+);
+assert.deepEqual(
+  Array.from(
+    responseCreates().at(-1).response.tools[0]
+      .parameters.properties.utterance_completeness.enum,
+  ),
+  ["complete", "incomplete", "uncertain"],
+  "ordinary routing must classify semantic completeness without a phrase or language table",
 );
 assert.equal(
   responseCreates().at(-1).response.tools[0]
@@ -205,7 +220,8 @@ assert.deepEqual(
       .parameters.properties.stop_target.enum,
   ),
   [
-    "current_voice_or_codex_work",
+    "current_answer_or_codex_work",
+    "voice_relay_session",
     "external_or_other_object",
     "not_applicable",
     "ambiguous",
@@ -276,6 +292,8 @@ receive({
   call_id: "route-call-1",
   arguments: JSON.stringify({
     kind: "codex",
+    confidence: "high",
+    utterance_completeness: "complete",
     social_origin: "not_applicable",
     spoken_language: "ko",
     spoken_register: "casual",
@@ -297,7 +315,7 @@ receive({
   type: "response.function_call_arguments.done",
   name: "route_voice_turn",
   call_id: "duplicate-route-call",
-  arguments: JSON.stringify({ kind: "codex" }),
+  arguments: JSON.stringify({ kind: "codex", confidence: "high", utterance_completeness: "complete" }),
 });
 assert.equal(
   nativeEvents("codexRequest").length,
@@ -588,6 +606,8 @@ runtime.receiveRealtimeEvent({
     call_id: "direct-call-2",
     arguments: JSON.stringify({
       kind: "direct_chat",
+      confidence: "high",
+      utterance_completeness: "complete",
       social_origin: "user_reply",
       spoken_language: "ko-KR",
       spoken_register: "casual",
@@ -767,7 +787,7 @@ runtime.receiveRealtimeEvent({
     type: "response.function_call_arguments.done",
     name: "route_voice_turn",
     call_id: "route-echo-call-4",
-    arguments: JSON.stringify({ kind: "direct_chat" }),
+    arguments: JSON.stringify({ kind: "direct_chat", confidence: "high", utterance_completeness: "complete" }),
   },
 });
 runtime.receiveRealtimeEvent({
@@ -922,7 +942,7 @@ runtime.receiveRealtimeEvent({
     type: "response.function_call_arguments.done",
     name: "route_voice_turn",
     call_id: "route-response-done-echo-call-5",
-    arguments: JSON.stringify({ kind: "direct_chat" }),
+    arguments: JSON.stringify({ kind: "direct_chat", confidence: "high", utterance_completeness: "complete" }),
   },
 });
 runtime.receiveRealtimeEvent({
@@ -1038,6 +1058,8 @@ runtime.receiveRealtimeEvent({
     call_id: "route-handoff-call-5",
     arguments: JSON.stringify({
       kind: "codex",
+      confidence: "high",
+      utterance_completeness: "complete",
       social_origin: "not_applicable",
       spoken_language: "es-MX",
       spoken_register: "polite",
@@ -1253,6 +1275,8 @@ runtime.receiveRealtimeEvent({
     call_id: "wake-command-call-73",
     arguments: JSON.stringify({
       kind: "direct_chat",
+      confidence: "high",
+      utterance_completeness: "complete",
       social_origin: "user_originated",
       spoken_language: "ko-KR",
       spoken_register: "casual",
@@ -1293,16 +1317,19 @@ const koreanWakeEvents = nativeMessages
   .slice(koreanWakePriorityStart)
   .filter(message => message.type === "realtimeSend")
   .map(message => JSON.parse(message.eventJSON));
+const koreanWakeTranscription = koreanWakeEvents.find(event =>
+  event.type === "session.update"
+)?.session?.audio?.input?.transcription;
 assert.equal(
-  JSON.stringify(
-    Array.from(
-      koreanWakeEvents.find(event =>
-        event.type === "session.update"
-      )?.session?.audio?.input?.transcription?.languages || [],
-    ),
-  ),
-  JSON.stringify(["en", "ko"]),
-  "wake language evidence must not rewrite the settings-derived ASR language order",
+  koreanWakeTranscription?.model,
+  "gpt-4o-transcribe",
+  "wake language evidence must keep the documented transcription model",
+);
+assert.equal(
+  Object.hasOwn(koreanWakeTranscription || {}, "language")
+    || Object.hasOwn(koreanWakeTranscription || {}, "languages"),
+  false,
+  "wake language evidence must remain app-side and leave non-forced ASR in auto-detect mode",
 );
 assert.match(
   koreanWakeEvents.find(event =>
@@ -1475,13 +1502,94 @@ assert.ok(
 );
 assert.match(
   presenceReturnGreeting.response.instructions,
-  /just returned after being away/,
-  "presence return must use the return-specific semantic prompt",
+  /heuristic return signal/,
+  "presence return must describe only the observed heuristic signal",
+);
+assert.doesNotMatch(
+  presenceReturnGreeting.response.instructions,
+  /confirmed physical presence/,
+  "presence return must not claim confirmed physical presence",
 );
 assert.match(
   presenceReturnGreeting.response.instructions,
   /fresh wording freely instead of using a fixed stock phrase/,
   "presence greeting wording must not be fixed",
+);
+
+const connectorBriefingStart = nativeMessages.length;
+runtime.start({
+  generation: 77,
+  language: "en-US",
+  additionalLanguages: [],
+  productName: "Voice Relay",
+  assistantName: "Relay",
+  wakePhrases: ["Relay"],
+  shouldGreet: false,
+  activationReason: "connector_event",
+  eventBriefing: {
+    eventId: "daily-brief-2026-08-03",
+    trigger: "morning",
+    speech: "Daily brief. Team review at 10:00.",
+  },
+});
+runtime.transportOpened({ generation: 77 });
+runtime.transportReady({ generation: 77 });
+const connectorBriefingMessages = nativeMessages.slice(connectorBriefingStart);
+const connectorBriefing = connectorBriefingMessages
+  .filter(message => message.type === "realtimeSend")
+  .map(message => JSON.parse(message.eventJSON))
+  .find(event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind
+      === "connector_event_briefing"
+  );
+assert.ok(
+  connectorBriefing,
+  "a prepared connector event must create one direct Realtime briefing",
+);
+assert.equal(
+  connectorBriefing.response.tool_choice,
+  "none",
+  "event-only connector briefings must never enter Codex task routing",
+);
+assert.match(
+  connectorBriefing.response.instructions,
+  /Daily brief\. Team review at 10:00\./,
+  "the direct briefing must use only host-prepared connector text",
+);
+assert.equal(
+  connectorBriefingMessages.filter(message => message.type === "codexRequest").length,
+  0,
+  "event-only connector briefings must not rotate or dispatch a Codex task",
+);
+runtime.receiveRealtimeEvent({
+  generation: 77,
+  event: {
+    type: "response.created",
+    response: {
+      id: "connector-response-77",
+      metadata: { voice_relay_kind: "connector_event_briefing" },
+    },
+  },
+});
+runtime.receiveRealtimeEvent({
+  generation: 77,
+  event: {
+    type: "response.output_audio_transcript.done",
+    response_id: "connector-response-77",
+    transcript: "Daily brief. Team review at 10:00.",
+  },
+});
+const connectorFinal = nativeMessages
+  .slice(connectorBriefingStart)
+  .find(message =>
+    message.type === "assistantFinal"
+    && message.responseId === "connector-response-77"
+  );
+assert.equal(
+  connectorFinal?.kind,
+  "connector_event_briefing",
+  "automatic connector finals must carry their exact response kind for host correlation",
 );
 
 const unidentifiedWakeBargeInStart = nativeMessages.length;
@@ -1650,7 +1758,7 @@ runtime.receiveRealtimeEvent({
     type: "response.function_call_arguments.done",
     name: "route_voice_turn",
     call_id: "weather-route-call-1",
-    arguments: JSON.stringify({ kind: "codex" }),
+    arguments: JSON.stringify({ kind: "codex", confidence: "high", utterance_completeness: "complete" }),
   },
 });
 runtime.receiveRealtimeEvent({
@@ -1838,7 +1946,7 @@ runtime.receiveRealtimeEvent({
     type: "response.function_call_arguments.done",
     name: "route_voice_turn",
     call_id: "post-final-call-1",
-    arguments: JSON.stringify({ kind: "codex" }),
+    arguments: JSON.stringify({ kind: "codex", confidence: "high", utterance_completeness: "complete" }),
   },
 });
 runtime.receiveRealtimeEvent({
@@ -1981,6 +2089,8 @@ runtime.receiveRealtimeEvent({
     call_id: "post-final-echo-call",
     arguments: JSON.stringify({
       kind: "direct_chat",
+      confidence: "high",
+      utterance_completeness: "complete",
       social_origin: "assistant_like_playback",
     }),
   },
@@ -2059,6 +2169,8 @@ runtime.receiveRealtimeEvent({
     call_id: "post-final-thanks-call",
     arguments: JSON.stringify({
       kind: "direct_chat",
+      confidence: "high",
+      utterance_completeness: "complete",
       social_origin: "user_reply",
       spoken_language: "en-US",
       spoken_register: "casual",
@@ -2179,7 +2291,9 @@ runtime.transportReady({ generation: 12 });
 const sourceRichOriginal =
   "오늘은 맑아. [예보 상세](https://weather.example/forecast)를 확인했어. " +
   "추가 원문은 https://weather.example/raw 이야.\n" +
-  "예상 범위는 18~27도고 ~~강조 표시~~도 자연스럽게 읽어.\n" +
+  "예상 범위는 18~27도, 30～40도, 50〜60도, 70–80도, 90—100도, 110-120도야. " +
+  "섭씨 -5--1도, 1.5-2.75 L, ١-٣ أيام도 범위고 ~~강조 표시~~도 자연스럽게 읽어.\n" +
+  "보호 토큰은 -12.5, 2026-08-03, v1.2.3, 1.2.3-1.2.4, 5 - 3, VR-204야.\n" +
   "#3 상태와 96개 테스트, VR-204, 짧은 커밋 a1b2c3d는 그대로 알려줘.\n" +
   '<a href="https://openai.example/report">OpenAI</a> 발표를 확인했어.\n' +
   "Task ID는 `019faf33-597f-73e3-b9b7-0486adc91dfc`야.\n" +
@@ -2218,6 +2332,36 @@ assert.match(
   /18 ~ 27도/,
   "speech projection must preserve numeric range semantics",
 );
+for (const expectedRange of [
+  "30 ~ 40도",
+  "50 ~ 60도",
+  "70 ~ 80도",
+  "90 ~ 100도",
+  "110 ~ 120도",
+  "-5 ~ -1도",
+  "1.5 ~ 2.75 L",
+  "١ ~ ٣ أيام",
+]) {
+  assert.match(
+    sourceRichAnswer,
+    new RegExp(expectedRange.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+    `speech projection must normalize the numeric range ${expectedRange}`,
+  );
+}
+for (const protectedNumericToken of [
+  "-12.5",
+  "2026-08-03",
+  "v1.2.3",
+  "1.2.3-1.2.4",
+  "5 - 3",
+  "VR-204",
+]) {
+  assert.match(
+    sourceRichAnswer,
+    new RegExp(protectedNumericToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+    `speech projection must protect ${protectedNumericToken} from range normalization`,
+  );
+}
 assert.doesNotMatch(
   sourceRichAnswer,
   /1827도/,
@@ -2254,13 +2398,18 @@ assert.equal(
 );
 assert.match(
   sourceRichSpeech?.response?.instructions || "",
-  /tilde appears between numbers/,
-  "final speech must explicitly preserve numeric range delivery",
+  /numeric range separator.*tilde.*hyphen.*en dash.*em dash/i,
+  "final speech must explicitly preserve every supported numeric range separator",
 );
 assert.match(
   sourceRichSpeech?.response?.instructions || "",
   /never concatenate the numbers/,
   "final speech must forbid joined numeric range endpoints",
+);
+assert.match(
+  sourceRichSpeech?.response?.instructions || "",
+  /Never speak JSON or object field names, schema labels, status labels or values, punctuation, or wrappers/i,
+  "final speech must forbid transport schema and status-label leakage",
 );
 runtime.receiveRealtimeEvent({
   generation: 12,
@@ -2372,6 +2521,8 @@ runtime.receiveRealtimeEvent({
     call_id: "pending-response-route-call-1",
     arguments: JSON.stringify({
       kind: "codex",
+      confidence: "high",
+      utterance_completeness: "complete",
       social_origin: "not_applicable",
       spoken_language: "en-US",
       spoken_register: "casual",
@@ -2490,8 +2641,8 @@ assert.equal(
 );
 assert.match(
   activeControlRequests[0].response.instructions,
-  /stop_session only when stop, cancel, or end targets this assistant's current voice or Codex work/,
-  "active control routing must scope session stops to the assistant's current work",
+  /cancel_current_answer only when stop or cancel targets the assistant's current answer or active Codex work.*stop_session only when the complete utterance explicitly targets the whole Voice Relay session/,
+  "active control routing must distinguish current-answer cancellation from a full session stop",
 );
 assert.match(
   activeControlRequests[0].response.instructions,
@@ -2521,6 +2672,7 @@ runtime.receiveRealtimeEvent({
     arguments: JSON.stringify({
       action: "stop_session",
       confidence: "high",
+      utterance_completeness: "complete",
       spoken_language: "en-US",
       spoken_register: "casual",
       stop_target: "external_or_other_object",
@@ -2642,6 +2794,8 @@ runtime.receiveRealtimeEvent({
     call_id: "text-control-route-call-14",
     arguments: JSON.stringify({
       kind: "codex",
+      confidence: "high",
+      utterance_completeness: "complete",
       social_origin: "not_applicable",
       spoken_language: "en-US",
       spoken_register: "casual",
@@ -2806,6 +2960,8 @@ runtime.receiveRealtimeEvent({
     call_id: "completed-final-call-15",
     arguments: JSON.stringify({
       kind: "codex",
+      confidence: "high",
+      utterance_completeness: "complete",
       social_origin: "not_applicable",
       spoken_language: "en-US",
       spoken_register: "casual",
@@ -3008,6 +3164,8 @@ runtime.receiveRealtimeEvent({
     call_id: "local-presence-call-16",
     arguments: JSON.stringify({
       kind: "local_presence",
+      confidence: "high",
+      utterance_completeness: "complete",
       social_origin: "not_applicable",
       spoken_language: "en-US",
       spoken_register: "casual",
@@ -3083,6 +3241,8 @@ function runInterruptedCommentaryCancelSettlementRegression(
       call_id: originalCallId,
       arguments: JSON.stringify({
         kind: "codex",
+        confidence: "high",
+        utterance_completeness: "complete",
         social_origin: "not_applicable",
         spoken_language: "en-US",
         spoken_register: "casual",
@@ -3336,6 +3496,8 @@ function runInterruptedCommentaryCancelSettlementRegression(
       call_id: `missing-terminal-replacement-call-${suffix}`,
       arguments: JSON.stringify({
         kind: "codex",
+        confidence: "high",
+        utterance_completeness: "complete",
         social_origin: "not_applicable",
         spoken_language: "en-US",
         spoken_register: "casual",
@@ -3426,6 +3588,8 @@ function runActiveStopTargetRegression(
       call_id: routeCallId,
       arguments: JSON.stringify({
         kind: "codex",
+        confidence: "high",
+        utterance_completeness: "complete",
         social_origin: "not_applicable",
         spoken_language: "ko-KR",
         spoken_register: "casual",
@@ -3492,6 +3656,7 @@ function runActiveStopTargetRegression(
       arguments: JSON.stringify({
         action,
         confidence: "high",
+        utterance_completeness: "complete",
         spoken_language: "ko-KR",
         spoken_register: "casual",
         stop_target: stopTarget,
@@ -3549,16 +3714,20 @@ for (const [generation, text] of [
   const messages = runActiveStopTargetRegression(
     generation,
     text,
-    "stop_session",
-    "current_voice_or_codex_work",
+    "cancel_current_answer",
+    "current_answer_or_codex_work",
   );
   assert.equal(
     messages.filter(message =>
-      message.type === "stopIntent"
-      && message.text === text
+      message.type === "cancelCurrentAnswer"
     ).length,
     1,
-    "a stop explicitly targeting current assistant output or work must stop the session",
+    "a stop explicitly targeting current assistant output or work must cancel the current answer",
+  );
+  assert.equal(
+    messages.filter(message => message.type === "stopIntent").length,
+    0,
+    "a verified current-answer cancel must leave the Voice Relay session active",
   );
   assert.equal(
     messages.filter(message => message.type === "codexSteer").length,
@@ -3610,9 +3779,9 @@ assert.equal(
 const visibleStopAckStart = nativeMessages.length;
 runActiveStopTargetRegression(
   28,
-  "지금 하던 거 전부 멈춰.",
+  "음성 릴레이 세션 전부 멈춰.",
   "stop_session",
-  "current_voice_or_codex_work",
+  "voice_relay_session",
 );
 runtime.receiveRealtimeEvent({
   generation: 28,
@@ -3703,9 +3872,9 @@ assert.equal(
 const reorderedStopAckStart = nativeMessages.length;
 runActiveStopTargetRegression(
   29,
-  "설명은 멈춰.",
+  "음성 릴레이 세션을 멈춰.",
   "stop_session",
-  "current_voice_or_codex_work",
+  "voice_relay_session",
 );
 runtime.receiveRealtimeEvent({
   generation: 29,
@@ -3750,9 +3919,9 @@ assert.ok(
 const emptyStopAckStart = nativeMessages.length;
 runActiveStopTargetRegression(
   30,
-  "지금 하던 거 전부 멈춰.",
+  "음성 릴레이 세션을 전부 멈춰.",
   "stop_session",
-  "current_voice_or_codex_work",
+  "voice_relay_session",
 );
 runtime.receiveRealtimeEvent({
   generation: 30,
@@ -3826,6 +3995,8 @@ runtime.receiveRealtimeEvent({
     call_id: completionRouteCallId,
     arguments: JSON.stringify({
       kind: "codex",
+      confidence: "high",
+      utterance_completeness: "complete",
       social_origin: "not_applicable",
       spoken_language: "ko-KR",
       spoken_register: "casual",
@@ -3897,6 +4068,7 @@ runtime.receiveRealtimeEvent({
     arguments: JSON.stringify({
       action: "steer_active_codex",
       confidence: "high",
+      utterance_completeness: "complete",
       spoken_language: "ko-KR",
       spoken_register: "casual",
       stop_target: "not_applicable",
@@ -4055,6 +4227,8 @@ function beginDeferredFinalRace(generation) {
       call_id: callId,
       arguments: JSON.stringify({
         kind: "codex",
+        confidence: "high",
+        utterance_completeness: "complete",
         social_origin: "not_applicable",
         spoken_language: "en-US",
         spoken_register: "casual",
@@ -4520,6 +4694,8 @@ function beginContractCodex(
     call_id: callID,
     arguments: JSON.stringify({
       kind: "codex",
+      confidence: "high",
+      utterance_completeness: "complete",
       social_origin: "not_applicable",
       spoken_language: spokenLanguage,
       spoken_register: spokenRegister,
@@ -4588,7 +4764,11 @@ function routeContractControl(harness, text, args) {
   harness.receive({
     type: "response.function_call_arguments.done",
     name: "route_active_codex_turn",
-    arguments: JSON.stringify(args),
+    arguments: JSON.stringify({
+      confidence: "high",
+      utterance_completeness: "complete",
+      ...args,
+    }),
   });
   harness.receive({
     type: "response.done",
@@ -4662,20 +4842,139 @@ const primaryOnlyTranscription =
   primaryOnlyLanguageHarness.outbound()
     .find(event => event.type === "session.update")
     ?.session?.audio?.input?.transcription;
-assert.deepEqual(
-  Array.from(primaryOnlyTranscription?.languages || []),
-  ["ko"],
-  "one primary configured language must provide its normalized ASR base list",
-);
 assert.equal(
   primaryOnlyTranscription?.model,
-  "gpt-live-transcribe",
-  "configured language hints must use the supported multilingual transcription model",
+  "gpt-4o-transcribe",
+  "Realtime input transcription must use a currently documented transcription model",
 );
 assert.equal(
   Object.hasOwn(primaryOnlyTranscription || {}, "language"),
   false,
-  "gpt-live-transcribe must never receive a singular language field",
+  "system-derived primary language must leave Realtime transcription in multilingual auto-detect mode",
+);
+assert.equal(
+  Object.hasOwn(primaryOnlyTranscription || {}, "languages"),
+  false,
+  "Realtime transcription must never serialize the undocumented plural languages field",
+);
+
+const explicitlyForcedLanguageHarness = makeContractHarness({
+  generation: 111,
+  language: "ko-KR",
+  additionalLanguages: ["en-US"],
+  startOverrides: { languageExplicitlyForced: true },
+});
+const explicitlyForcedTranscription =
+  explicitlyForcedLanguageHarness.outbound()
+    .find(event => event.type === "session.update")
+    ?.session?.audio?.input?.transcription;
+assert.equal(
+  explicitlyForcedTranscription?.language,
+  "ko",
+  "an explicit user language override must serialize one ISO-639-1 language hint",
+);
+assert.equal(
+  Object.hasOwn(explicitlyForcedTranscription || {}, "languages"),
+  false,
+  "an explicit language override must still avoid the undocumented plural field",
+);
+const explicitSelectionDiagnostic =
+  explicitlyForcedLanguageHarness.native("diagnostic").find(message =>
+    message.stage === "route_language_selected"
+  );
+assert.deepEqual(
+  {
+    locale: explicitSelectionDiagnostic?.locale,
+    reason: explicitSelectionDiagnostic?.selectionReason,
+  },
+  { locale: "ko-KR", reason: "explicit_user_override" },
+  "an explicit override must remain the selected spoken locale with bounded diagnostics",
+);
+
+const reliableLaneLanguageHarness = makeContractHarness({
+  generation: 113,
+  language: "en-US",
+  additionalLanguages: ["sv-SE", "ko-KR"],
+  startOverrides: {
+    wakeLocale: "ko-KR",
+    spokenLocale: "sv-SE",
+    spokenLocaleSelectionReason: "reliable_lane_evidence",
+    spokenLocaleLane: 1,
+    spokenLocaleConfidence: 0.82,
+    spokenLocaleFinal: true,
+  },
+});
+const reliableLaneDiagnostic =
+  reliableLaneLanguageHarness.native("diagnostic").find(message =>
+    message.stage === "route_language_selected"
+  );
+assert.deepEqual(
+  {
+    locale: reliableLaneDiagnostic?.locale,
+    reason: reliableLaneDiagnostic?.selectionReason,
+    lane: reliableLaneDiagnostic?.lane,
+    confidence: reliableLaneDiagnostic?.confidence,
+    final: reliableLaneDiagnostic?.final,
+  },
+  {
+    locale: "sv-SE",
+    reason: "reliable_lane_evidence",
+    lane: "1",
+    confidence: "0.82",
+    final: "true",
+  },
+  "finalized confident same-audio lane evidence must outrank wake and primary fallbacks",
+);
+assert.equal(
+  Object.hasOwn(reliableLaneDiagnostic || {}, "text")
+    || Object.hasOwn(reliableLaneDiagnostic || {}, "userText")
+    || Object.hasOwn(reliableLaneDiagnostic || {}, "assistantText"),
+  false,
+  "locale selection diagnostics must never carry transcript text",
+);
+routeOrdinaryContractTurn(reliableLaneLanguageHarness, {
+  itemID: "reliable-lane-fallback-user",
+  transcript: "Please check this.",
+  callID: "reliable-lane-fallback-call",
+});
+assert.match(
+  reliableLaneLanguageHarness.outbound().findLast(event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind === "codex_progress"
+  )?.response?.instructions || "",
+  /BCP 47 tag: "sv-SE"/,
+  "an omitted route classifier language must fall back to reliable lane evidence before wake and primary",
+);
+
+const reliableBaseLaneLanguageHarness = makeContractHarness({
+  generation: 114,
+  language: "en-US",
+  additionalLanguages: ["sv-SE", "ko-KR"],
+  startOverrides: {
+    wakeLocale: "ko-KR",
+    spokenLocale: "sv",
+    spokenLocaleSelectionReason: "reliable_lane_evidence",
+    spokenLocaleLane: 2,
+    spokenLocaleConfidence: 0.91,
+    spokenLocaleFinal: true,
+  },
+});
+const reliableBaseLaneDiagnostic =
+  reliableBaseLaneLanguageHarness.native("diagnostic").find(message =>
+    message.stage === "route_language_selected"
+  );
+assert.deepEqual(
+  {
+    locale: reliableBaseLaneDiagnostic?.locale,
+    reason: reliableBaseLaneDiagnostic?.selectionReason,
+    lane: reliableBaseLaneDiagnostic?.lane,
+  },
+  {
+    locale: "sv-SE",
+    reason: "reliable_lane_evidence",
+    lane: "2",
+  },
+  "a reliable base-locale lane must resolve to its configured regional locale",
 );
 
 const oneBaseLanguageHarness = makeContractHarness({
@@ -4687,15 +4986,15 @@ const oneBaseTranscription =
   oneBaseLanguageHarness.outbound()
     .find(event => event.type === "session.update")
     ?.session?.audio?.input?.transcription;
-assert.deepEqual(
-  Array.from(oneBaseTranscription?.languages || []),
-  ["en"],
-  "regional variants of one configured base language must retain one deduplicated ASR base",
-);
 assert.equal(
   Object.hasOwn(oneBaseTranscription || {}, "language"),
   false,
-  "a deduplicated one-base list must not serialize a singular language field",
+  "regional variants must remain auto-detected when the user did not force a language",
+);
+assert.equal(
+  Object.hasOwn(oneBaseTranscription || {}, "languages"),
+  false,
+  "regional variants must not produce a plural language hint",
 );
 
 const multiBaseLanguageHarness = makeContractHarness({
@@ -4708,14 +5007,14 @@ const multiBaseTranscription =
     .find(event => event.type === "session.update")
     ?.session?.audio?.input?.transcription;
 assert.equal(
-  JSON.stringify(Array.from(multiBaseTranscription?.languages || [])),
-  JSON.stringify(["ko", "en"]),
-  "multiple configured base languages must preserve settings order in the plural languages field",
-);
-assert.equal(
   Object.hasOwn(multiBaseTranscription || {}, "language"),
   false,
-  "plural-language transcription must never also send a singular language",
+  "multiple configured languages must use transcription auto-detection",
+);
+assert.equal(
+  Object.hasOwn(multiBaseTranscription || {}, "languages"),
+  false,
+  "multiple configured languages must remain in app routing policy rather than an unsupported protocol field",
 );
 assert.match(
   multiBaseLanguageHarness.outbound()
@@ -4735,11 +5034,53 @@ const changedLanguageTranscription =
     .find(event => event.type === "session.update")
     ?.session?.audio?.input?.transcription;
 assert.equal(
-  JSON.stringify(
-    Array.from(changedLanguageTranscription?.languages || []),
-  ),
-  JSON.stringify(["sv", "en", "ko"]),
-  "a rebuilt session must derive a fresh ordered deduplicated language list from changed settings",
+  Object.hasOwn(changedLanguageTranscription || {}, "language"),
+  false,
+  "a rebuilt auto-detect session must not accidentally force its changed configured primary",
+);
+
+const rejectedConfigurationHarness = makeContractHarness({
+  generation: 112,
+  language: "en-US",
+});
+const rejectedUpdate = rejectedConfigurationHarness.outbound()
+  .find(event => event.type === "session.update");
+const rejectedConfigurationMessageStart =
+  rejectedConfigurationHarness.messages.length;
+rejectedConfigurationHarness.receive({
+  type: "error",
+  error: {
+    event_id: rejectedUpdate?.event_id,
+    code: "invalid_request_error",
+    type: "invalid_request_error",
+  },
+});
+rejectedConfigurationHarness.receive({
+  type: "conversation.item.input_audio_transcription.completed",
+  item_id: "post-rejection-user",
+  transcript: "This must not route.",
+});
+const postRejectionMessages = rejectedConfigurationHarness.messages
+  .slice(rejectedConfigurationMessageStart);
+assert.equal(
+  postRejectionMessages.filter(message =>
+    message.type === "state" && message.phase === "failed"
+  ).length,
+  1,
+  "a rejected transcription session update must fail the session",
+);
+assert.equal(
+  postRejectionMessages.filter(message => message.type === "error").length,
+  1,
+  "a rejected transcription session update must surface one terminal error",
+);
+assert.equal(
+  postRejectionMessages.filter(message =>
+    message.type === "realtimeSend"
+    && JSON.parse(message.eventJSON).type === "response.create"
+  ).length,
+  0,
+  "no user turn may route after the server rejects the session transcription configuration",
 );
 
 function routeOrdinaryContractTurn(
@@ -4765,6 +5106,8 @@ function routeOrdinaryContractTurn(
   });
   const routeArguments = {
     kind: "codex",
+    confidence: "high",
+    utterance_completeness: "complete",
     social_origin: "not_applicable",
     spoken_register: "neutral",
     stop_target: "not_applicable",
@@ -5467,6 +5810,8 @@ interruptedFinalHarness.receive({
   call_id: "replacement-route-call",
   arguments: JSON.stringify({
     kind: "ignore",
+    confidence: "high",
+    utterance_completeness: "complete",
     social_origin: "not_applicable",
     spoken_language: "en-US",
     spoken_register: "casual",
@@ -5499,6 +5844,8 @@ interruptedFinalHarness.receive({
   call_id: "explicit-repeat-call",
   arguments: JSON.stringify({
     kind: "repeat_output",
+    confidence: "high",
+    utterance_completeness: "complete",
     social_origin: "user_reply",
     spoken_language: "en-US",
     spoken_register: "casual",
@@ -5620,6 +5967,18 @@ drainedFinalHarness.runtime.playbackDrained({
   generation: drainedFinalHarness.generation,
   responseId: drainedFinalResponseID,
 });
+drainedFinalHarness.runtime.playbackDrained({
+  generation: drainedFinalHarness.generation,
+  responseId: drainedFinalResponseID,
+});
+assert.equal(
+  drainedFinalHarness.messages.filter(message =>
+    message.type === "assistantPlaybackDrained"
+    && message.responseId === drainedFinalResponseID
+  ).length,
+  1,
+  "a late duplicate native playback callback must not finish one final twice",
+);
 drainedFinalHarness.receive({
   type: "input_audio_buffer.speech_started",
   item_id: "after-drain-repeat",
@@ -5642,6 +6001,8 @@ drainedFinalHarness.receive({
   call_id: "after-drain-repeat-call",
   arguments: JSON.stringify({
     kind: "repeat_output",
+    confidence: "high",
+    utterance_completeness: "complete",
     social_origin: "user_reply",
     spoken_language: "en-US",
     spoken_register: "casual",
@@ -5752,6 +6113,7 @@ function runCompletedTargetControlRace({
     arguments: JSON.stringify({
       action,
       confidence: action === "clarify" ? "low" : "high",
+      utterance_completeness: "complete",
       spoken_language: "en-US",
       spoken_register: "casual",
       stop_target: "not_applicable",
@@ -8087,6 +8449,8 @@ assistantLikeHarness.receive({
   call_id: "assistant-like-call-211",
   arguments: JSON.stringify({
     kind: "direct_chat",
+    confidence: "high",
+    utterance_completeness: "complete",
     social_origin: "assistant_like_playback",
     spoken_language: "en-US",
     spoken_register: "neutral",
@@ -8182,6 +8546,8 @@ ignoredContextHarness.receive({
   call_id: "ignored-context-call-216",
   arguments: JSON.stringify({
     kind: "ignore",
+    confidence: "high",
+    utterance_completeness: "complete",
     social_origin: "not_applicable",
     spoken_language: "en-US",
     spoken_register: "neutral",
@@ -8234,6 +8600,8 @@ function completeIgnoredIdentityTurn(harness, index) {
     call_id: `identity-cache-call-${index}`,
     arguments: JSON.stringify({
       kind: "ignore",
+      confidence: "high",
+      utterance_completeness: "complete",
       social_origin: "not_applicable",
       spoken_language: "en-US",
       spoken_register: "neutral",
@@ -8314,6 +8682,8 @@ function beginOrdinaryRouteDecision(
     socialOrigin = "not_applicable",
     stopTarget = "not_applicable",
     progressSummary = "",
+    confidence = "high",
+    utteranceCompleteness = "complete",
   },
 ) {
   harness.receive({
@@ -8335,6 +8705,8 @@ function beginOrdinaryRouteDecision(
     call_id: callID,
     arguments: JSON.stringify({
       kind,
+      confidence,
+      utterance_completeness: utteranceCompleteness,
       social_origin: socialOrigin,
       spoken_language: spokenLanguage,
       spoken_register: spokenRegister,
@@ -8703,6 +9075,8 @@ completedTrajectoryHarness.receive({
   call_id: "completed-trajectory-close-call",
   arguments: JSON.stringify({
     kind: "close_session",
+    confidence: "high",
+    utterance_completeness: "complete",
     social_origin: "user_reply",
     spoken_language: "en-US",
     spoken_register: "casual",
@@ -8795,20 +9169,18 @@ for (const [index, fixture] of [
     itemID: `${callID}-item`,
     text: fixture.text,
     callID,
-    kind: "stop_session",
+    kind: "cancel_current_answer",
     spokenLanguage: fixture.language,
     spokenRegister: "casual",
-    stopTarget: "current_voice_or_codex_work",
+    stopTarget: "current_answer_or_codex_work",
   });
   const messages = harness.messages.slice(start);
   assert.equal(
     messages.filter(message =>
-      message.type === "stopIntent"
-      && message.reason === "semantic_stop"
-      && message.text === fixture.text
+      message.type === "cancelCurrentAnswer"
     ).length,
-    1,
-    "a semantically classified quiet request must execute the same wide stop action once",
+    0,
+    "a current-answer quiet request without active work must not emit a host interrupt",
   );
   const stopRequest = messages
     .filter(message => message.type === "realtimeSend")
@@ -8816,31 +9188,26 @@ for (const [index, fixture] of [
     .find(event =>
       event.type === "response.create"
       && event.response?.metadata?.voice_relay_kind
-        === "semantic_stop"
+        === "codex_control_cancelled"
     );
   assert.equal(
     stopRequest?.response?.conversation,
     "none",
-    "quiet acknowledgement must stay isolated from prior conversation state",
+    "current-answer cancellation acknowledgement must stay isolated from prior conversation state",
   );
   assert.deepEqual(
     Array.from(
       stopRequest?.response?.input?.[0]?.content || [],
       item => item.text,
     ),
-    [fixture.text],
-    "quiet acknowledgement may receive only the exact current stop utterance as conversation data",
+    [],
+    "current-answer cancellation acknowledgement must not inherit conversation payloads",
   );
   const instructions = stopRequest?.response?.instructions || "";
   assert.match(
     instructions,
-    /Reply conversationally to the user's actual stop request/i,
-    "quiet acknowledgement must answer the user's speech act instead of narrating backend state",
-  );
-  assert.match(
-    instructions,
-    /Do not narrate backend operations, background work, Codex, cancellation mechanics/i,
-    "quiet acknowledgement must exclude backend cancellation reports while the wide stop action still runs",
+    /current answer was cancelled.*voice session ended/is,
+    "current-answer cancellation must acknowledge only the bounded nonterminal outcome",
   );
   assert.doesNotMatch(
     instructions,
@@ -8852,7 +9219,7 @@ for (const [index, fixture] of [
     type: "response.created",
     response: {
       id: responseID,
-      metadata: { voice_relay_kind: "semantic_stop" },
+      metadata: { voice_relay_kind: "codex_control_cancelled" },
     },
   });
   harness.receive({
@@ -8865,36 +9232,17 @@ for (const [index, fixture] of [
     response: {
       id: responseID,
       status: "completed",
-      metadata: { voice_relay_kind: "semantic_stop" },
+      metadata: { voice_relay_kind: "codex_control_cancelled" },
       output: [],
     },
   });
-  harness.runtime.playbackDrained({
-    generation: harness.generation,
-    responseId: responseID,
-  });
-  assert.equal(
-    harness.native("stopAcknowledgementFinal").filter(event =>
-      event.responseId === responseID
-      && event.text === fixture.acknowledgement
-    ).length,
-    1,
-    "Realtime may choose a short natural acknowledgement freely and mirror it once",
-  );
-  assert.equal(
-    harness.native("stopAcknowledgementDrained").filter(event =>
-      event.responseId === responseID
-    ).length,
-    1,
-    "the wide stop lifecycle must complete only after the generated acknowledgement drains",
-  );
   assert.equal(
     harness.messages.slice(start).filter(event =>
       event.type === "state"
       && event.phase === "listening"
-    ).length,
-    0,
-    "a quiet wide stop must not return to the active Realtime listening state",
+    ).length > 0,
+    true,
+    "current-answer cancellation must return to the active Realtime listening state",
   );
 }
 
@@ -8904,12 +9252,12 @@ const pendingTerminalAckHarness = makeContractHarness({
 });
 beginOrdinaryRouteDecision(pendingTerminalAckHarness, {
   itemID: "pending-terminal-stop-item",
-  text: "Please stop now.",
+  text: "Please stop the Voice Relay session now.",
   callID: "pending-terminal-stop-call",
   kind: "stop_session",
   spokenLanguage: "en-US",
   spokenRegister: "polite",
-  stopTarget: "current_voice_or_codex_work",
+  stopTarget: "voice_relay_session",
 });
 const pendingTerminalAckStart = pendingTerminalAckHarness.messages.length;
 pendingTerminalAckHarness.receive({
@@ -8996,12 +9344,12 @@ const activeTerminalAckHarness = makeContractHarness({
 });
 beginOrdinaryRouteDecision(activeTerminalAckHarness, {
   itemID: "active-terminal-stop-item",
-  text: "이제 멈춰.",
+  text: "이제 음성 릴레이 세션을 멈춰.",
   callID: "active-terminal-stop-call",
   kind: "stop_session",
   spokenLanguage: "ko-KR",
   spokenRegister: "casual",
-  stopTarget: "current_voice_or_codex_work",
+  stopTarget: "voice_relay_session",
 });
 const activeTerminalResponseID = "active-terminal-ack-response";
 activeTerminalAckHarness.receive({
@@ -9345,6 +9693,7 @@ closureRaceHarness.receive({
   arguments: JSON.stringify({
     action: "close_session",
     confidence: "high",
+    utterance_completeness: "complete",
     spoken_language: "en-US",
     spoken_register: "casual",
     stop_target: "not_applicable",
@@ -9374,6 +9723,194 @@ assert.equal(
   "completion-race closure must never silently become a new request or steer",
 );
 
+const configuredFragmentHarness = makeContractHarness({
+  generation: 370,
+  language: "sv-SE",
+  additionalLanguages: ["ko-KR"],
+});
+const configuredFragmentStart = configuredFragmentHarness.messages.length;
+beginOrdinaryRouteDecision(configuredFragmentHarness, {
+  itemID: "configured-fragment-item",
+  text: "och sedan",
+  callID: "configured-fragment-call",
+  kind: "codex",
+  confidence: "medium",
+  utteranceCompleteness: "incomplete",
+  spokenLanguage: "sv-SE",
+  spokenRegister: "neutral",
+  progressSummary: "continue an unresolved request",
+});
+const configuredFragmentMessages =
+  configuredFragmentHarness.messages.slice(configuredFragmentStart);
+assert.equal(
+  configuredFragmentMessages.filter(message =>
+    message.type === "codexRequest"
+  ).length,
+  0,
+  "an incomplete configured-language fragment must not create new Codex work",
+);
+assert.equal(
+  configuredFragmentHarness.outbound().filter(event =>
+    event.type === "response.create"
+    && /Ask one short clarification question/.test(
+      event.response?.instructions || "",
+    )
+  ).length,
+  1,
+  "an incomplete configured-language fragment must receive one local clarification",
+);
+
+const completeShortRequestHarness = makeContractHarness({
+  generation: 371,
+  language: "sv-SE",
+});
+beginOrdinaryRouteDecision(completeShortRequestHarness, {
+  itemID: "complete-short-request-item",
+  text: "Sök.",
+  callID: "complete-short-request-call",
+  kind: "codex",
+  confidence: "high",
+  utteranceCompleteness: "complete",
+  spokenLanguage: "sv-SE",
+  spokenRegister: "neutral",
+  progressSummary: "perform a requested search",
+});
+assert.equal(
+  completeShortRequestHarness.native("codexRequest").length,
+  1,
+  "a short but semantically complete high-confidence request must not be suppressed by length",
+);
+
+const cancelCurrentAnswerHarness = makeContractHarness({
+  generation: 372,
+  language: "en-US",
+});
+const cancelledCodex = beginContractCodex(
+  cancelCurrentAnswerHarness,
+  "Review the current deployment logs.",
+);
+const cancelCurrentAnswerStart = cancelCurrentAnswerHarness.messages.length;
+routeContractControl(
+  cancelCurrentAnswerHarness,
+  "Cancel this answer.",
+  {
+    action: "cancel_current_answer",
+    confidence: "high",
+    utterance_completeness: "complete",
+    spoken_language: "en-US",
+    spoken_register: "casual",
+    stop_target: "current_answer_or_codex_work",
+  },
+);
+const cancelCurrentAnswerMessages =
+  cancelCurrentAnswerHarness.messages.slice(cancelCurrentAnswerStart);
+assert.equal(
+  cancelCurrentAnswerMessages.filter(message =>
+    message.type === "cancelCurrentAnswer"
+    && message.callId === cancelledCodex.callID
+  ).length,
+  1,
+  "current-answer cancellation must interrupt exactly the active Codex request",
+);
+assert.equal(
+  cancelCurrentAnswerMessages.filter(message =>
+    message.type === "stopIntent"
+  ).length,
+  0,
+  "current-answer cancellation must not enter the Voice Relay terminal lifecycle",
+);
+assert.equal(
+  cancelCurrentAnswerMessages.filter(message =>
+    message.type === "codexSteer"
+  ).length,
+  0,
+  "current-answer cancellation must not become additive steering",
+);
+const cancellationAcknowledgement = cancelCurrentAnswerHarness.outbound()
+  .findLast(event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind
+      === "codex_control_cancelled"
+  );
+assert.ok(
+  cancellationAcknowledgement,
+  "current-answer cancellation must produce one bounded local acknowledgement",
+);
+const cancellationAcknowledgementID = "cancel-current-answer-ack";
+cancelCurrentAnswerHarness.receive({
+  type: "response.created",
+  response: {
+    id: cancellationAcknowledgementID,
+    metadata: { voice_relay_kind: "codex_control_cancelled" },
+  },
+});
+cancelCurrentAnswerHarness.receive({
+  type: "response.done",
+  response: {
+    id: cancellationAcknowledgementID,
+    status: "completed",
+    metadata: { voice_relay_kind: "codex_control_cancelled" },
+    output: [],
+  },
+});
+assert.equal(
+  cancelCurrentAnswerHarness.native("state").at(-1)?.phase,
+  "listening",
+  "current-answer cancellation must return the same Voice Relay session to listening",
+);
+cancelCurrentAnswerHarness.runtime.resolveCodex({
+  generation: cancelCurrentAnswerHarness.generation,
+  callId: cancelledCodex.callID,
+  output: "Late obsolete output.",
+});
+assert.equal(
+  cancelCurrentAnswerHarness.outbound().filter(event =>
+    event.type === "response.create"
+    && event.response?.metadata?.voice_relay_kind === "codex_final"
+  ).length,
+  0,
+  "a late result from the cancelled request must never become a spoken final",
+);
+beginOrdinaryRouteDecision(cancelCurrentAnswerHarness, {
+  itemID: "post-cancel-request-item",
+  text: "Check the next deployment.",
+  callID: "post-cancel-request-call",
+  kind: "codex",
+  confidence: "high",
+  utteranceCompleteness: "complete",
+  spokenLanguage: "en-US",
+  spokenRegister: "casual",
+  progressSummary: "check the next deployment",
+});
+assert.equal(
+  cancelCurrentAnswerHarness.native("codexRequest").length,
+  2,
+  "current-answer cancellation must allow later Codex work in the same voice session",
+);
+
+const explicitSessionStopHarness = makeContractHarness({
+  generation: 373,
+  language: "en-US",
+});
+beginOrdinaryRouteDecision(explicitSessionStopHarness, {
+  itemID: "explicit-session-stop-item",
+  text: "Stop the Voice Relay session.",
+  callID: "explicit-session-stop-call",
+  kind: "stop_session",
+  confidence: "high",
+  utteranceCompleteness: "complete",
+  spokenLanguage: "en-US",
+  spokenRegister: "casual",
+  stopTarget: "voice_relay_session",
+});
+assert.equal(
+  explicitSessionStopHarness.native("stopIntent").filter(message =>
+    message.reason === "semantic_stop"
+  ).length,
+  1,
+  "an explicit full-session stop must retain the terminal Voice Relay lifecycle",
+);
+
 assert.equal(normalizeServiceTierForConfig("priority"), "priority");
 assert.equal(normalizeServiceTierForConfig("fast"), null);
 assert.deepEqual(
@@ -9400,7 +9937,7 @@ const inheritedXHigh = resolveVoiceTurnProfileSelection(
   {
     model: "inherit",
     reasoningEffort: "inherit",
-    serviceTier: null,
+    serviceTier: "inherit",
   },
   {
     model: "gpt-5.6-sol",
@@ -9412,7 +9949,7 @@ const inheritedMedium = resolveVoiceTurnProfileSelection(
   {
     model: "inherit",
     reasoningEffort: "inherit",
-    serviceTier: null,
+    serviceTier: "inherit",
   },
   {
     model: "gpt-5.6-sol",
@@ -9432,7 +9969,7 @@ const explicitMedium = resolveVoiceTurnProfileSelection(
   {
     model: "gpt-5.6-sol",
     reasoningEffort: "medium",
-    serviceTier: null,
+    serviceTier: "standard",
   },
   {
     model: "gpt-5.6-sol",
@@ -9447,17 +9984,22 @@ const fastOnProfile = resolveVoiceTurnProfileSelection(
   { model: "gpt-5.6-sol", reasoningEffort: "xhigh", serviceTier: "default" },
 );
 const fastOffProfile = resolveVoiceTurnProfileSelection(
-  { model: "inherit", reasoningEffort: "inherit", serviceTier: null },
+  { model: "inherit", reasoningEffort: "inherit", serviceTier: "standard" },
   { model: "gpt-5.6-sol", reasoningEffort: "xhigh", serviceTier: "default" },
 );
 const fastOffInheritedPriority = resolveVoiceTurnProfileSelection(
-  { model: "inherit", reasoningEffort: "inherit", serviceTier: null },
+  { model: "inherit", reasoningEffort: "inherit", serviceTier: "standard" },
+  { model: "gpt-5.6-sol", reasoningEffort: "xhigh", serviceTier: "priority" },
+);
+const inheritedPriority = resolveVoiceTurnProfileSelection(
+  { model: "inherit", reasoningEffort: "inherit", serviceTier: "inherit" },
   { model: "gpt-5.6-sol", reasoningEffort: "xhigh", serviceTier: "priority" },
 );
 assert.equal(fastOnProfile.serviceTier, "priority");
 assert.equal(fastOffProfile.serviceTier, null);
 assert.equal(fastOffProfile.expectedServiceTier, null);
-assert.equal(fastOffProfile.provenance.serviceTier, "inherit");
+assert.equal(fastOnProfile.provenance.serviceTier, "priority");
+assert.equal(fastOffProfile.provenance.serviceTier, "standard");
 assert.equal(
   fastOffInheritedPriority.serviceTier,
   null,
@@ -9465,8 +10007,23 @@ assert.equal(
 );
 assert.equal(
   fastOffInheritedPriority.expectedServiceTier,
+  null,
+  "explicit Standard must validate non-priority even when the live host default is priority",
+);
+assert.equal(
+  inheritedPriority.serviceTier,
   "priority",
-  "Fast off must validate the freshly inherited host tier rather than a cached Voice override",
+  "only Inherit may resolve and dispatch the live host priority tier",
+);
+assert.equal(inheritedPriority.expectedServiceTier, "priority");
+assert.equal(inheritedPriority.provenance.serviceTier, "inherit");
+assert.equal(
+  resolveVoiceTurnProfileSelection(
+    { model: "inherit", reasoningEffort: "inherit", serviceTier: null },
+    { model: "gpt-5.6-sol", reasoningEffort: "xhigh", serviceTier: "priority" },
+  ).provenance.serviceTier,
+  "standard",
+  "legacy Fast-off null must migrate at the request boundary to explicit Standard",
 );
 
 const appliedProfileRequests = [];

@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voice-relay.app/schemas/connector-v1.json",
+  "title": "Voice Relay Connector v1 Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "version",
+    "name",
+    "executable",
+    "protocol",
+    "capabilities",
+    "triggers",
+    "dataClasses",
+    "requiredPermissions",
+    "readOnly",
+    "limits"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "dataClasses": { "contains": { "const": "calendar_events" } }
+        }
+      },
+      "then": {
+        "properties": {
+          "requiredPermissions": { "contains": { "const": "calendar.read" } }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "dataClasses": { "contains": { "const": "reminders" } }
+        }
+      },
+      "then": {
+        "properties": {
+          "requiredPermissions": { "contains": { "const": "reminders.read" } }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "dataClasses": { "contains": { "const": "location" } }
+        }
+      },
+      "then": {
+        "properties": {
+          "requiredPermissions": { "contains": { "const": "location.read" } }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}\\.)+[A-Za-z0-9][A-Za-z0-9-]{0,62}$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+    },
+    "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "executable": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/\\\\]+$"
+    },
+    "protocol": { "const": "voice-relay.connector.v1" },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["daily_brief"] }
+    },
+    "triggers": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["return", "morning", "manual"] }
+    },
+    "dataClasses": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": ["calendar_events", "reminders", "location"]
+      }
+    },
+    "requiredPermissions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": ["calendar.read", "reminders.read", "location.read"]
+      }
+    },
+    "readOnly": { "const": true },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timeoutMilliseconds", "maxOutputBytes"],
+      "properties": {
+        "timeoutMilliseconds": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 30000
+        },
+        "maxOutputBytes": {
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 1048576
+        }
+      }
+    }
+  }
+}

@@ -2840,8 +2840,14 @@ export function resolveVoiceTurnProfileSelection(
   const modelInherited = !requestedModel || requestedModel === "inherit";
   const reasoningInherited =
     !requestedReasoningEffort || requestedReasoningEffort === "inherit";
-  const fastModeEnabled =
-    normalizeServiceTierForConfig(request.serviceTier) === "priority";
+  const serviceTierSelection = normalizeVoiceServiceTierSelection(
+    request.serviceTier,
+  );
+  const serviceTier = serviceTierSelection === "priority"
+    ? "priority"
+    : serviceTierSelection === "inherit"
+      ? normalizeServiceTierForConfig(hostConfig.serviceTier)
+      : null;
   return Object.freeze({
     model: normalizeModelForConfig(
       modelInherited ? hostConfig.model : requestedModel,
@@ -2851,16 +2857,21 @@ export function resolveVoiceTurnProfileSelection(
         ? hostConfig.reasoningEffort
         : requestedReasoningEffort,
     ),
-    serviceTier: fastModeEnabled ? "priority" : null,
-    expectedServiceTier: fastModeEnabled
-      ? "priority"
-      : normalizeServiceTierForConfig(hostConfig.serviceTier),
+    serviceTier,
+    expectedServiceTier: serviceTier,
     provenance: Object.freeze({
       model: modelInherited ? "inherit" : "explicit",
       reasoningEffort: reasoningInherited ? "inherit" : "explicit",
-      serviceTier: fastModeEnabled ? "explicit" : "inherit",
+      serviceTier: serviceTierSelection,
     }),
   });
+}
+
+function normalizeVoiceServiceTierSelection(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "inherit") return "inherit";
+  if (normalized === "priority") return "priority";
+  return "standard";
 }
 
 function normalizeReasoningForConfig(value) {
@@ -2877,13 +2888,19 @@ function normalizeReasoningForConfig(value) {
   return /^[a-z][a-z0-9]{0,31}$/u.test(token) ? token : "";
 }
 
-function normalizeProfileProvenance(value) {
+function normalizeProfileProvenance(value, serviceTier = null) {
+  const serviceTierProvenance = String(value?.serviceTier || "").trim();
   return Object.freeze({
     model: value?.model === "inherit" ? "inherit" : "explicit",
     reasoningEffort:
       value?.reasoningEffort === "inherit" ? "inherit" : "explicit",
-    serviceTier:
-      value?.serviceTier === "inherit" ? "inherit" : "explicit",
+    serviceTier: ["inherit", "standard", "priority"].includes(
+      serviceTierProvenance,
+    )
+      ? serviceTierProvenance
+      : normalizeServiceTierForConfig(serviceTier) === "priority"
+        ? "priority"
+        : "standard",
   });
 }
 
@@ -2900,7 +2917,7 @@ function immutableDispatchProfile({
       normalizeReasoningForConfig(reasoningEffort) || "xhigh",
     serviceTier: normalizeServiceTierForConfig(serviceTier),
     expectedServiceTier: normalizeServiceTierForConfig(expectedServiceTier),
-    provenance: normalizeProfileProvenance(provenance),
+    provenance: normalizeProfileProvenance(provenance, serviceTier),
   });
 }
 
